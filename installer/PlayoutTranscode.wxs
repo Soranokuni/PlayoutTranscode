@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="PlayoutTranscode"
+           Manufacturer="PlayoutTranscode"
+           Version="1.0.0"
+           UpgradeCode="A1B2C3D4-E5F6-7890-ABCD-EF1234567890"
+           Scope="perMachine"
+           Platform="x64"
+           Language="1033">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="MainFeature" Title="PlayoutTranscode" Level="1">
+      <ComponentGroupRef Id="AppComponents" />
+      <ComponentGroupRef Id="WebUiComponents" />
+      <ComponentGroupRef Id="FfmpegComponents" />
+    </Feature>
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder" Name="PFiles">
+        <Directory Id="INSTALLDIR" Name="PlayoutTranscode">
+          <!-- PlayoutTranscode.exe -->
+          <Directory Id="WebUiDir" Name="web-ui">
+            <Directory Id="WebUiDistDir" Name="dist" />
+          </Directory>
+          <Directory Id="RequirementsDir" Name="Requirements">
+            <Directory Id="FfmpegDir" Name="ffmpeg">
+              <Directory Id="FfmpegBinDir" Name="bin" />
+            </Directory>
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="DesktopFolder" Name="Desktop" />
+      <Directory Id="ProgramMenuFolder" Name="Programs">
+        <Directory Id="StartMenuFolder" Name="PlayoutTranscode" />
+      </Directory>
+    </Directory>
+
+    <ComponentGroup Id="AppComponents" Directory="INSTALLDIR">
+      <Component Id="AppExe" Guid="*">
+        <File Id="AppExeFile" Source="..\dist\installer\PlayoutTranscode.exe" />
+        <File Id="InstallPs1" Source="..\dist\installer\install.ps1" />
+        <File Id="ConfigExample" Source="..\dist\installer\config.toml.example" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="WebUiComponents" Directory="WebUiDistDir">
+      <Component Id="WebUiFiles" Guid="*">
+        <File Id="WebIndexHtml" Source="..\dist\installer\web-ui\dist\index.html" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="FfmpegComponents" Directory="FfmpegBinDir">
+      <Component Id="FfmpegBin" Guid="*">
+        <File Id="FfmpegExe" Source="..\dist\installer\Requirements\ffmpeg\bin\ffmpeg.exe" />
+        <File Id="FfprobeExe" Source="..\dist\installer\Requirements\ffmpeg\bin\ffprobe.exe" />
+        <File Id="FfplayExe" Source="..\dist\installer\Requirements\ffmpeg\bin\ffplay.exe" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- Desktop Shortcut -->
+    <Component Id="DesktopShortcut" Guid="*" Directory="DesktopFolder">
+      <Shortcut Id="DesktopLink"
+                Name="PlayoutTranscode"
+                Description="Broadcast media transcoding web UI"
+                Target="http://127.0.0.1:4353"
+                WorkingDirectory="INSTALLDIR" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\PlayoutTranscode"
+                     Name="installed"
+                     Value="1"
+                     Type="integer"
+                     KeyPath="yes" />
+    </Component>
+
+    <!-- Start Menu Shortcut -->
+    <Component Id="StartMenuShortcut" Guid="*" Directory="StartMenuFolder">
+      <Shortcut Id="StartMenuLink"
+                Name="PlayoutTranscode Web UI"
+                Description="Open PlayoutTranscode in browser"
+                Target="http://127.0.0.1:4353"
+                WorkingDirectory="INSTALLDIR" />
+      <RemoveFolder Id="RemoveStartMenuFolder" Directory="StartMenuFolder" On="uninstall" />
+      <RegistryValue Root="HKCU"
+                     Key="Software\PlayoutTranscode"
+                     Name="startMenuInstalled"
+                     Value="1"
+                     Type="integer"
+                     KeyPath="yes" />
+    </Component>
+
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLDIR" />
+    <UIRef Id="WixUI_InstallDir" />
+
+    <CustomAction Id="RunPostInstall"
+                  Directory="INSTALLDIR"
+                  ExeCommand="powershell.exe -ExecutionPolicy Bypass -File install.ps1"
+                  Execute="deferred"
+                  Return="ignore"
+                  Impersonate="yes" />
+    <InstallExecuteSequence>
+      <Custom Action="RunPostInstall" After="InstallFiles">NOT Installed</Custom>
+    </InstallExecuteSequence>
+
+  </Package>
+</Wix>

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PlayoutTranscode Monitor</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#111827;color:#F9FAFB;min-height:100vh}
+header{background:#1B1B1B;border-bottom:1px solid rgba(255,255,255,0.08);padding:12px 24px;display:flex;justify-content:space-between;align-items:center}
+header h1{font-size:18px;font-weight:600;color:#33BECC}
+.status-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:6px}
+.status-dot.ok{background:#3fb950}.status-dot.err{background:#E63946}
+.header-right{display:flex;gap:16px;align-items:center;font-size:13px;color:#9CA3AF}
+main{max-width:1440px;margin:0 auto;padding:20px 24px}
+.stats-row{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:24px}
+.stat-card{background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:16px;text-align:center}
+.stat-card .num{font-size:28px;font-weight:700}
+.stat-card .label{font-size:12px;color:#9CA3AF;margin-top:4px}
+.stat-card.pending .num{color:#F8B400}
+.stat-card.active .num{color:#33BECC}
+.stat-card.completed .num{color:#3fb950}
+.stat-card.failed .num{color:#E63946}
+.stat-card.total .num{color:#F9FAFB}
+.section{margin-bottom:24px}
+.section h2{font-size:14px;font-weight:600;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid rgba(255,255,255,0.08);color:#9CA3AF;text-transform:uppercase;letter-spacing:0.5px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{padding:8px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.06)}
+th{color:#9CA3AF;font-weight:500;font-size:12px;text-transform:uppercase}
+tr:hover{background:rgba(255,255,255,0.03)}
+.progress-bar{width:120px;height:6px;background:#1B1B1B;border-radius:3px;overflow:hidden;display:inline-block;vertical-align:middle;margin-right:8px}
+.progress-fill{height:100%;background:#33BECC;border-radius:3px;transition:width .3s}
+.progress-fill.done{background:#3fb950}
+.progress-fill.fail{background:#E63946}
+.mono{font-family:'Cascadia Code',Consolas,monospace;font-size:12px}
+.stage{color:#9CA3AF;font-style:italic}
+.error-text{color:#E63946;font-size:12px}
+.empty-state{text-align:center;padding:40px;color:#9CA3AF}
+.log-panel{background:#111827;border:1px solid rgba(255,255,255,0.08);border-radius:12px;padding:0;max-height:300px;overflow-y:auto}
+.log-panel .log-line{padding:4px 12px;font-size:12px;border-bottom:1px solid rgba(255,255,255,0.06);font-family:'Cascadia Code',Consolas,monospace}
+.log-line.info{color:#9CA3AF}
+.log-line.warn{color:#F8B400}
+.log-line.error{color:#E63946}
+.log-line.success{color:#3fb950}
+.no-events{text-align:center;padding:20px;color:#9CA3AF;font-size:13px}
+.refresh-hint{font-size:11px;color:#9CA3AF;margin-top:4px}
+</style>
+</head>
+<body>
+<header>
+  <h1>PlayoutTranscode</h1>
+  <div class="header-right">
+    <span><span class="status-dot ok" id="tool-status-dot"></span><span id="tool-status-text">Toolchain: OK</span></span>
+    <span id="version-text"></span>
+    <span id="uptime-text"></span>
+  </div>
+</header>
+<main>
+  <div class="stats-row" id="stats-row"></div>
+  <div class="section">
+    <h2>Active Jobs</h2>
+    <div id="active-jobs"></div>
+  </div>
+  <div class="section">
+    <h2>Pending Queue</h2>
+    <div id="pending-jobs"></div>
+  </div>
+  <div class="section">
+    <h2>Completed</h2>
+    <div id="completed-jobs"></div>
+  </div>
+  <div class="section">
+    <h2>Failed</h2>
+    <div id="failed-jobs"></div>
+  </div>
+</main>
+<script>
+const API = window.location.origin;
+let jobState = { pending:[], active:[], completed:[], failed:[], total:0 };
+let startedAt = Date.now();
+
+function fmtUptime(){const s=Math.floor((Date.now()-startedAt)/1000);const h=Math.floor(s/3600);const m=Math.floor((s%3600)/60);return h>0?`${h}h ${m}m`:m>0?`${m}m`:`${s}s`}
+
+function renderStats(){
+  const {pending,active,completed,failed,total}=jobState;
+  document.getElementById('stats-row').innerHTML=`
+    <div class="stat-card pending"><div class="num">${pending.length}</div><div class="label">Pending</div></div>
+    <div class="stat-card active"><div class="num">${active.length}</div><div class="label">Active</div></div>
+    <div class="stat-card completed"><div class="num">${completed.length}</div><div class="label">Completed</div></div>
+    <div class="stat-card failed"><div class="num">${failed.length}</div><div class="label">Failed</div></div>
+    <div class="stat-card total"><div class="num">${total}</div><div class="label">Total</div></div>`;
+}
+
+function jobRow(j){
+  const pct=j.progress||0;
+  const cls=pct>=100?(j.state==='Failed'?'fail':'done'):'';
+  const progress=pct>0?`<div class="progress-bar"><div class="progress-fill ${cls}" style="width:${pct}%"></div></div>${pct.toFixed(0)}%`:'';
+  const inp=j.input_path.split('\\').pop()||j.input_path;
+  const out=j.output_path?j.output_path.split('\\').pop():'';
+  const err=j.error?`<br><span class="error-text">${j.error}</span>`:'';
+  return `<tr>
+    <td class="mono">${j.id.substring(0,8)}</td>
+    <td title="${j.input_path}">${inp}</td>
+    <td>${j.profile||''}</td>
+    <td>${progress}</td>
+    <td class="stage">${j.current_stage||''}</td>
+    <td class="mono">${j.duration_secs?s:(j.duration_secs||0).toFixed(1)+'s':''}</td>
+    <td>${out||''}${err}</td>
+  </tr>`;
+}
+
+function renderSection(id, jobs){
+  const el=document.getElementById(id);
+  if(!jobs||jobs.length===0){el.innerHTML='<div class="empty-state">No jobs</div>';return}
+  el.innerHTML=`<table><thead><tr><th>ID</th><th>Input</th><th>Profile</th><th>Progress</th><th>Stage</th><th>Duration</th><th>Output</th></tr></thead><tbody>${jobs.map(jobRow).join('')}</tbody></table>`;
+}
+
+function refreshAll(){
+  renderStats();
+  renderSection('active-jobs',jobState.active);
+  renderSection('pending-jobs',jobState.pending);
+  renderSection('completed-jobs',jobState.completed.slice(0,20));
+  renderSection('failed-jobs',jobState.failed.slice(0,20));
+}
+
+async function fetchJobs(){
+  try{
+    const[active,pending,completed,failed]=await Promise.all([
+      fetch(API+'/api/jobs/active').then(r=>r.json()),
+      fetch(API+'/api/jobs/pending').then(r=>r.json()),
+      fetch(API+'/api/jobs/completed').then(r=>r.json()),
+      fetch(API+'/api/jobs/failed').then(r=>r.json()),
+    ]);
+    jobState={active,pending,completed,failed,total:active.length+pending.length+completed.length+failed.length};
+    refreshAll();
+  }catch(e){console.error(e)}
+}
+
+async function fetchHealth(){
+  try{const r=await fetch(API+'/api/health');const d=await r.json();
+    document.getElementById('version-text').textContent='v'+d.version;
+    const dot=document.getElementById('tool-status-dot');
+    if(d.toolchain_ready){dot.className='status-dot ok';document.getElementById('tool-status-text').textContent='Toolchain: OK'}
+    else{dot.className='status-dot err';document.getElementById('tool-status-text').textContent='Toolchain: Missing'}
+  }catch(e){}
+}
+
+function connectSSE(){
+  const es=new EventSource(API+'/api/events');
+  es.addEventListener('connected',()=>{fetchJobs();fetchHealth()});
+  es.addEventListener('job_update',()=>{fetchJobs()});
+  es.onerror=()=>{setTimeout(connectSSE,5000)};
+}
+
+setInterval(()=>{document.getElementById('uptime-text').textContent='Up: '+fmtUptime()},10000);
+fetchHealth();
+fetchJobs();
+connectSSE();
+refreshAll();
+document.getElementById('uptime-text').textContent='Up: '+fmtUptime();
+</script>
+</body>
+</html>
