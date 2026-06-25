@@ -29,6 +29,8 @@ sha2 = "0.10"
 regex = "1"
 anyhow = "1"
 parking_lot = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "derive"] }
+fnv = "1.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

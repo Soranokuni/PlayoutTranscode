@@ -64,9 +64,9 @@ const PROFILE_C: EncodingProfile = EncodingProfile {
     target_height: 576,
     interlaced: false,
     sar: Some("64:45"),
-    colorspace: "bt601",
-    color_trc: "bt601",
-    color_primaries: "bt601",
+    colorspace: "smpte170m",
+    color_trc: "smpte170m",
+    color_primaries: "smpte170m",
     profile_h264: "main",
     level_h264: "3.0",
 };
@@ -95,15 +95,16 @@ impl EncodingProfile {
             "-hide_banner".to_string(),
             "-loglevel".to_string(), "info".to_string(),
             "-stats".to_string(),
-            "-analyzeduration".to_string(), "100M".to_string(),
-            "-probesize".to_string(), "100M".to_string(),
+            "-analyzeduration".to_string(), config.encoding.analyzeduration.clone(),
+            "-probesize".to_string(), config.encoding.probesize.clone(),
+            "-fflags".to_string(), "+genpts".to_string(),
             "-i".to_string(), input_path.to_string(),
-            "-r".to_string(), "25".to_string(),
         ];
 
         let vf = self.build_vf();
         args.extend_from_slice(&["-vf".to_string(), vf]);
 
+        args.extend_from_slice(&["-vsync".to_string(), "cfr".to_string()]);
         args.extend_from_slice(&["-c:v".to_string(), "libx264".to_string()]);
         args.extend_from_slice(&["-preset".to_string(), config.encoding.preset.clone()]);
 
@@ -127,12 +128,9 @@ impl EncodingProfile {
 
         if self.interlaced {
             args.extend_from_slice(&[
-                "-flags".to_string(), "+ilme+ildct+cgop".to_string(),
                 "-top".to_string(), "1".to_string(),
                 "-field_order".to_string(), "tt".to_string(),
             ]);
-        } else {
-            args.extend_from_slice(&["-flags".to_string(), "+cgop".to_string()]);
         }
 
         args.extend_from_slice(&[
@@ -141,8 +139,13 @@ impl EncodingProfile {
             "-sc_threshold".to_string(), "0".to_string(),
         ]);
 
+        let x264_params = if self.interlaced {
+            "open-gop=0:interlaced=1:pic-struct=1"
+        } else {
+            "open-gop=0"
+        };
         args.extend_from_slice(&[
-            "-x264-params".to_string(), "open-gop=0".to_string(),
+            "-x264-params".to_string(), x264_params.to_string(),
             "-movflags".to_string(), "+faststart".to_string(),
         ]);
 
@@ -163,6 +166,8 @@ impl EncodingProfile {
         }
         args.extend_from_slice(&["-ar".to_string(), "48000".to_string(), "-ac".to_string(), "2".to_string()]);
 
+        args.extend_from_slice(&["-max_muxing_queue_size".to_string(), "4096".to_string()]);
+
         args.push(output_path.to_string());
         args
     }
@@ -170,17 +175,45 @@ impl EncodingProfile {
     fn build_vf(&self) -> String {
         if let Some(sar) = self.sar {
             format!(
-                "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar={},format=yuv420p",
+                "fps=25,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar={},format=yuv420p",
                 self.target_width, self.target_height,
                 self.target_width, self.target_height,
                 sar
             )
         } else {
             format!(
-                "scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
+                "fps=25,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
                 self.target_width, self.target_height,
                 self.target_width, self.target_height,
             )
         }
     }
+}
+
+static VALID_COLORSPACE: &[&str] = &["undef", "bt709", "smpte170m", "smpte240m"];
+
+static VALID_COLOR_TRC: &[&str] = &[
+    "undef", "bt709", "smpte170m", "smpte240m", "bt470bg", "linear",
+    "smpte2084", "bt2020-10", "bt2020-12", "iec61966-2-1", "arib-std-b67",
+];
+
+static VALID_COLOR_PRIMARIES: &[&str] = &[
+    "undef", "bt709", "smpte170m", "smpte240m", "bt470bg", "film",
+    "bt2020", "smpte431", "smpte432", "jedec-p22",
+];
+
+pub fn validate_color_constants() -> Result<(), String> {
+    for id in [ProfileId::ProfileA, ProfileId::ProfileB, ProfileId::ProfileC] {
+        let p = EncodingProfile::by_id(id);
+        if !VALID_COLORSPACE.contains(&p.colorspace) {
+            return Err(format!("{}: invalid colorspace '{}'", id, p.colorspace));
+        }
+        if !VALID_COLOR_TRC.contains(&p.color_trc) {
+            return Err(format!("{}: invalid color_trc '{}'", id, p.color_trc));
+        }
+        if !VALID_COLOR_PRIMARIES.contains(&p.color_primaries) {
+            return Err(format!("{}: invalid color_primaries '{}'", id, p.color_primaries));
+        }
+    }
+    Ok(())
 }

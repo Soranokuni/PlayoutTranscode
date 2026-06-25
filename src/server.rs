@@ -1,16 +1,19 @@
 use crate::bootstrap::ToolchainStatus;
 use crate::config::AppConfig;
+use crate::db::{self, AssetResponse};
 use crate::jobs::{JobQueue, JobState};
 use crate::service_handle::ServiceHandle;
 use axum::{
-    extract::{State},
+    extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
 
@@ -21,6 +24,8 @@ pub struct ServerState {
     pub toolchain_status: Arc<ToolchainStatus>,
     pub service_handle: ServiceHandle,
     pub web_ui_dir: Arc<std::path::PathBuf>,
+    pub pool: Arc<SqlitePool>,
+    pub started_at: std::time::Instant,
 }
 
 pub async fn run_server(
@@ -31,6 +36,7 @@ pub async fn run_server(
     toolchain_status: ToolchainStatus,
     service_handle: ServiceHandle,
     web_ui_dir: std::path::PathBuf,
+    pool: Arc<SqlitePool>,
 ) -> Result<(), String> {
     let state = ServerState {
         jobs: jobs.clone(),
@@ -38,6 +44,8 @@ pub async fn run_server(
         toolchain_status: Arc::new(toolchain_status),
         service_handle,
         web_ui_dir: Arc::new(web_ui_dir),
+        pool,
+        started_at: std::time::Instant::now(),
     };
 
     let api = Router::new()
@@ -59,7 +67,14 @@ pub async fn run_server(
         .route("/download/status", get(get_download_status))
         .route("/logs", get(get_logs))
         .route("/service/install", post(post_install_service))
-        .route("/service/uninstall", post(post_uninstall_service));
+        .route("/service/uninstall", post(post_uninstall_service))
+        .route("/assets", get(list_assets))
+        .route("/assets/{uuid}", get(get_asset))
+        .route("/assets/{uuid}/trim", put(put_trim))
+        .route("/assets/{uuid}/rating", put(put_rating))
+        .route("/assets/{uuid}/rename", put(put_rename))
+        .route("/assets/{uuid}/move", put(put_move))
+        .route("/assets/batch", post(post_batch));
 
     let app = Router::new()
         .nest("/api", api)
@@ -120,12 +135,14 @@ async fn serve_spa(uri: Uri, State(state): State<ServerState>) -> Response {
 }
 
 async fn health(State(state): State<ServerState>) -> Json<serde_json::Value> {
+    let uptime_ms = state.started_at.elapsed().as_millis() as u64;
     Json(serde_json::json!({
         "status": "ok",
         "service": "PlayoutTranscode",
         "version": env!("CARGO_PKG_VERSION"),
         "toolchain_ready": state.toolchain_status.ffmpeg_found && state.toolchain_status.ffprobe_found,
         "service_running": state.service_handle.is_running(),
+        "uptime_ms": uptime_ms,
     }))
 }
 
@@ -166,6 +183,8 @@ async fn get_config(State(state): State<ServerState>) -> Json<serde_json::Value>
             "audio_codec": config.encoding.audio_codec,
             "audio_bitrate": config.encoding.audio_bitrate,
             "tune": config.encoding.tune,
+            "probesize": config.encoding.probesize,
+            "analyzeduration": config.encoding.analyzeduration,
         },
         "profiles": {
             "a": {
@@ -206,11 +225,21 @@ async fn get_toolchain_status(State(_state): State<ServerState>) -> Json<Toolcha
     Json(status)
 }
 
+#[derive(Deserialize)]
+struct EventEnvelope {
+    event: String,
+    data: serde_json::Value,
+}
+
 async fn sse_events(State(state): State<ServerState>) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.jobs.event_sender().subscribe();
     let stream = BroadcastStream::new(rx).filter_map(|msg: Result<String, _>| {
         let msg = msg.ok()?;
-        Some(Ok(Event::default().data(msg)))
+        let envelope: EventEnvelope = serde_json::from_str(&msg).ok()?;
+        let event = Event::default()
+            .event(envelope.event)
+            .data(envelope.data.to_string());
+        Some(Ok(event))
     });
 
     Sse::new(stream).keep_alive(KeepAlive::default())
@@ -281,7 +310,7 @@ async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json
         Err(e) => return Json(serde_json::json!({ "success": false, "error": format!("FFmpeg toolchain: {}", e) })),
     };
 
-    match crate::service_handle::start_processing_loop(&state.service_handle, &config, &state.jobs, &tools) {
+    match crate::service_handle::start_processing_loop(&state.service_handle, &config, &state.jobs, &tools, state.pool.clone()) {
         Ok(()) => Json(serde_json::json!({ "success": true })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
     }
@@ -348,5 +377,297 @@ async fn post_uninstall_service(State(_state): State<ServerState>) -> Json<serde
         Ok(o) if o.status.success() => Json(serde_json::json!({ "success": true, "message": "Uninstalled" })),
         Ok(o) => Json(serde_json::json!({ "success": false, "error": String::from_utf8_lossy(&o.stderr) })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": format!("powershell error: {}", e) })),
+    }
+}
+
+#[derive(Deserialize)]
+struct TrimRequest {
+    trim_in_ms: i64,
+    trim_out_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct RatingRequest {
+    rating: String,
+}
+
+#[derive(Deserialize)]
+struct RenameRequest {
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+struct MoveRequest {
+    virtual_folder: String,
+}
+
+const MAX_BATCH_UUIDS: usize = 500;
+
+async fn list_assets(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let status_filter = params.get("status").map(|s| s.as_str());
+    match db::find_all(&state.pool, status_filter).await {
+        Ok(assets) => {
+            let response: Vec<AssetResponse> = assets.into_iter().map(AssetResponse::from).collect();
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("DB error on list_assets: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_asset(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    match db::find_by_uuid(&state.pool, &uuid).await {
+        Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_asset: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_trim(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<TrimRequest>,
+) -> impl IntoResponse {
+    match db::set_trim(&state.pool, &uuid, body.trim_in_ms, body.trim_out_ms).await {
+        Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
+            Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "asset not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("DB error on put_trim fetch: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_trim: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_rating(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<RatingRequest>,
+) -> impl IntoResponse {
+    if !db::is_valid_rating(&body.rating) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid rating; must be one of K, 8, 12, 16, 18"})),
+        )
+            .into_response();
+    }
+    match db::set_rating(&state.pool, &uuid, &body.rating).await {
+        Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
+            Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "asset not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("DB error on put_rating fetch: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_rating: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_rename(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<RenameRequest>,
+) -> impl IntoResponse {
+    if body.display_name.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "display_name must not be empty"})),
+        )
+            .into_response();
+    }
+    if body.display_name.len() > db::MAX_DISPLAY_NAME_LEN {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("display_name must not exceed {} characters", db::MAX_DISPLAY_NAME_LEN)})),
+        )
+            .into_response();
+    }
+    match db::set_display_name(&state.pool, &uuid, &body.display_name).await {
+        Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
+            Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "asset not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("DB error on put_rename fetch: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_rename: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_move(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<MoveRequest>,
+) -> impl IntoResponse {
+    if !db::is_valid_virtual_folder(&body.virtual_folder) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid virtual_folder; must start with '/', must not contain '..', and must not end with '/' unless root"})),
+        )
+            .into_response();
+    }
+    match db::set_virtual_folder(&state.pool, &uuid, &body.virtual_folder).await {
+        Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
+            Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "asset not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("DB error on put_move fetch: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_move: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_batch(
+    State(state): State<ServerState>,
+    Json(body): Json<Vec<String>>,
+) -> impl IntoResponse {
+    if body.len() > MAX_BATCH_UUIDS {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("max {} UUIDs per batch request", MAX_BATCH_UUIDS)})),
+        )
+            .into_response();
+    }
+
+    let mut seen = HashSet::with_capacity(body.len());
+    for uuid in &body {
+        if !seen.insert(uuid) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "duplicate UUIDs in batch request"})),
+            )
+                .into_response();
+        }
+    }
+
+    match db::find_batch(&state.pool, &body).await {
+        Ok(assets) => {
+            let map: serde_json::Map<String, serde_json::Value> = assets
+                .into_iter()
+                .map(|a| {
+                    let uuid = a.uuid.clone();
+                    let val = serde_json::to_value(AssetResponse::from(a)).unwrap_or_default();
+                    (uuid, val)
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::Value::Object(map))).into_response()
+        }
+        Err(e) => {
+            tracing::error!("DB error on post_batch: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
     }
 }

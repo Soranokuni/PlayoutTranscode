@@ -2,6 +2,7 @@ use crate::bootstrap::ToolPaths;
 use crate::config::AppConfig;
 use crate::jobs::JobQueue;
 use parking_lot::Mutex;
+use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -52,6 +53,7 @@ pub fn start_processing_loop(
     config: &AppConfig,
     job_queue: &JobQueue,
     tools: &ToolPaths,
+    pool: Arc<SqlitePool>,
 ) -> Result<(), String> {
     if *handle.running.lock() {
         return Err("Service already running".into());
@@ -102,9 +104,10 @@ pub fn start_processing_loop(
                         let jq = jobs.clone();
                         let tg = target.clone();
                         let s = sem.clone();
+                        let p = pool.clone();
                         let _permit = s.acquire_owned().await;
                         tokio::task::spawn_blocking(move || {
-                            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c);
+                            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p);
                         });
                     }
                     cmd = cmd_rx.recv() => {

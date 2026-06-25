@@ -1,6 +1,8 @@
 mod bootstrap;
 mod config;
+mod db;
 mod encoder;
+mod fingerprint;
 mod identity;
 mod jobs;
 mod logging;
@@ -14,6 +16,7 @@ mod watcher;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use service_handle::ServiceHandle;
+use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(name = "PlayoutTranscode", version, about = "Broadcast media transcoding service")]
@@ -90,11 +93,25 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
 
     logging::init_logging(&app_config.logging.level);
 
+    profiles::validate_color_constants()
+        .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
+
     let port = app_config.server.web_port;
     let bind_addr = app_config.server.bind_address.clone();
     let url = format!("http://{}:{}", bind_addr, port);
     println!("\n  PlayoutTranscode web UI starting at {}\n", url);
     tracing::info!("PlayoutTranscode starting on {}", url);
+
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let pool = db::init_pool(&exe_dir.join("media_assets.db"))
+        .await
+        .map_err(|e| anyhow::anyhow!("Database init failed: {}", e))?;
+    let pool = Arc::new(pool);
+    tracing::info!("Asset database ready");
 
     let (_, toolchain_status) = bootstrap::audit_toolchain();
     tracing::info!("FFmpeg: {:?}", toolchain_status.ffmpeg_version);
@@ -114,11 +131,8 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
     let port = server_cfg.server.web_port;
     let sh = service_handle.clone();
     let jq = job_queue.clone();
+    let server_pool = pool.clone();
 
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
     let web_ui_dir = exe_dir.join("web-ui").join("dist");
 
     let server_task = tokio::spawn(async move {
@@ -127,6 +141,7 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
             server_cfg,
             toolchain_status.clone(), sh,
             web_ui_dir,
+            server_pool,
         ).await
     });
 
@@ -138,7 +153,7 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
         service_handle.add_log("info", "Auto-starting service with configured watch folder");
         if let Ok(tools) = bootstrap::ensure_toolchain() {
             let _ = service_handle::start_processing_loop(
-                &service_handle, &app_config, &job_queue, &tools,
+                &service_handle, &app_config, &job_queue, &tools, pool.clone(),
             );
         } else {
             service_handle.add_log("warn", "FFmpeg not found. Download from the web UI.");
