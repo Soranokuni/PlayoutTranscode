@@ -32,6 +32,8 @@ pub struct JobRecord {
     pub encode_fps: f64,
     pub encode_bitrate: String,
     pub encode_speed: String,
+    pub current_time_ms: i64,
+    pub duration_ms: i64,
 }
 
 impl JobRecord {
@@ -54,6 +56,8 @@ impl JobRecord {
             encode_fps: 0.0,
             encode_bitrate: String::new(),
             encode_speed: String::new(),
+            current_time_ms: 0,
+            duration_ms: 0,
         }
     }
 }
@@ -151,7 +155,7 @@ impl JobQueue {
     }
 
     pub fn broadcast(&self, event_type: &str, payload: &str) {
-        let msg = format!("event: {}\ndata: {}\n\n", event_type, payload);
-        let _ = self.event_tx.send(msg);
+        let envelope = serde_json::json!({"event": event_type, "data": serde_json::from_str::<serde_json::Value>(payload).unwrap_or(serde_json::Value::String(payload.to_string()))}).to_string();
+        let _ = self.event_tx.send(envelope);
     }
 }

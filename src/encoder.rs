@@ -28,6 +28,8 @@ pub struct EncodeProgress {
     pub fps: f64,
     pub bitrate: String,
     pub speed: String,
+    pub current_time_ms: i64,
+    pub duration_ms: i64,
 }
 
 pub struct EncodeResult {
@@ -62,6 +64,7 @@ pub fn transcode_file(
     args.insert(insert_pos + 3, format!("playoutvue_id={}", metadata_uuid));
 
     let total_frames = source_probe.frame_count;
+    let duration_ms = (source_probe.duration_secs * 1000.0).round() as i64;
 
     let mut command = Command::new(&tools.ffmpeg);
     command.args(&args);
@@ -84,7 +87,7 @@ pub fn transcode_file(
     };
 
     let stderr = child.stderr.take().expect("stderr should be piped");
-    let reader = BufReader::new(stderr);
+    let mut reader = BufReader::new(stderr);
 
     let time_re = &*TIME_RE;
     let frame_re = &*FRAME_RE;
@@ -93,13 +96,34 @@ pub fn transcode_file(
     let speed_re = &*SPEED_RE;
 
     let mut last_frame = 0;
+    let mut stderr_lines: Vec<String> = Vec::new();
+    const STDERR_RING_SIZE: usize = 200;
+    let mut line_buf = String::new();
 
-    for line in reader.lines().flatten() {
-        if let Some(caps) = frame_re.captures(&line) {
+    loop {
+        line_buf.clear();
+        match reader.read_line(&mut line_buf) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Error reading ffmpeg stderr: {}", e);
+                break;
+            }
+        }
+        let line = line_buf.trim_end_matches(|c| c == '\n' || c == '\r');
+        if line.is_empty() {
+            continue;
+        }
+        stderr_lines.push(line.to_string());
+        if stderr_lines.len() > STDERR_RING_SIZE {
+            stderr_lines.remove(0);
+        }
+
+        if let Some(caps) = frame_re.captures(line) {
             last_frame = caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok()).unwrap_or(last_frame);
         }
 
-        let time_str = time_re.captures(&line).map(|caps| {
+        let time_str = time_re.captures(line).map(|caps| {
             format!(
                 "{}:{}:{}.{}",
                 caps.get(1).map_or("00", |m| m.as_str()),
@@ -109,32 +133,31 @@ pub fn transcode_file(
             )
         });
 
-        let fps_val = fps_re.captures(&line)
+        let current_time_ms = time_str.as_ref().map(|ts| {
+            let parts: Vec<f64> = ts.split(':').filter_map(|p| p.parse().ok()).collect();
+            if parts.len() == 4 {
+                (parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] + parts[3] / 100.0) as i64 * 1000
+            } else {
+                0
+            }
+        }).unwrap_or(0);
+
+        let fps_val = fps_re.captures(line)
             .and_then(|caps| caps.get(1).and_then(|m| m.as_str().parse::<f64>().ok()))
             .unwrap_or(0.0);
 
-        let bitrate = bitrate_re.captures(&line)
+        let bitrate = bitrate_re.captures(line)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
             .unwrap_or_default();
 
-        let speed = speed_re.captures(&line)
+        let speed = speed_re.captures(line)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
             .unwrap_or_default();
 
-        let percent = if total_frames > 0 {
+        let percent = if duration_ms > 0 && current_time_ms > 0 {
+            ((current_time_ms as f64 / duration_ms as f64) * 100.0).min(99.0) as f32
+        } else if total_frames > 0 {
             ((last_frame as f32 / total_frames as f32) * 100.0).min(99.0)
-        } else if let Some(ref ts) = time_str {
-            let parts: Vec<f64> = ts.split(':').filter_map(|p| p.parse().ok()).collect();
-            let secs = if parts.len() == 4 {
-                parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] + parts[3] / 100.0
-            } else {
-                0.0
-            };
-            if source_probe.duration_secs > 0.0 {
-                ((secs / source_probe.duration_secs) * 100.0).min(99.0) as f32
-            } else {
-                0.0
-            }
         } else {
             0.0
         };
@@ -147,6 +170,8 @@ pub fn transcode_file(
                 fps: fps_val,
                 bitrate,
                 speed,
+                current_time_ms,
+                duration_ms,
             });
         }
     }
@@ -169,19 +194,32 @@ pub fn transcode_file(
         fps: 0.0,
         bitrate: String::new(),
         speed: String::new(),
+        current_time_ms: duration_ms,
+        duration_ms,
     });
 
     if status.success() {
+        tracing::debug!("FFmpeg stderr ({} lines):\n{}", stderr_lines.len(), stderr_lines.join("\n"));
         EncodeResult {
             output_path: output_path.to_path_buf(),
             success: true,
             error: None,
         }
     } else {
+        let mut error_msg = format!("ffmpeg exited with code {:?}", status.code());
+        if !stderr_lines.is_empty() {
+            let tail_len = stderr_lines.len().min(50);
+            let tail = &stderr_lines[stderr_lines.len() - tail_len..];
+            error_msg.push_str("\n--- FFmpeg stderr (last lines) ---\n");
+            for line in tail {
+                error_msg.push_str(line);
+                error_msg.push('\n');
+            }
+        }
         EncodeResult {
             output_path: output_path.to_path_buf(),
             success: false,
-            error: Some(format!("ffmpeg exited with code {:?}", status.code())),
+            error: Some(error_msg),
         }
     }
 }

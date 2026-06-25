@@ -1,6 +1,8 @@
-use crate::{bootstrap, config, encoder, identity, jobs, probe, profiles};
+use crate::{bootstrap, config, db, encoder, fingerprint, identity, jobs, probe, profiles};
 use chrono::Utc;
+use sqlx::SqlitePool;
 use std::path::Path;
+use uuid::Uuid;
 
 pub fn process_file_sync(
     queue: &jobs::JobQueue,
@@ -8,6 +10,7 @@ pub fn process_file_sync(
     target_root: &Path,
     input_path: &Path,
     config: &config::AppConfig,
+    pool: &SqlitePool,
 ) {
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
     let canonical_input = input_path.canonicalize().unwrap_or_else(|_| input_path.to_path_buf());
@@ -17,9 +20,61 @@ pub fn process_file_sync(
         return;
     }
 
+    let handle = tokio::runtime::Handle::current();
+
+    let fingerprint = match fingerprint::compute_fnv1a64(input_path) {
+        Ok(fp) => fp,
+        Err(e) => {
+            tracing::error!("Fingerprint failed for {}: {}", input_path.display(), e);
+            return;
+        }
+    };
+
+    if let Ok(Some(existing)) = handle.block_on(db::find_by_fingerprint(pool, fingerprint)) {
+        let _ = handle.block_on(db::update_path_by_fingerprint(
+            pool,
+            fingerprint,
+            &input_path.to_string_lossy(),
+        ));
+        tracing::info!(
+            "Dedup: asset {} already exists (fingerprint={}), updating path",
+            existing.uuid,
+            fingerprint,
+        );
+        return;
+    }
+
+    let metadata_uuid = Uuid::new_v4().to_string();
+    let short_uuid = &metadata_uuid[..8];
+    let video_dir = target_root.join("videos");
+    let _ = std::fs::create_dir_all(&video_dir);
+    let safe_stem = identity::sanitize_filename(
+        &input_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy(),
+    );
+    let output_filename = if safe_stem.is_empty() {
+        format!("{}.mp4", short_uuid)
+    } else {
+        format!("{}_{}.mp4", safe_stem, short_uuid)
+    };
+    let output_path = video_dir.join(&output_filename);
+
+    if let Err(e) = handle.block_on(db::insert_processing(
+        pool,
+        &metadata_uuid,
+        fingerprint,
+        &input_path.to_string_lossy(),
+        &safe_stem,
+    )) {
+        tracing::error!("DB insert processing failed for {}: {}", input_path.display(), e);
+    }
+
     let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
     job.state = jobs::JobState::Processing;
     job.current_stage = "Probing".to_string();
+    job.uuid = Some(metadata_uuid.clone());
     queue.push(job.clone());
     queue.broadcast("job_update", &serde_json::json!({"id": job.id, "stage": "Probing"}).to_string());
 
@@ -33,6 +88,8 @@ pub fn process_file_sync(
                 j.finished_at = Some(Utc::now().to_rfc3339());
             });
             tracing::error!("Probe failed for {}: {}", input_path.display(), e);
+            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Probe: {}", e)}).to_string());
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
             return;
         }
     };
@@ -45,6 +102,8 @@ pub fn process_file_sync(
             j.state = jobs::JobState::Failed;
             j.error = Some("Profile disabled".into());
         });
+        queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": "Profile disabled"}).to_string());
+        let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
         return;
     }
 
@@ -53,29 +112,43 @@ pub fn process_file_sync(
         j.current_stage = format!("Encoding {}", profile_name);
         j.source_frame_count = probe_data.frame_count;
         j.duration_secs = probe_data.duration_secs;
+        j.duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
     });
-
-    let output_filename = identity::output_filename(&input_path.to_string_lossy(), &profile_name);
-    let video_dir = target_root.join("videos");
-    let _ = std::fs::create_dir_all(&video_dir);
-    let output_path = video_dir.join(&output_filename);
-
-    let metadata_uuid = identity::generate_uuid();
 
     let (ptx, prx) = std::sync::mpsc::channel::<encoder::EncodeProgress>();
     let jid = job.id.clone();
     let qc = queue.clone();
     std::thread::spawn(move || {
+        let mut last_broadcast = std::time::Instant::now();
+        const THROTTLE_MS: u64 = 250;
         while let Ok(p) = prx.recv() {
-            let pct = if p.total_frames > 0 { p.percent } else { 50.0 };
+            let pct = p.percent;
             qc.update(&jid, |j| {
                 j.progress = pct;
                 j.current_frame = p.frame;
                 j.encode_fps = p.fps;
                 j.encode_bitrate = p.bitrate.clone();
                 j.encode_speed = p.speed.clone();
+                j.current_time_ms = p.current_time_ms;
+                j.duration_ms = p.duration_ms;
                 j.current_stage = if pct >= 100.0 { "Finalizing".into() } else { format!("Encoding {:.0}%", pct) };
             });
+            let now = std::time::Instant::now();
+            if now.duration_since(last_broadcast).as_millis() as u64 >= THROTTLE_MS || pct >= 100.0 {
+                last_broadcast = now;
+                let determinate = p.duration_ms > 0 || p.total_frames > 0;
+                let _ = qc.broadcast("progress", &serde_json::json!({
+                    "id": jid,
+                    "percent": pct,
+                    "current_time_ms": p.current_time_ms,
+                    "duration_ms": p.duration_ms,
+                    "determinate": determinate,
+                    "fps": p.fps,
+                    "bitrate": p.bitrate,
+                    "speed": p.speed,
+                    "stage": if pct >= 100.0 { "Finalizing" } else { "Encoding" },
+                }).to_string());
+            }
         }
     });
 
@@ -84,7 +157,32 @@ pub fn process_file_sync(
     if result.success {
         let output_probe = probe::probe_media(tools, &result.output_path)
             .unwrap_or_else(|_| probe_data.clone());
+        let output_duration = output_probe.duration_secs;
+        let source_duration = probe_data.duration_secs;
+        let tolerance = (source_duration * 0.05).max(2.0);
+        if (output_duration - source_duration).abs() > tolerance {
+            tracing::error!(
+                "Duration mismatch: source={}s output={}s (tolerance={}s)",
+                source_duration, output_duration, tolerance
+            );
+            let err = format!(
+                "Duration mismatch: source {}s vs output {}s",
+                source_duration, output_duration
+            );
+            queue.update(&job.id, |j| {
+                j.state = jobs::JobState::Failed;
+                j.error = Some(err.clone());
+                j.finished_at = Some(Utc::now().to_rfc3339());
+            });
+            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": err}).to_string());
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            let _ = std::fs::remove_file(&result.output_path);
+            queue.prune_old(500);
+            return;
+        }
         let _ = identity::write_sidecar_next_to_video(&result.output_path, &metadata_uuid, &probe_data, &output_probe, &profile_name, "h264", &config.encoding.audio_codec);
+        let duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
+        let _ = handle.block_on(db::mark_ready(pool, &metadata_uuid, &result.output_path.to_string_lossy(), duration_ms));
         queue.update(&job.id, |j| {
             j.state = jobs::JobState::Completed;
             j.uuid = Some(metadata_uuid.clone());
@@ -93,7 +191,7 @@ pub fn process_file_sync(
             j.current_stage = "Completed".into();
             j.finished_at = Some(Utc::now().to_rfc3339());
         });
-        queue.broadcast("job_completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
+        queue.broadcast("completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
         tracing::info!("Completed: {} -> {} (uuid={})", input_path.display(), result.output_path.display(), metadata_uuid);
         if config.ingestion.clean_source_after_success {
             let _ = std::fs::remove_file(input_path);
@@ -106,6 +204,8 @@ pub fn process_file_sync(
             j.current_stage = "Failed".into();
             j.finished_at = Some(Utc::now().to_rfc3339());
         });
+        queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": msg}).to_string());
+        let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
         tracing::error!("Failed: {} - {}", input_path.display(), msg);
         let _ = std::fs::remove_file(&result.output_path);
     }

@@ -45,6 +45,10 @@ pub struct EncodingConfig {
     pub audio_bitrate: String,
     #[serde(default = "default_tune")]
     pub tune: String,
+    #[serde(default = "default_probesize")]
+    pub probesize: String,
+    #[serde(default = "default_analyzeduration")]
+    pub analyzeduration: String,
 }
 
 fn default_preset() -> String { "medium".into() }
@@ -52,6 +56,8 @@ fn default_threads() -> usize { 0 }
 fn default_audio_codec() -> String { "aac".into() }
 fn default_audio_bitrate() -> String { "320k".into() }
 fn default_tune() -> String { "film".into() }
+fn default_probesize() -> String { "500M".into() }
+fn default_analyzeduration() -> String { "500M".into() }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileConfig {
@@ -174,6 +180,8 @@ impl Default for AppConfig {
                 audio_codec: "aac".into(),
                 audio_bitrate: "320k".into(),
                 tune: "film".into(),
+                probesize: "500M".into(),
+                analyzeduration: "500M".into(),
             },
             profile_a: ProfileConfig::profile_a_default(),
             profile_b: ProfileConfig::profile_b_default(),
