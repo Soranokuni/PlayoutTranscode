@@ -7,7 +7,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{sse::{Event, KeepAlive, Sse}, IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{get, post, put, delete},
     Json, Router,
 };
 use parking_lot::Mutex;
@@ -72,8 +72,11 @@ pub async fn run_server(
         .route("/assets/{uuid}", get(get_asset))
         .route("/assets/{uuid}/trim", put(put_trim))
         .route("/assets/{uuid}/rating", put(put_rating))
+        .route("/assets/{uuid}/tp", put(put_tp))
         .route("/assets/{uuid}/rename", put(put_rename))
         .route("/assets/{uuid}/move", put(put_move))
+        .route("/assets/{uuid}/subclip", post(post_subclip))
+        .route("/assets/{uuid}/purge", delete(delete_purge_asset))
         .route("/assets/batch", post(post_batch));
 
     let app = Router::new()
@@ -392,6 +395,11 @@ struct RatingRequest {
 }
 
 #[derive(Deserialize)]
+struct TpRequest {
+    tp: String,
+}
+
+#[derive(Deserialize)]
 struct RenameRequest {
     display_name: String,
 }
@@ -399,6 +407,13 @@ struct RenameRequest {
 #[derive(Deserialize)]
 struct MoveRequest {
     virtual_folder: String,
+}
+
+#[derive(Deserialize)]
+struct SubclipRequest {
+    display_name: String,
+    trim_in_ms: i64,
+    trim_out_ms: i64,
 }
 
 const MAX_BATCH_UUIDS: usize = 500;
@@ -520,6 +535,141 @@ async fn put_rating(
             .into_response(),
         Err(e) => {
             tracing::error!("DB error on put_rating: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_tp(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<TpRequest>,
+) -> impl IntoResponse {
+    match db::set_tp(&state.pool, &uuid, &body.tp).await {
+        Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
+            Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "asset not found"})),
+            )
+                .into_response(),
+            Err(e) => {
+                tracing::error!("DB error on put_tp fetch: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "database error"})),
+                )
+                    .into_response()
+            }
+        },
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_tp: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_subclip(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    Json(body): Json<SubclipRequest>,
+) -> impl IntoResponse {
+    if body.display_name.is_empty() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "display_name must not be empty"})),
+        )
+            .into_response();
+    }
+    if body.display_name.len() > db::MAX_DISPLAY_NAME_LEN {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("display_name must not exceed {} characters", db::MAX_DISPLAY_NAME_LEN)})),
+        )
+            .into_response();
+    }
+    
+    let new_uuid = uuid::Uuid::new_v4().to_string();
+    match db::create_subclip(
+        &state.pool,
+        &new_uuid,
+        &uuid,
+        &body.display_name,
+        body.trim_in_ms,
+        body.trim_out_ms,
+    )
+    .await
+    {
+        Ok(Some(asset)) => (StatusCode::CREATED, Json(AssetResponse::from(asset))).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "parent asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on post_subclip: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_purge_asset(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    match db::find_by_uuid(&state.pool, &uuid).await {
+        Ok(Some(asset)) => {
+            let path_str = asset.current_path.clone();
+            if !path_str.is_empty() {
+                let path = std::path::Path::new(&path_str);
+                if let Err(e) = tokio::fs::remove_file(path).await {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!("Failed to remove physical file at {}: {}", path_str, e);
+                    }
+                }
+            }
+            
+            match db::purge_asset_by_path_or_fingerprint(&state.pool, &asset.current_path, asset.fingerprint).await {
+                Ok(rows) => {
+                    (StatusCode::OK, Json(serde_json::json!({
+                        "success": true,
+                        "purged_records": rows
+                    }))).into_response()
+                }
+                Err(e) => {
+                    tracing::error!("DB error during asset purge: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "database error"})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error finding asset for purge: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "database error"})),
