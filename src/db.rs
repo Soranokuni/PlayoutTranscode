@@ -11,6 +11,7 @@ pub struct MediaAsset {
     pub trim_in_ms: i64,
     pub trim_out_ms: i64,
     pub rating: String,
+    pub tp: String,
     pub status: String,
     pub display_name: String,
     pub virtual_folder: String,
@@ -24,6 +25,7 @@ pub struct AssetResponse {
     pub trim_in_ms: i64,
     pub trim_out_ms: i64,
     pub rating: String,
+    pub tp: String,
     pub status: String,
     pub display_name: String,
     pub virtual_folder: String,
@@ -38,6 +40,7 @@ impl From<MediaAsset> for AssetResponse {
             trim_in_ms: a.trim_in_ms,
             trim_out_ms: a.trim_out_ms,
             rating: a.rating,
+            tp: a.tp,
             status: a.status,
             display_name: a.display_name,
             virtual_folder: a.virtual_folder,
@@ -67,6 +70,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
             trim_in_ms   INTEGER NOT NULL DEFAULT 0,
             trim_out_ms  INTEGER NOT NULL DEFAULT 0,
             rating       TEXT NOT NULL DEFAULT 'K',
+            tp           TEXT NOT NULL DEFAULT 'None',
             status       TEXT NOT NULL DEFAULT 'processing',
             display_name TEXT NOT NULL DEFAULT '',
             virtual_folder TEXT NOT NULL DEFAULT '/'
@@ -82,6 +86,24 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .await
     {
         tracing::debug!("display_name column may already exist: {}", e);
+    }
+
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE media_assets ADD COLUMN rating TEXT NOT NULL DEFAULT 'K'",
+    )
+    .execute(&pool)
+    .await
+    {
+        tracing::debug!("rating column may already exist: {}", e);
+    }
+
+    if let Err(e) = sqlx::query(
+        "ALTER TABLE media_assets ADD COLUMN tp TEXT NOT NULL DEFAULT 'None'",
+    )
+    .execute(&pool)
+    .await
+    {
+        tracing::debug!("tp column may already exist: {}", e);
     }
 
     if let Err(e) = sqlx::query(
@@ -212,7 +234,7 @@ pub async fn find_by_uuid(
     uuid: &str,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
     sqlx::query_as::<_, MediaAsset>(
-        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, status, display_name, virtual_folder FROM media_assets WHERE uuid = ?1",
+        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder FROM media_assets WHERE uuid = ?1",
     )
     .bind(uuid)
     .fetch_optional(pool)
@@ -224,7 +246,7 @@ pub async fn find_by_fingerprint(
     fingerprint: i64,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
     sqlx::query_as::<_, MediaAsset>(
-        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, status, display_name, virtual_folder FROM media_assets WHERE fingerprint = ?1",
+        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder FROM media_assets WHERE fingerprint = ?1",
     )
     .bind(fingerprint)
     .fetch_optional(pool)
@@ -253,18 +275,89 @@ pub async fn set_rating(
     uuid: &str,
     rating: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE uuid = ?2")
-        .bind(rating)
-        .bind(uuid)
+    let asset = find_by_uuid(pool, uuid).await?;
+    if let Some(a) = asset {
+        let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE fingerprint = ?2")
+            .bind(rating)
+            .bind(a.fingerprint)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn set_tp(
+    pool: &SqlitePool,
+    uuid: &str,
+    tp: &str,
+) -> Result<bool, sqlx::Error> {
+    let asset = find_by_uuid(pool, uuid).await?;
+    if let Some(a) = asset {
+        let result = sqlx::query("UPDATE media_assets SET tp = ?1 WHERE fingerprint = ?2")
+            .bind(tp)
+            .bind(a.fingerprint)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    } else {
+        Ok(false)
+    }
+}
+
+pub async fn create_subclip(
+    pool: &SqlitePool,
+    new_uuid: &str,
+    parent_uuid: &str,
+    display_name: &str,
+    trim_in_ms: i64,
+    trim_out_ms: i64,
+) -> Result<Option<MediaAsset>, sqlx::Error> {
+    let parent = find_by_uuid(pool, parent_uuid).await?;
+    if let Some(p) = parent {
+        sqlx::query(
+            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)"
+        )
+        .bind(new_uuid)
+        .bind(p.fingerprint)
+        .bind(&p.current_path)
+        .bind(p.duration_ms)
+        .bind(trim_in_ms)
+        .bind(trim_out_ms)
+        .bind(&p.rating)
+        .bind(&p.tp)
+        .bind(&p.status)
+        .bind(display_name)
+        .bind(&p.virtual_folder)
         .execute(pool)
         .await?;
-    Ok(result.rows_affected() > 0)
+        
+        find_by_uuid(pool, new_uuid).await
+    } else {
+        Ok(None)
+    }
+}
+
+pub async fn purge_asset_by_path_or_fingerprint(
+    pool: &SqlitePool,
+    current_path: &str,
+    fingerprint: i64,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM media_assets WHERE current_path = ?1 OR fingerprint = ?2")
+        .bind(current_path)
+        .bind(fingerprint)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
 }
 
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
 
-pub fn is_valid_rating(_rating: &str) -> bool {
-    true
+pub fn is_valid_rating(rating: &str) -> bool {
+    let trimmed = rating.trim_end_matches('+').to_ascii_uppercase();
+    VALID_RATINGS.contains(&trimmed.as_str()) || trimmed == "NONE" || trimmed.is_empty()
 }
 
 pub const MAX_DISPLAY_NAME_LEN: usize = 255;
@@ -317,14 +410,14 @@ pub async fn find_all(
 ) -> Result<Vec<MediaAsset>, sqlx::Error> {
     if let Some(status) = status_filter {
         sqlx::query_as::<_, MediaAsset>(
-            "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, status, display_name, virtual_folder FROM media_assets WHERE status = ?1 ORDER BY uuid",
+            "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder FROM media_assets WHERE status = ?1 ORDER BY uuid",
         )
         .bind(status)
         .fetch_all(pool)
         .await
     } else {
         sqlx::query_as::<_, MediaAsset>(
-            "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, status, display_name, virtual_folder FROM media_assets ORDER BY uuid",
+            "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder FROM media_assets ORDER BY uuid",
         )
         .fetch_all(pool)
         .await
@@ -340,7 +433,7 @@ pub async fn find_batch(
     }
     let placeholders = uuids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, status, display_name, virtual_folder FROM media_assets WHERE uuid IN ({})",
+        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder FROM media_assets WHERE uuid IN ({})",
         placeholders
     );
     let mut query = sqlx::query_as::<_, MediaAsset>(&sql);
