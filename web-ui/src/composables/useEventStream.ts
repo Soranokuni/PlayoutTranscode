@@ -114,8 +114,18 @@ export function useEventStream() {
     try {
       const r = await fetch('/api' + path)
       if (!r.ok) return null
-      return await r.json()
-    } catch {
+      const text = await r.text()
+      if (!text || text.trim() === '') {
+        return null
+      }
+      try {
+        return JSON.parse(text) as T
+      } catch (parseError) {
+        console.error('[useEventStream] apiGet JSON parse failed:', parseError, '\nBody:', text)
+        return null
+      }
+    } catch (error) {
+      console.error('[useEventStream] apiGet request failed:', error)
       return null
     }
   }
@@ -124,8 +134,18 @@ export function useEventStream() {
     try {
       const r = await fetch('/api' + path, { method: 'POST' })
       if (!r.ok) return null
-      return await r.json()
-    } catch {
+      const text = await r.text()
+      if (!text || text.trim() === '') {
+        return null
+      }
+      try {
+        return JSON.parse(text) as T
+      } catch (parseError) {
+        console.error('[useEventStream] apiPost JSON parse failed:', parseError, '\nBody:', text)
+        return null
+      }
+    } catch (error) {
+      console.error('[useEventStream] apiPost request failed:', error)
       return null
     }
   }
