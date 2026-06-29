@@ -2,3 +2,25 @@
 /web-ui/node_modules/
 /web-ui/dist/
 /dist/
+
+# AI Agent / Kilo Planning files
+.kilo/
+.agents/
+*revamp*.md
+*walkthrough*.md
+*-plan*.md
+
+# Compiled Executables / Installers
+*.exe
+*.msi
+*.msm
+*.msp
+*.app
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.zip
+*.tar.gz
+target/
+
