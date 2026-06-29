@@ -79,6 +79,15 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS virtual_folder_colors (
+            virtual_folder TEXT PRIMARY KEY,
+            color          TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     if let Err(e) = sqlx::query(
         "ALTER TABLE media_assets ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
     )
@@ -442,3 +451,32 @@ pub async fn find_batch(
     }
     query.fetch_all(pool).await
 }
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct FolderColor {
+    pub virtual_folder: String,
+    pub color: String,
+}
+
+pub async fn get_all_folder_colors(pool: &SqlitePool) -> Result<Vec<FolderColor>, sqlx::Error> {
+    sqlx::query_as::<_, FolderColor>("SELECT virtual_folder, color FROM virtual_folder_colors")
+        .fetch_all(pool)
+        .await
+}
+
+pub async fn set_folder_color(
+    pool: &SqlitePool,
+    virtual_folder: &str,
+    color: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO virtual_folder_colors (virtual_folder, color) VALUES (?1, ?2)
+         ON CONFLICT(virtual_folder) DO UPDATE SET color = excluded.color",
+    )
+    .bind(virtual_folder)
+    .bind(color)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+

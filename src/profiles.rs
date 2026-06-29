@@ -18,6 +18,7 @@ impl std::fmt::Display for ProfileId {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EncodingProfile {
     pub id: ProfileId,
@@ -41,34 +42,34 @@ const PROFILE_A: EncodingProfile = EncodingProfile {
     colorspace: "bt709",
     color_trc: "bt709",
     color_primaries: "bt709",
-    profile_h264: "main",
-    level_h264: "4.1",
+    profile_h264: "high",
+    level_h264: "4.2",
 };
 
 const PROFILE_B: EncodingProfile = EncodingProfile {
     id: ProfileId::ProfileB,
     target_width: 1920,
     target_height: 1080,
-    interlaced: true,
+    interlaced: false,
     sar: None,
     colorspace: "bt709",
     color_trc: "bt709",
     color_primaries: "bt709",
-    profile_h264: "main",
-    level_h264: "4.1",
+    profile_h264: "high",
+    level_h264: "4.2",
 };
 
 const PROFILE_C: EncodingProfile = EncodingProfile {
     id: ProfileId::ProfileC,
-    target_width: 720,
-    target_height: 576,
+    target_width: 1920,
+    target_height: 1080,
     interlaced: false,
-    sar: Some("64:45"),
-    colorspace: "smpte170m",
-    color_trc: "smpte170m",
-    color_primaries: "smpte170m",
-    profile_h264: "main",
-    level_h264: "3.0",
+    sar: None,
+    colorspace: "bt709",
+    color_trc: "bt709",
+    color_primaries: "bt709",
+    profile_h264: "high",
+    level_h264: "4.2",
 };
 
 impl EncodingProfile {
@@ -89,7 +90,6 @@ impl EncodingProfile {
     }
 
     pub fn build_ffmpeg_args(&self, config: &AppConfig, input_path: &str, output_path: &str) -> Vec<String> {
-        let pc = self.config_for(config);
         let mut args = vec![
             "-y".to_string(),
             "-hide_banner".to_string(),
@@ -105,47 +105,40 @@ impl EncodingProfile {
         args.extend_from_slice(&["-vf".to_string(), vf]);
 
         args.extend_from_slice(&["-vsync".to_string(), "cfr".to_string()]);
-        args.extend_from_slice(&["-c:v".to_string(), "libx264".to_string()]);
-        args.extend_from_slice(&["-preset".to_string(), config.encoding.preset.clone()]);
-
-        let tune = config.encoding.tune.clone();
-        if tune != "none" {
-            args.extend_from_slice(&["-tune".to_string(), tune]);
-        }
-
-        args.extend_from_slice(&["-crf".to_string(), pc.crf.to_string()]);
-        args.extend_from_slice(&["-maxrate".to_string(), pc.maxrate.clone()]);
-        args.extend_from_slice(&["-bufsize".to_string(), pc.bufsize.clone()]);
-        args.extend_from_slice(&["-profile:v".to_string(), self.profile_h264.to_string()]);
-        args.extend_from_slice(&["-level:v".to_string(), self.level_h264.to_string()]);
-        args.extend_from_slice(&["-pix_fmt".to_string(), "yuv420p".to_string()]);
-
+        
+        // Video Codec & Format
         args.extend_from_slice(&[
-            "-colorspace".to_string(), self.colorspace.to_string(),
-            "-color_trc".to_string(), self.color_trc.to_string(),
-            "-color_primaries".to_string(), self.color_primaries.to_string(),
+            "-f".to_string(), "mp4".to_string(),
+            "-c:v".to_string(), "libx264".to_string(),
+            "-preset".to_string(), "fast".to_string(),
+            "-crf".to_string(), "20".to_string(),
+            "-profile:v".to_string(), "high".to_string(),
+            "-level".to_string(), "4.2".to_string(), // Correct: no :v suffix for libx264 encoder level option
+            "-pix_fmt".to_string(), "yuv420p".to_string(),
         ]);
 
-        if self.interlaced {
-            args.extend_from_slice(&[
-                "-top".to_string(), "1".to_string(),
-                "-field_order".to_string(), "tt".to_string(),
-            ]);
-        }
-
+        // Explicitly force standard BT.709 color properties for HD display compatibility
         args.extend_from_slice(&[
-            "-g".to_string(), "50".to_string(),
-            "-keyint_min".to_string(), "50".to_string(),
+            "-colorspace".to_string(), "bt709".to_string(),
+            "-color_trc".to_string(), "bt709".to_string(),
+            "-color_primaries".to_string(), "bt709".to_string(),
+        ]);
+
+        // Closed GOP seeking optimization:
+        // -g 25: forces keyframe every 25 frames (exactly 1 second at 25fps)
+        // -keyint_min 25: prevents keyframes from being generated more frequently than 1 second
+        // -sc_threshold 0: disables scene-change dynamic keyframes to avoid drift
+        // -flags +cgop: forces strictly closed GOPs
+        args.extend_from_slice(&[
+            "-g".to_string(), "25".to_string(),
+            "-keyint_min".to_string(), "25".to_string(),
             "-sc_threshold".to_string(), "0".to_string(),
+            "-flags".to_string(), "+cgop".to_string(),
         ]);
 
-        let x264_params = if self.interlaced {
-            "open-gop=0:interlaced=1:pic-struct=1"
-        } else {
-            "open-gop=0"
-        };
+        // open-gop=0 disables open GOPs in libx264 params; faststart enables quick media loading
         args.extend_from_slice(&[
-            "-x264-params".to_string(), x264_params.to_string(),
+            "-x264-params".to_string(), "open-gop=0".to_string(),
             "-movflags".to_string(), "+faststart".to_string(),
         ]);
 
@@ -160,11 +153,13 @@ impl EncodingProfile {
             "-map".to_string(), "0:a:0?".to_string(),
         ]);
 
-        args.extend_from_slice(&["-c:a".to_string(), config.encoding.audio_codec.clone()]);
-        if config.encoding.audio_codec == "aac" || config.encoding.audio_codec == "libmp3lame" {
-            args.extend_from_slice(&["-b:a".to_string(), config.encoding.audio_bitrate.clone()]);
-        }
-        args.extend_from_slice(&["-ar".to_string(), "48000".to_string(), "-ac".to_string(), "2".to_string()]);
+        // Audio conversion specifications (AAC stereo 256k at 48kHz)
+        args.extend_from_slice(&[
+            "-c:a".to_string(), "aac".to_string(),
+            "-b:a".to_string(), "256k".to_string(),
+            "-ar".to_string(), "48000".to_string(),
+            "-ac".to_string(), "2".to_string(),
+        ]);
 
         args.extend_from_slice(&["-max_muxing_queue_size".to_string(), "4096".to_string()]);
 
@@ -173,20 +168,13 @@ impl EncodingProfile {
     }
 
     fn build_vf(&self) -> String {
-        if let Some(sar) = self.sar {
-            format!(
-                "fps=25,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,setsar={},format=yuv420p",
-                self.target_width, self.target_height,
-                self.target_width, self.target_height,
-                sar
-            )
-        } else {
-            format!(
-                "fps=25,scale={}:{}:force_original_aspect_ratio=decrease,pad={}:{}:(ow-iw)/2:(oh-ih)/2,format=yuv420p",
-                self.target_width, self.target_height,
-                self.target_width, self.target_height,
-            )
-        }
+        // Smart Retro Scaling Filter graph:
+        // 1. fps=25: forces frame rate conversion to constant 25fps (required for 1s keyframe sync)
+        // 2. scale=1920:1080:force_original_aspect_ratio=decrease: scales to fit boundaries
+        // 3. pad=1920:1080:(ow-iw)/2:(oh-ih)/2: centers and pillarboxes/letterboxes retro/odd content to 1920x1080
+        // 4. setsar=1: forces standard 1:1 square pixel aspect ratio
+        // 5. format=yuv420p: output standard colorspace
+        "fps=25,scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p".to_string()
     }
 }
 

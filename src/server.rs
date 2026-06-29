@@ -77,7 +77,8 @@ pub async fn run_server(
         .route("/assets/{uuid}/move", put(put_move))
         .route("/assets/{uuid}/subclip", post(post_subclip))
         .route("/assets/{uuid}/purge", delete(delete_purge_asset))
-        .route("/assets/batch", post(post_batch));
+        .route("/assets/batch", post(post_batch))
+        .route("/folders/colors", get(get_folder_colors).put(put_folder_color));
 
     let app = Router::new()
         .nest("/api", api)
@@ -821,3 +822,48 @@ async fn post_batch(
         }
     }
 }
+
+#[derive(serde::Deserialize)]
+struct SetFolderColorRequest {
+    virtual_folder: String,
+    color: String,
+}
+
+async fn get_folder_colors(State(state): State<ServerState>) -> impl IntoResponse {
+    match db::get_all_folder_colors(&state.pool).await {
+        Ok(colors) => (StatusCode::OK, Json(colors)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_folder_colors: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn put_folder_color(
+    State(state): State<ServerState>,
+    Json(body): Json<SetFolderColorRequest>,
+) -> impl IntoResponse {
+    if !db::is_valid_virtual_folder(&body.virtual_folder) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid virtual_folder"})),
+        )
+            .into_response();
+    }
+    match db::set_folder_color(&state.pool, &body.virtual_folder, &body.color).await {
+        Ok(_) => StatusCode::OK.into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_folder_color: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
