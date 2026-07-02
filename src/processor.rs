@@ -154,32 +154,73 @@ pub fn process_file_sync(
 
     let result = encoder::transcode_file(tools, config, input_path, &probe_data, profile_id, &output_path, &metadata_uuid, ptx);
 
+    let mut validation_ok = false;
+    let mut validation_error = String::new();
+    let mut final_probe = None;
+
     if result.success {
-        let output_probe = probe::probe_media(tools, &result.output_path)
-            .unwrap_or_else(|_| probe_data.clone());
-        let output_duration = output_probe.duration_secs;
-        let source_duration = probe_data.duration_secs;
-        let tolerance = (source_duration * 0.05).max(2.0);
-        if (output_duration - source_duration).abs() > tolerance {
-            tracing::error!(
-                "Duration mismatch: source={}s output={}s (tolerance={}s)",
-                source_duration, output_duration, tolerance
-            );
-            let err = format!(
-                "Duration mismatch: source {}s vs output {}s",
-                source_duration, output_duration
-            );
-            queue.update(&job.id, |j| {
-                j.state = jobs::JobState::Failed;
-                j.error = Some(err.clone());
-                j.finished_at = Some(Utc::now().to_rfc3339());
-            });
-            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": err}).to_string());
-            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
-            let _ = std::fs::remove_file(&result.output_path);
-            queue.prune_old(500);
-            return;
+        // 1. File existence and size check
+        let file_ok = if result.output_path.exists() {
+            if let Ok(metadata) = std::fs::metadata(&result.output_path) {
+                metadata.len() > 0
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        if !file_ok {
+            validation_error = "File does not exist or has 0 bytes".to_string();
+        } else {
+            // 2. Write lock verification
+            let lock_ok = match std::fs::OpenOptions::new().read(true).write(true).open(&result.output_path) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::error!("Write lock check failed for output file {:?}: {}", result.output_path, e);
+                    false
+                }
+            };
+
+            if !lock_ok {
+                validation_error = "File write lock check failed (still being written or locked)".to_string();
+            } else {
+                // 3. FFprobe validation run
+                match probe::probe_media(tools, &result.output_path) {
+                    Ok(p) => {
+                        // Check for at least one valid video stream and one valid audio stream
+                        if p.width == 0 || p.height == 0 {
+                            validation_error = "No valid video stream found in output file".to_string();
+                        } else if p.audio_codec == "none" {
+                            validation_error = "No valid audio stream found in output file".to_string();
+                        } else {
+                            // Check that duration matches expected duration within a tolerance
+                            let output_duration = p.duration_secs;
+                            let source_duration = probe_data.duration_secs;
+                            let tolerance = (source_duration * 0.05).max(2.0);
+                            if (output_duration - source_duration).abs() > tolerance {
+                                validation_error = format!(
+                                    "Duration mismatch: source={}s output={}s (tolerance={}s)",
+                                    source_duration, output_duration, tolerance
+                                );
+                            } else {
+                                validation_ok = true;
+                                final_probe = Some(p);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        validation_error = format!("FFprobe validation failed on output file: {}", e);
+                    }
+                }
+            }
         }
+    } else {
+        validation_error = result.error.unwrap_or_else(|| "FFmpeg encoding failed".to_string());
+    }
+
+    if validation_ok && final_probe.is_some() {
+        let output_probe = final_probe.unwrap();
         let _ = identity::write_sidecar_next_to_video(&result.output_path, &metadata_uuid, &probe_data, &output_probe, &profile_name, "h264", &config.encoding.audio_codec);
         let duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
         let _ = handle.block_on(db::mark_ready(pool, &metadata_uuid, &result.output_path.to_string_lossy(), duration_ms));
@@ -192,22 +233,23 @@ pub fn process_file_sync(
             j.finished_at = Some(Utc::now().to_rfc3339());
         });
         queue.broadcast("completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
-        tracing::info!("Completed: {} -> {} (uuid={})", input_path.display(), result.output_path.display(), metadata_uuid);
+        tracing::info!("Completed and verified: {} -> {} (uuid={})", input_path.display(), result.output_path.display(), metadata_uuid);
         if config.ingestion.clean_source_after_success {
             let _ = std::fs::remove_file(input_path);
         }
     } else {
-        let msg = result.error.unwrap_or_default();
         queue.update(&job.id, |j| {
             j.state = jobs::JobState::Failed;
-            j.error = Some(msg.clone());
+            j.error = Some(validation_error.clone());
             j.current_stage = "Failed".into();
             j.finished_at = Some(Utc::now().to_rfc3339());
         });
-        queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": msg}).to_string());
+        queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": validation_error}).to_string());
         let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
-        tracing::error!("Failed: {} - {}", input_path.display(), msg);
-        let _ = std::fs::remove_file(&result.output_path);
+        tracing::error!("Failed transcode validation: {} - {}", input_path.display(), validation_error);
+        if result.output_path.exists() {
+            let _ = std::fs::remove_file(&result.output_path);
+        }
     }
     queue.prune_old(500);
 }
