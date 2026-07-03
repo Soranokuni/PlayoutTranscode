@@ -136,7 +136,6 @@ impl EncodingProfile {
         // -sc_threshold 0: disables scene-change dynamic keyframes to avoid drift
         // -flags +cgop: forces strictly closed GOPs
         args.extend_from_slice(&[
-            "-force_key_frames".to_string(), "expr:gte(t,n_forced*2)".to_string(),
             "-g".to_string(), "50".to_string(),
             "-keyint_min".to_string(), "50".to_string(),
             "-sc_threshold".to_string(), "0".to_string(),

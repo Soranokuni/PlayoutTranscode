@@ -86,7 +86,17 @@ pub fn transcode_file(
         }
     };
 
-    let stderr = child.stderr.take().expect("stderr should be piped");
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            return EncodeResult {
+                output_path: output_path.to_path_buf(),
+                success: false,
+                error: Some("Failed to pipe stderr from ffmpeg process".to_string()),
+            };
+        }
+    };
     let mut reader = BufReader::new(stderr);
 
     let time_re = &*TIME_RE;

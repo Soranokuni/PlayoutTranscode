@@ -259,7 +259,7 @@ pub fn process_file_sync(
         }
 
         let total_frames = output_probe.frame_count;
-        let gop_frames = 25; // default closed GOP size in our profiles
+        let gop_frames = 50; // default closed GOP size in our profiles
 
         let _ = identity::write_sidecar_next_to_video(
             &result.output_path, 
@@ -328,17 +328,17 @@ fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
     let start = std::time::Instant::now();
     let mut last_size = None;
     loop {
-        let size = std::fs::metadata(path).map(|m| m.len()).ok();
-        if let Some(s) = size {
-            if s > 0 {
-                if let Some(prev) = last_size {
-                    if prev == s {
-                        return true;
-                    }
-                }
-                last_size = Some(s);
-            }
+        let size = std::fs::metadata(path)
+            .map(|m| m.len())
+            .ok()
+            .filter(|&s| s > 0);
+
+        match (size, last_size) {
+            (Some(s), Some(prev)) if s == prev => return true,
+            (Some(s), _) => last_size = Some(s),
+            (None, _) => last_size = None,
         }
+
         if start.elapsed().as_millis() as u64 > timeout_ms {
             tracing::warn!("Timeout waiting for file flush on {:?}", path);
             return false;

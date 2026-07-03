@@ -90,11 +90,11 @@ pub async fn watch_loop(
     let mut queued: HashMap<PathBuf, (u64, u64)> = HashMap::new();
     let stable_polls_min = stable_polls_min.max(1);
 
-    let mut notify_rx = match create_notify_watcher(&watch_root) {
-        Ok((_, rx)) => Some(rx),
+    let (_watcher, mut notify_rx) = match create_notify_watcher(&watch_root) {
+        Ok((watcher, rx)) => (Some(watcher), Some(rx)),
         Err(e) => {
             tracing::warn!("Filesystem watcher unavailable ({}), using polling only", e);
-            None
+            (None, None)
         }
     };
 
