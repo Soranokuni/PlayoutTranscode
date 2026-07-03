@@ -99,6 +99,8 @@ impl EncodingProfile {
             "-probesize".to_string(), config.encoding.probesize.clone(),
             "-fflags".to_string(), "+genpts".to_string(),
             "-i".to_string(), input_path.to_string(),
+            "-map_metadata".to_string(), "-1".to_string(),
+            "-map_chapters".to_string(), "-1".to_string(),
         ];
 
         let vf = self.build_vf();
@@ -115,6 +117,9 @@ impl EncodingProfile {
             "-profile:v".to_string(), "high".to_string(),
             "-level".to_string(), "4.2".to_string(), // Correct: no :v suffix for libx264 encoder level option
             "-pix_fmt".to_string(), "yuv420p".to_string(),
+            "-r".to_string(), "25".to_string(),
+            "-force_key_frames".to_string(), "expr:gte(t,n_forced*1)".to_string(),
+            "-video_track_timescale".to_string(), "90000".to_string(),
         ]);
 
         // Explicitly force standard BT.709 color properties for HD display compatibility
@@ -159,6 +164,7 @@ impl EncodingProfile {
             "-b:a".to_string(), "256k".to_string(),
             "-ar".to_string(), "48000".to_string(),
             "-ac".to_string(), "2".to_string(),
+            "-async".to_string(), "1".to_string(),
         ]);
 
         args.extend_from_slice(&["-max_muxing_queue_size".to_string(), "4096".to_string()]);

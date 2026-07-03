@@ -13,6 +13,18 @@ pub struct SidecarPayload {
     pub profile_used: String,
     pub original_source: SourceInfo,
     pub output_media: OutputInfo,
+    #[serde(default)]
+    pub mezzanine_ok: bool,
+    #[serde(default)]
+    pub fps: f64,
+    #[serde(default)]
+    pub total_frames: i64,
+    #[serde(default)]
+    pub gop_frames: i64,
+    #[serde(default)]
+    pub keyframe_safe_start_ms: i64,
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +65,12 @@ pub fn write_sidecar_next_to_video(
     profile_name: &str,
     target_codec: &str,
     target_audio_codec: &str,
+    mezzanine_ok: bool,
+    fps: f64,
+    total_frames: i64,
+    gop_frames: i64,
+    keyframe_safe_start_ms: i64,
+    warnings: &[String],
 ) -> Result<PathBuf, String> {
     let sidecar_path = sidecar_path_for(output_path);
     let filename = output_path
@@ -89,6 +107,12 @@ pub fn write_sidecar_next_to_video(
             fps_num: output_probe.fps_num,
             fps_den: output_probe.fps_den,
         },
+        mezzanine_ok,
+        fps,
+        total_frames,
+        gop_frames,
+        keyframe_safe_start_ms,
+        warnings: warnings.to_vec(),
     };
 
     let json = serde_json::to_string_pretty(&payload)
