@@ -154,6 +154,9 @@ pub fn process_file_sync(
 
     let result = encoder::transcode_file(tools, config, input_path, &probe_data, profile_id, &output_path, &metadata_uuid, ptx);
 
+    // 500ms debounce sleep after the encoder finishes
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     let mut validation_ok = false;
     let mut validation_error = String::new();
     let mut final_probe = None;
@@ -173,11 +176,25 @@ pub fn process_file_sync(
         if !file_ok {
             validation_error = "File does not exist or has 0 bytes".to_string();
         } else {
-            // 2. Write lock verification
-            let lock_ok = match std::fs::OpenOptions::new().read(true).write(true).open(&result.output_path) {
+            // 2. Write lock verification with exclusive write access
+            #[cfg(target_os = "windows")]
+            let lock_res = {
+                use std::os::windows::fs::OpenOptionsExt;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(0)
+                    .open(&result.output_path)
+            };
+
+            #[cfg(not(target_os = "windows"))]
+            let lock_res = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&result.output_path);
+
+            let lock_ok = match lock_res {
                 Ok(_) => true,
                 Err(e) => {
-                    tracing::error!("Write lock check failed for output file {:?}: {}", result.output_path, e);
+                    tracing::error!("Exclusive write lock check failed for output file {:?}: {}", result.output_path, e);
                     false
                 }
             };
@@ -221,9 +238,56 @@ pub fn process_file_sync(
 
     if validation_ok && final_probe.is_some() {
         let output_probe = final_probe.unwrap();
-        let _ = identity::write_sidecar_next_to_video(&result.output_path, &metadata_uuid, &probe_data, &output_probe, &profile_name, "h264", &config.encoding.audio_codec);
-        let duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
-        let _ = handle.block_on(db::mark_ready(pool, &metadata_uuid, &result.output_path.to_string_lossy(), duration_ms));
+        
+        let keyframe_safe_start_ms = probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
+        
+        let mut warnings_list = Vec::new();
+        let mut mezzanine_ok = true;
+
+        let fps = output_probe.fps();
+        let expected_fps = 25.0;
+        if (fps - expected_fps).abs() > 0.01 {
+            warnings_list.push(format!("fps_mismatch: got {:.3} expected {:.3}", fps, expected_fps));
+            mezzanine_ok = false;
+        }
+
+        let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
+        if duration_ms == 0 {
+            warnings_list.push("zero_duration".to_string());
+            mezzanine_ok = false;
+        }
+
+        let total_frames = output_probe.frame_count;
+        let gop_frames = 25; // default closed GOP size in our profiles
+
+        let _ = identity::write_sidecar_next_to_video(
+            &result.output_path, 
+            &metadata_uuid, 
+            &probe_data, 
+            &output_probe, 
+            &profile_name, 
+            "h264", 
+            &config.encoding.audio_codec,
+            mezzanine_ok,
+            fps,
+            total_frames,
+            gop_frames,
+            keyframe_safe_start_ms,
+            &warnings_list,
+        );
+
+        let _ = handle.block_on(db::mark_ready(
+            pool, 
+            &metadata_uuid, 
+            &result.output_path.to_string_lossy(), 
+            duration_ms,
+            mezzanine_ok,
+            fps,
+            total_frames,
+            gop_frames,
+            keyframe_safe_start_ms,
+            &warnings_list,
+        ));
         queue.update(&job.id, |j| {
             j.state = jobs::JobState::Completed;
             j.uuid = Some(metadata_uuid.clone());

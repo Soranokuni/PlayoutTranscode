@@ -830,21 +830,19 @@ struct SetFolderColorRequest {
 }
 
 async fn get_folder_colors(State(state): State<ServerState>) -> impl IntoResponse {
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+
     match db::get_all_folder_colors(&state.pool).await {
         Ok(colors) => {
-            if colors.is_empty() {
-                (StatusCode::OK, Json(serde_json::json!({}))).into_response()
-            } else {
-                (StatusCode::OK, Json(colors)).into_response()
-            }
+            (StatusCode::OK, headers, Json(colors)).into_response()
         }
         Err(e) => {
             tracing::error!("DB error on get_folder_colors: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-                .into_response()
+            (StatusCode::OK, headers, Json(serde_json::json!([]))).into_response()
         }
     }
 }

@@ -252,3 +252,31 @@ fn parse_fps_value(value: &FfprobeValue) -> (i64, i64) {
         }
     }
 }
+
+pub fn get_keyframe_safe_start_ms(ffprobe_path: &Path, path: &Path) -> i64 {
+    let mut command = Command::new(ffprobe_path);
+    command.args([
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_entries", "frame=pkt_pts_time",
+        "-of", "csv=p=0",
+    ]);
+    command.arg(path);
+
+    #[cfg(target_os = "windows")]
+    command.creation_flags(CREATE_NO_WINDOW);
+
+    let out = command.output();
+    
+    if let Ok(output) = out {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if let Some(first_line) = text.lines().next() {
+            if let Ok(t_sec) = first_line.trim().parse::<f64>() {
+                return (t_sec * 1000.0).round() as i64;
+            }
+        }
+    }
+    0
+}
+
