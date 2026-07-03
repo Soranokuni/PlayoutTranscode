@@ -327,6 +327,7 @@ pub fn process_file_sync(
 fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
     let start = std::time::Instant::now();
     let mut last_size = None;
+    let mut stable_count = 0;
     loop {
         let size = std::fs::metadata(path)
             .map(|m| m.len())
@@ -334,9 +335,20 @@ fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
             .filter(|&s| s > 0);
 
         match (size, last_size) {
-            (Some(s), Some(prev)) if s == prev => return true,
-            (Some(s), _) => last_size = Some(s),
-            (None, _) => last_size = None,
+            (Some(s), Some(prev)) if s == prev => {
+                stable_count += 1;
+                if stable_count >= 3 {
+                    return true;
+                }
+            }
+            (Some(s), _) => {
+                stable_count = 1;
+                last_size = Some(s);
+            }
+            (None, _) => {
+                stable_count = 0;
+                last_size = None;
+            }
         }
 
         if start.elapsed().as_millis() as u64 > timeout_ms {
