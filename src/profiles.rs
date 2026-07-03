@@ -106,7 +106,10 @@ impl EncodingProfile {
         let vf = self.build_vf();
         args.extend_from_slice(&["-vf".to_string(), vf]);
 
-        args.extend_from_slice(&["-vsync".to_string(), "cfr".to_string()]);
+        args.extend_from_slice(&[
+            "-fps_mode".to_string(), "cfr".to_string(),
+            "-video_track_timescale".to_string(), "90000".to_string(),
+        ]);
         
         // Video Codec & Format
         args.extend_from_slice(&[
@@ -118,8 +121,6 @@ impl EncodingProfile {
             "-level".to_string(), "4.2".to_string(), // Correct: no :v suffix for libx264 encoder level option
             "-pix_fmt".to_string(), "yuv420p".to_string(),
             "-r".to_string(), "25".to_string(),
-            "-force_key_frames".to_string(), "expr:gte(t,n_forced*1)".to_string(),
-            "-video_track_timescale".to_string(), "90000".to_string(),
         ]);
 
         // Explicitly force standard BT.709 color properties for HD display compatibility
@@ -130,20 +131,21 @@ impl EncodingProfile {
         ]);
 
         // Closed GOP seeking optimization:
-        // -g 25: forces keyframe every 25 frames (exactly 1 second at 25fps)
-        // -keyint_min 25: prevents keyframes from being generated more frequently than 1 second
+        // -g 50: forces keyframe every 50 frames (exactly 2 seconds at 25fps)
+        // -keyint_min 50: prevents keyframes from being generated more frequently than 2 seconds
         // -sc_threshold 0: disables scene-change dynamic keyframes to avoid drift
         // -flags +cgop: forces strictly closed GOPs
         args.extend_from_slice(&[
-            "-g".to_string(), "25".to_string(),
-            "-keyint_min".to_string(), "25".to_string(),
+            "-force_key_frames".to_string(), "expr:gte(t,n_forced*2)".to_string(),
+            "-g".to_string(), "50".to_string(),
+            "-keyint_min".to_string(), "50".to_string(),
             "-sc_threshold".to_string(), "0".to_string(),
             "-flags".to_string(), "+cgop".to_string(),
+            "-x264-params".to_string(), "open-gop=0:keyint=50:min-keyint=50:scenecut=0".to_string(),
         ]);
 
         // open-gop=0 disables open GOPs in libx264 params; faststart enables quick media loading
         args.extend_from_slice(&[
-            "-x264-params".to_string(), "open-gop=0".to_string(),
             "-movflags".to_string(), "+faststart".to_string(),
         ]);
 

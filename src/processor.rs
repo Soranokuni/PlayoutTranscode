@@ -154,8 +154,9 @@ pub fn process_file_sync(
 
     let result = encoder::transcode_file(tools, config, input_path, &probe_data, profile_id, &output_path, &metadata_uuid, ptx);
 
-    // 500ms debounce sleep after the encoder finishes
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    if result.success {
+        wait_for_file_flush(&result.output_path, 3000);
+    }
 
     let mut validation_ok = false;
     let mut validation_error = String::new();
@@ -276,6 +277,10 @@ pub fn process_file_sync(
             &warnings_list,
         );
 
+        let ffprobe_str = tools.ffprobe.to_str().unwrap_or("");
+        let keyframe_offsets = extract_keyframe_offsets_ms(ffprobe_str, &result.output_path);
+        let keyframe_offsets_json = serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
+
         let _ = handle.block_on(db::mark_ready(
             pool, 
             &metadata_uuid, 
@@ -287,6 +292,7 @@ pub fn process_file_sync(
             gop_frames,
             keyframe_safe_start_ms,
             &warnings_list,
+            &keyframe_offsets_json,
         ));
         queue.update(&job.id, |j| {
             j.state = jobs::JobState::Completed;
@@ -316,4 +322,67 @@ pub fn process_file_sync(
         }
     }
     queue.prune_old(500);
+}
+
+fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
+    let start = std::time::Instant::now();
+    let mut last_size = None;
+    loop {
+        let size = std::fs::metadata(path).map(|m| m.len()).ok();
+        if let Some(s) = size {
+            if s > 0 {
+                if let Some(prev) = last_size {
+                    if prev == s {
+                        return true;
+                    }
+                }
+                last_size = Some(s);
+            }
+        }
+        if start.elapsed().as_millis() as u64 > timeout_ms {
+            tracing::warn!("Timeout waiting for file flush on {:?}", path);
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
+    let output = match std::process::Command::new(ffprobe)
+        .args(&[
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-skip_frame",
+            "nokey",
+            "-show_entries",
+            "frame=pkt_pts_time",
+            "-of",
+            "csv=p=0",
+        ])
+        .arg(path)
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::error!("Failed to execute ffprobe for keyframe scanning: {}", e);
+            return Vec::new();
+        }
+    };
+
+    if !output.status.success() {
+        let err_msg = String::from_utf8_lossy(&output.stderr);
+        tracing::error!("ffprobe keyframe scanning failed: {}", err_msg);
+        return Vec::new();
+    }
+
+    let stdout_str = String::from_utf8_lossy(&output.stdout);
+    stdout_str
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| line.parse::<f64>().ok())
+        .map(|t| (t * 1000.0).round() as i64)
+        .collect()
 }
