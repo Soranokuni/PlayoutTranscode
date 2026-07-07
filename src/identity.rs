@@ -7,23 +7,24 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarPayload {
     pub playoutvue_id: String,
+    pub id: String,
+    pub path: String,
+    pub duration_ms: i64,
+    pub trim_in_ms: i64,
+    pub trim_out_ms: i64,
+    pub fps_num: i64,
+    pub fps_den: i64,
+    pub mezzanine_ok: bool,
     pub filename: String,
     pub filepath: String,
     pub transcoded_at: String,
     pub profile_used: String,
     pub original_source: SourceInfo,
     pub output_media: OutputInfo,
-    #[serde(default)]
-    pub mezzanine_ok: bool,
-    #[serde(default)]
     pub fps: f64,
-    #[serde(default)]
     pub total_frames: i64,
-    #[serde(default)]
     pub gop_frames: i64,
-    #[serde(default)]
     pub keyframe_safe_start_ms: i64,
-    #[serde(default)]
     pub warnings: Vec<String>,
 }
 
@@ -49,6 +50,8 @@ pub struct OutputInfo {
     pub height: i64,
     pub codec: String,
     pub audio_codec: String,
+    pub audio_sample_rate: i64,
+    pub audio_channels: i64,
     pub fps_num: i64,
     pub fps_den: i64,
 }
@@ -65,8 +68,11 @@ pub fn write_sidecar_next_to_video(
     profile_name: &str,
     target_codec: &str,
     target_audio_codec: &str,
+    duration_ms: i64,
     mezzanine_ok: bool,
     fps: f64,
+    fps_num: i64,
+    fps_den: i64,
     total_frames: i64,
     gop_frames: i64,
     keyframe_safe_start_ms: i64,
@@ -78,11 +84,20 @@ pub fn write_sidecar_next_to_video(
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned();
+    let filepath = output_path.to_string_lossy().into_owned();
 
     let payload = SidecarPayload {
         playoutvue_id: uuid.to_string(),
+        id: uuid.to_string(),
+        path: filepath.clone(),
+        duration_ms,
+        trim_in_ms: 0,
+        trim_out_ms: duration_ms,
+        fps_num,
+        fps_den,
+        mezzanine_ok,
         filename: filename.clone(),
-        filepath: output_path.to_string_lossy().into_owned(),
+        filepath: filepath.clone(),
         transcoded_at: Utc::now().to_rfc3339(),
         profile_used: profile_name.to_string(),
         original_source: SourceInfo {
@@ -104,10 +119,11 @@ pub fn write_sidecar_next_to_video(
             height: output_probe.height,
             codec: target_codec.to_string(),
             audio_codec: target_audio_codec.to_string(),
+            audio_sample_rate: output_probe.audio_sample_rate,
+            audio_channels: output_probe.audio_channels,
             fps_num: output_probe.fps_num,
             fps_den: output_probe.fps_den,
         },
-        mezzanine_ok,
         fps,
         total_frames,
         gop_frames,

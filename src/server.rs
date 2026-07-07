@@ -16,6 +16,7 @@ use sqlx::SqlitePool;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt};
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 pub struct ServerState {
@@ -55,7 +56,9 @@ pub async fn run_server(
         .route("/jobs/completed", get(list_completed_jobs))
         .route("/jobs/failed", get(list_failed_jobs))
         .route("/jobs/pending", get(list_pending_jobs))
-        .route("/config", get(get_config))
+        .route("/jobs/{id}/retry", post(post_retry_job))
+        .route("/jobs/retry-failed", post(post_retry_all_failed))
+        .route("/config", get(get_config).put(put_config))
         .route("/toolchain", get(get_toolchain_status))
         .route("/events", get(sse_events))
         .route("/stats", get(get_stats))
@@ -83,6 +86,7 @@ pub async fn run_server(
     let app = Router::new()
         .nest("/api", api)
         .fallback(serve_spa)
+        .layer(CorsLayer::permissive())
         .with_state(state);
 
     let addr = format!("{}:{}", bind_address, port);
@@ -172,56 +176,226 @@ async fn list_pending_jobs(State(state): State<ServerState>) -> Json<Vec<crate::
 
 async fn get_config(State(state): State<ServerState>) -> Json<serde_json::Value> {
     let config = state.config.lock();
-    Json(serde_json::json!({
-        "paths": {
-            "watch_folder": config.paths.watch_folder,
-            "target_folder": config.paths.target_folder,
-        },
-        "server": {
-            "web_port": config.server.web_port,
-            "bind_address": config.server.bind_address,
-        },
-        "encoding": {
-            "preset": config.encoding.preset,
-            "ffmpeg_threads": config.encoding.ffmpeg_threads,
-            "audio_codec": config.encoding.audio_codec,
-            "audio_bitrate": config.encoding.audio_bitrate,
-            "tune": config.encoding.tune,
-            "probesize": config.encoding.probesize,
-            "analyzeduration": config.encoding.analyzeduration,
-        },
-        "profiles": {
-            "a": {
-                "enabled": config.profile_a.enabled,
-                "crf": config.profile_a.crf,
-                "maxrate": config.profile_a.maxrate,
-                "bufsize": config.profile_a.bufsize,
+        let max_concurrency = config.ingestion.max_concurrency;
+        let per_encode_threads = config.encoding.effective_threads_per_encode(max_concurrency);
+        let total_threads = config.encoding.effective_total_threads(max_concurrency);
+        let available_cores = crate::config::available_logical_cores();
+        Json(serde_json::json!({
+            "paths": {
+                "watch_folder": config.paths.watch_folder,
+                "target_folder": config.paths.target_folder,
             },
-            "b": {
-                "enabled": config.profile_b.enabled,
-                "crf": config.profile_b.crf,
-                "maxrate": config.profile_b.maxrate,
-                "bufsize": config.profile_b.bufsize,
+            "server": {
+                "web_port": config.server.web_port,
+                "bind_address": config.server.bind_address,
             },
-            "c": {
-                "enabled": config.profile_c.enabled,
-                "crf": config.profile_c.crf,
-                "maxrate": config.profile_c.maxrate,
-                "bufsize": config.profile_c.bufsize,
+            "encoding": {
+                "preset": config.encoding.preset,
+                "ffmpeg_threads": config.encoding.ffmpeg_threads,
+                "cpu_cores": config.encoding.cpu_cores,
+                "audio_codec": config.encoding.audio_codec,
+                "audio_bitrate": config.encoding.audio_bitrate,
+                "tune": config.encoding.tune,
+                "probesize": config.encoding.probesize,
+                "analyzeduration": config.encoding.analyzeduration,
+                // Read-only derived values for the config UI:
+                "effective_threads_per_encode": per_encode_threads,
+                "effective_total_threads": total_threads,
             },
-        },
-        "ingestion": {
-            "settle_secs": config.ingestion.settle_secs,
-            "poll_secs": config.ingestion.poll_secs,
-            "max_concurrency": config.ingestion.max_concurrency,
-            "stable_polls_min": config.ingestion.stable_polls_min,
-            "retry_policy": config.ingestion.retry_policy,
-            "clean_source_after_success": config.ingestion.clean_source_after_success,
-        },
-        "logging": {
-            "level": config.logging.level,
-        },
-    }))
+            "profiles": {
+                "a": {
+                    "enabled": config.profile_a.enabled,
+                    "crf": config.profile_a.crf,
+                    "maxrate": config.profile_a.maxrate,
+                    "bufsize": config.profile_a.bufsize,
+                },
+                "b": {
+                    "enabled": config.profile_b.enabled,
+                    "crf": config.profile_b.crf,
+                    "maxrate": config.profile_b.maxrate,
+                    "bufsize": config.profile_b.bufsize,
+                },
+                "c": {
+                    "enabled": config.profile_c.enabled,
+                    "crf": config.profile_c.crf,
+                    "maxrate": config.profile_c.maxrate,
+                    "bufsize": config.profile_c.bufsize,
+                },
+            },
+            "ingestion": {
+                "settle_secs": config.ingestion.settle_secs,
+                "poll_secs": config.ingestion.poll_secs,
+                "max_concurrency": config.ingestion.max_concurrency,
+                "stable_polls_min": config.ingestion.stable_polls_min,
+                "retry_policy": config.ingestion.retry_policy,
+                "auto_retry_on_start": config.ingestion.auto_retry_on_start,
+                "max_attempts": config.ingestion.max_attempts,
+                "retry_delay_ms": config.ingestion.retry_delay_ms,
+                "clean_source_after_success": config.ingestion.clean_source_after_success,
+            },
+            "logging": {
+                "level": config.logging.level,
+            },
+            "system": {
+                "available_logical_cores": available_cores,
+            },
+            "initialized": config.initialized,
+        }))
+}
+
+#[derive(Deserialize)]
+struct ConfigUpdate {
+    #[serde(default)]
+    paths: Option<PathsConfigUpdate>,
+    #[serde(default)]
+    encoding: Option<EncodingConfigUpdate>,
+    #[serde(default)]
+    profile_a: Option<ProfileConfigUpdate>,
+    #[serde(default)]
+    profile_b: Option<ProfileConfigUpdate>,
+    #[serde(default)]
+    profile_c: Option<ProfileConfigUpdate>,
+    #[serde(default)]
+    ingestion: Option<IngestionConfigUpdate>,
+}
+
+#[derive(Deserialize)]
+struct PathsConfigUpdate {
+    #[serde(default)]
+    watch_folder: Option<String>,
+    #[serde(default)]
+    target_folder: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EncodingConfigUpdate {
+    #[serde(default)]
+    preset: Option<String>,
+    #[serde(default)]
+    ffmpeg_threads: Option<usize>,
+    #[serde(default)]
+    cpu_cores: Option<usize>,
+    #[serde(default)]
+    audio_codec: Option<String>,
+    #[serde(default)]
+    audio_bitrate: Option<String>,
+    #[serde(default)]
+    tune: Option<String>,
+    #[serde(default)]
+    probesize: Option<String>,
+    #[serde(default)]
+    analyzeduration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProfileConfigUpdate {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    crf: Option<u8>,
+    #[serde(default)]
+    maxrate: Option<String>,
+    #[serde(default)]
+    bufsize: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct IngestionConfigUpdate {
+    #[serde(default)]
+    settle_secs: Option<u64>,
+    #[serde(default)]
+    poll_secs: Option<u64>,
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+    #[serde(default)]
+    stable_polls_min: Option<u32>,
+    #[serde(default)]
+    retry_policy: Option<String>,
+    #[serde(default)]
+    auto_retry_on_start: Option<bool>,
+    #[serde(default)]
+    max_attempts: Option<u32>,
+    #[serde(default)]
+    retry_delay_ms: Option<u64>,
+    #[serde(default)]
+    clean_source_after_success: Option<bool>,
+}
+
+async fn put_config(
+    State(state): State<ServerState>,
+    Json(body): Json<ConfigUpdate>,
+) -> impl IntoResponse {
+    {
+        let mut config = state.config.lock();
+        if let Some(p) = body.paths {
+            if let Some(w) = p.watch_folder { config.paths.watch_folder = w; }
+            if let Some(t) = p.target_folder { config.paths.target_folder = t; }
+        }
+        if let Some(e) = body.encoding {
+            if let Some(v) = e.preset { config.encoding.preset = v; }
+            if let Some(v) = e.ffmpeg_threads { config.encoding.ffmpeg_threads = v; }
+            if let Some(v) = e.cpu_cores { config.encoding.cpu_cores = v; }
+            if let Some(v) = e.audio_codec { config.encoding.audio_codec = v; }
+            if let Some(v) = e.audio_bitrate { config.encoding.audio_bitrate = v; }
+            if let Some(v) = e.tune { config.encoding.tune = v; }
+            if let Some(v) = e.probesize { config.encoding.probesize = v; }
+            if let Some(v) = e.analyzeduration { config.encoding.analyzeduration = v; }
+        }
+        if let Some(p) = body.profile_a {
+            if let Some(v) = p.enabled { config.profile_a.enabled = v; }
+            if let Some(v) = p.crf { config.profile_a.crf = v; }
+            if let Some(v) = p.maxrate { config.profile_a.maxrate = v; }
+            if let Some(v) = p.bufsize { config.profile_a.bufsize = v; }
+        }
+        if let Some(p) = body.profile_b {
+            if let Some(v) = p.enabled { config.profile_b.enabled = v; }
+            if let Some(v) = p.crf { config.profile_b.crf = v; }
+            if let Some(v) = p.maxrate { config.profile_b.maxrate = v; }
+            if let Some(v) = p.bufsize { config.profile_b.bufsize = v; }
+        }
+        if let Some(p) = body.profile_c {
+            if let Some(v) = p.enabled { config.profile_c.enabled = v; }
+            if let Some(v) = p.crf { config.profile_c.crf = v; }
+            if let Some(v) = p.maxrate { config.profile_c.maxrate = v; }
+            if let Some(v) = p.bufsize { config.profile_c.bufsize = v; }
+        }
+        if let Some(i) = body.ingestion {
+            if let Some(v) = i.settle_secs { config.ingestion.settle_secs = v; }
+            if let Some(v) = i.poll_secs { config.ingestion.poll_secs = v; }
+            if let Some(v) = i.max_concurrency { config.ingestion.max_concurrency = v; }
+            if let Some(v) = i.stable_polls_min { config.ingestion.stable_polls_min = v; }
+            if let Some(v) = i.retry_policy { config.ingestion.retry_policy = v; }
+            if let Some(v) = i.auto_retry_on_start { config.ingestion.auto_retry_on_start = v; }
+            if let Some(v) = i.max_attempts { config.ingestion.max_attempts = v; }
+            if let Some(v) = i.retry_delay_ms { config.ingestion.retry_delay_ms = v; }
+            if let Some(v) = i.clean_source_after_success { config.ingestion.clean_source_after_success = v; }
+        }
+
+        config.initialized = true;
+
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let config_path = exe_dir.join("config.toml");
+        if let Err(e) = config.save_to(&config_path) {
+            tracing::error!("Failed to save config: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": format!("Failed to save config: {}", e)})),
+            ).into_response();
+        }
+    }
+
+    let config = state.config.lock().clone();
+    if let Err(e) = config.validate() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("Config validation: {}", e)})),
+        ).into_response();
+    }
+
+    Json(serde_json::json!({"success": true})).into_response()
 }
 
 async fn get_toolchain_status(State(_state): State<ServerState>) -> Json<ToolchainStatus> {
@@ -338,6 +512,83 @@ async fn get_download_status(State(state): State<ServerState>) -> Json<serde_jso
 
 async fn get_logs(State(state): State<ServerState>) -> Json<Vec<String>> {
     Json(state.service_handle.get_logs())
+}
+
+#[derive(Deserialize)]
+struct RetryJobBody {
+    /// Optional override for retrying a job whose source is no longer in the watch folder.
+    /// If omitted, the job's stored `input_path` is used.
+    input_path: Option<String>,
+}
+
+async fn post_retry_job(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+    body: Option<Json<RetryJobBody>>,
+) -> impl IntoResponse {
+    let jobs = state.jobs.all_recent();
+    let Some(job) = jobs.into_iter().find(|j| j.id == id) else {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "job not found"}))).into_response();
+    };
+    let path_str: String = body
+        .and_then(|b| b.input_path.clone())
+        .unwrap_or(job.input_path.clone());
+    if path_str.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"error": "no input_path on job"}))).into_response();
+    }
+    let path = std::path::PathBuf::from(&path_str);
+    if !path.exists() {
+        return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("source file no longer exists: {}", path_str)}))).into_response();
+    }
+    match state.service_handle.submit_retry(path) {
+        Ok(_) => {
+            state.jobs.update(&id, |j| {
+                j.state = JobState::Pending;
+                j.error = None;
+                j.stderr_log = None;
+                j.current_stage = "Re-queued (manual retry)".into();
+                j.finished_at = None;
+                j.attempt = j.attempt.saturating_add(1);
+            });
+            Json(serde_json::json!({"success": true})).into_response()
+        }
+        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoResponse {
+    let failed = state.jobs.failed();
+    let mut submitted = 0usize;
+    let mut missing = 0usize;
+    let mut errors = 0usize;
+    for job in &failed {
+        let path = std::path::PathBuf::from(&job.input_path);
+        if !path.exists() {
+            missing += 1;
+            continue;
+        }
+        match state.service_handle.submit_retry(path) {
+            Ok(_) => {
+                state.jobs.update(&job.id, |j| {
+                    j.state = JobState::Pending;
+                    j.error = None;
+                    j.stderr_log = None;
+                    j.current_stage = "Re-queued (bulk retry)".into();
+                    j.finished_at = None;
+                    j.attempt = j.attempt.saturating_add(1);
+                });
+                submitted += 1;
+            }
+            Err(_) => {
+                errors += 1;
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "submitted": submitted,
+        "source_missing": missing,
+        "errors": errors,
+    }))
 }
 
 async fn post_install_service(State(_state): State<ServerState>) -> Json<serde_json::Value> {
@@ -467,35 +718,59 @@ async fn put_trim(
     Path(uuid): Path<String>,
     Json(body): Json<TrimRequest>,
 ) -> impl IntoResponse {
-    match db::set_trim(&state.pool, &uuid, body.trim_in_ms, body.trim_out_ms).await {
+    if body.trim_in_ms < 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "trim_in_ms must be non-negative"})),
+        ).into_response();
+    }
+
+    let asset = match db::find_by_uuid(&state.pool, &uuid).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "asset not found"}))).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on put_trim fetch: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "database error"}))).into_response();
+        }
+    };
+
+    let duration_ms = asset.duration_ms;
+    if duration_ms <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "asset has no resolved duration; cannot set trim"})),
+        ).into_response();
+    }
+
+    let effective_out = if body.trim_out_ms <= 0 { duration_ms } else { body.trim_out_ms };
+
+    if effective_out <= body.trim_in_ms {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "trim_out_ms must be greater than trim_in_ms"})),
+        ).into_response();
+    }
+
+    if effective_out > duration_ms {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("trim_out_ms ({}) exceeds duration_ms ({})", effective_out, duration_ms)})),
+        ).into_response();
+    }
+
+    match db::set_trim(&state.pool, &uuid, body.trim_in_ms, effective_out).await {
         Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
             Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
-            Ok(None) => (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "asset not found"})),
-            )
-                .into_response(),
+            Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "asset not found"}))).into_response(),
             Err(e) => {
                 tracing::error!("DB error on put_trim fetch: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "database error"})),
-                )
-                    .into_response()
+                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "database error"}))).into_response()
             }
         },
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "asset not found"})),
-        )
-            .into_response(),
+        Ok(false) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "asset not found"}))).into_response(),
         Err(e) => {
             tracing::error!("DB error on put_trim: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "database error"}))).into_response()
         }
     }
 }
@@ -592,17 +867,70 @@ async fn post_subclip(
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": "display_name must not be empty"})),
-        )
-            .into_response();
+        ).into_response();
     }
     if body.display_name.len() > db::MAX_DISPLAY_NAME_LEN {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({"error": format!("display_name must not exceed {} characters", db::MAX_DISPLAY_NAME_LEN)})),
-        )
-            .into_response();
+        ).into_response();
     }
-    
+    if body.trim_in_ms < 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "trim_in_ms must be non-negative"})),
+        ).into_response();
+    }
+
+    let parent = match db::find_by_uuid(&state.pool, &uuid).await {
+        Ok(Some(a)) => a,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "parent asset not found"}))).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on post_subclip parent fetch: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "database error"}))).into_response();
+        }
+    };
+
+    let duration_ms = parent.duration_ms;
+    if duration_ms <= 0 {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "parent asset has no resolved duration"})),
+        ).into_response();
+    }
+
+    let effective_out = if body.trim_out_ms <= 0 { duration_ms } else { body.trim_out_ms };
+
+    if effective_out <= body.trim_in_ms {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "trim_out_ms must be greater than trim_in_ms"})),
+        ).into_response();
+    }
+    if effective_out > duration_ms {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": format!("trim_out_ms ({}) exceeds parent duration_ms ({})", effective_out, duration_ms)})),
+        ).into_response();
+    }
+
+    let (sub_mezzanine_ok, sub_warnings) = if parent.mezzanine_ok && !parent.keyframe_offsets_json.is_empty() {
+        let offsets: Vec<i64> = serde_json::from_str(&parent.keyframe_offsets_json).unwrap_or_default();
+        let fps = if parent.fps_den > 0 { parent.fps_num as f64 / parent.fps_den as f64 } else { parent.fps };
+        let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 40.0 };
+        let tolerance = frame_ms * 0.5;
+        let aligned = offsets.iter().any(|&kf| (kf - body.trim_in_ms).abs() as f64 <= tolerance);
+        if aligned {
+            (true, Vec::new())
+        } else {
+            (false, vec!["trim_in_not_keyframe_aligned".to_string()])
+        }
+    } else {
+        (parent.mezzanine_ok, Vec::new())
+    };
+
+    let warnings_json = serde_json::to_string(&sub_warnings).unwrap_or_else(|_| "[]".to_string());
+
     let new_uuid = uuid::Uuid::new_v4().to_string();
     match db::create_subclip(
         &state.pool,
@@ -610,23 +938,16 @@ async fn post_subclip(
         &uuid,
         &body.display_name,
         body.trim_in_ms,
-        body.trim_out_ms,
-    )
-    .await
+        effective_out,
+        sub_mezzanine_ok,
+        &warnings_json,
+    ).await
     {
         Ok(Some(asset)) => (StatusCode::CREATED, Json(AssetResponse::from(asset))).into_response(),
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "parent asset not found"})),
-        )
-            .into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "parent asset not found"}))).into_response(),
         Err(e) => {
             tracing::error!("DB error on post_subclip: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-                .into_response()
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "database error"}))).into_response()
         }
     }
 }
@@ -635,47 +956,21 @@ async fn delete_purge_asset(
     State(state): State<ServerState>,
     Path(uuid): Path<String>,
 ) -> impl IntoResponse {
-    match db::find_by_uuid(&state.pool, &uuid).await {
-        Ok(Some(asset)) => {
-            let path_str = asset.current_path.clone();
-            if !path_str.is_empty() {
-                let path = std::path::Path::new(&path_str);
-                if let Err(e) = tokio::fs::remove_file(path).await {
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        tracing::warn!("Failed to remove physical file at {}: {}", path_str, e);
-                    }
-                }
-            }
-            
-            match db::purge_asset_by_path_or_fingerprint(&state.pool, &asset.current_path, asset.fingerprint).await {
-                Ok(rows) => {
-                    (StatusCode::OK, Json(serde_json::json!({
-                        "success": true,
-                        "purged_records": rows
-                    }))).into_response()
-                }
-                Err(e) => {
-                    tracing::error!("DB error during asset purge: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": "database error"})),
-                    )
-                        .into_response()
-                }
+    match db::purge_asset_completely(&state.pool, &uuid).await {
+        Ok(outcome) => {
+            if outcome.rows_deleted == 0 {
+                (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "asset not found"}))).into_response()
+            } else {
+                (StatusCode::OK, Json(serde_json::json!({
+                    "success": true,
+                    "purged_records": outcome.rows_deleted,
+                    "file_removed": outcome.file_removed,
+                }))).into_response()
             }
         }
-        Ok(None) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "asset not found"})),
-        )
-            .into_response(),
         Err(e) => {
-            tracing::error!("DB error finding asset for purge: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "database error"})),
-            )
-                .into_response()
+            tracing::error!("DB error during asset purge: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "database error"}))).into_response()
         }
     }
 }

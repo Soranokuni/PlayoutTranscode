@@ -1,0 +1,153 @@
+/* CasparCG SOTA Client Global Styles */
+
+:root {
+  /* Core Colors */
+  --bg-primary: #111827;
+  --bg-secondary: #1B1B1B;
+  --bg-tertiary: #2a2a2a;
+  --bg-surface: rgba(255, 255, 255, 0.03);
+
+  /* Accents */
+  --accent-blue: #33BECC;
+  --accent-red: #E63946;
+  --accent-yellow: #F8B400;
+
+  /* Text */
+  --text-primary: #F9FAFB;
+  --text-secondary: #9CA3AF;
+
+  /* Layout */
+  --border-radius-base: 12px;
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-bg: rgba(255, 255, 255, 0.03);
+  color-scheme: dark;
+}
+
+.light-theme {
+  --bg-primary: #eff1f5;
+  --bg-secondary: #ffffff;
+  --bg-tertiary: #e6e9ef;
+  --bg-surface: rgba(255, 255, 255, 0.72);
+
+  --accent-blue: #1e66f5;
+  --accent-red: #d20f39;
+  --accent-yellow: #df8e1d;
+
+  --text-primary: #4c4f69;
+  --text-secondary: #6c6f85;
+
+  --glass-border: rgba(76, 79, 105, 0.12);
+  --glass-bg: rgba(255, 255, 255, 0.72);
+  color-scheme: light;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: Inter, "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+  background:
+    radial-gradient(circle at top left, color-mix(in srgb, var(--accent-blue) 10%, transparent), transparent 34%),
+    radial-gradient(circle at top right, color-mix(in srgb, var(--accent-yellow) 10%, transparent), transparent 28%),
+    linear-gradient(180deg, color-mix(in srgb, var(--bg-primary) 92%, black 8%), var(--bg-primary));
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  min-height: 100vh;
+  /* Prevent text selection and context menus in the Tauri desktop app */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+html,
+body,
+#app {
+  min-height: 100vh;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent-blue) 78%, white 22%);
+  outline-offset: 2px;
+}
+
+/* Glassmorphism Utilities */
+.glass-panel {
+  background: var(--glass-bg);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--border-radius-base);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+/* Bento Grid System */
+.bento-container {
+  display: grid;
+  grid-template-columns: repeat(12, 1fr);
+  grid-template-rows: repeat(8, 1fr);
+  gap: 16px;
+  height: 100vh;
+  padding: 16px;
+}
+
+/* Base utility classes */
+.flex-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.text-accent {
+  color: var(--accent-blue);
+}
+
+.text-danger {
+  color: var(--accent-red);
+}
+
+.text-warning {
+  color: var(--accent-yellow);
+}
+
+/* Custom Scrollbar for dark theme */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+}
+
+::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--text-secondary) 32%, var(--bg-tertiary));
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--text-secondary) 70%, var(--accent-blue));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -17,6 +17,8 @@ pub struct MediaAsset {
     pub virtual_folder: String,
     pub mezzanine_ok: bool,
     pub fps: f64,
+    pub fps_num: i64,
+    pub fps_den: i64,
     pub total_frames: i64,
     pub gop_frames: i64,
     pub keyframe_safe_start_ms: i64,
@@ -27,6 +29,7 @@ pub struct MediaAsset {
 #[derive(Debug, Clone, Serialize)]
 pub struct AssetResponse {
     pub uuid: String,
+    pub playoutvue_id: String,
     pub current_path: String,
     pub duration_ms: i64,
     pub trim_in_ms: i64,
@@ -38,6 +41,8 @@ pub struct AssetResponse {
     pub virtual_folder: String,
     pub mezzanine_ok: bool,
     pub fps: f64,
+    pub fps_num: i64,
+    pub fps_den: i64,
     pub total_frames: i64,
     pub gop_frames: i64,
     pub keyframe_safe_start_ms: i64,
@@ -50,7 +55,8 @@ impl From<MediaAsset> for AssetResponse {
         let warnings: Vec<String> = serde_json::from_str(&a.warnings).unwrap_or_default();
         let keyframe_offsets: Vec<i64> = serde_json::from_str(&a.keyframe_offsets_json).unwrap_or_default();
         Self {
-            uuid: a.uuid,
+            uuid: a.uuid.clone(),
+            playoutvue_id: a.uuid,
             current_path: a.current_path,
             duration_ms: a.duration_ms,
             trim_in_ms: a.trim_in_ms,
@@ -62,6 +68,8 @@ impl From<MediaAsset> for AssetResponse {
             virtual_folder: a.virtual_folder,
             mezzanine_ok: a.mezzanine_ok,
             fps: a.fps,
+            fps_num: a.fps_num,
+            fps_den: a.fps_den,
             total_frames: a.total_frames,
             gop_frames: a.gop_frames,
             keyframe_safe_start_ms: a.keyframe_safe_start_ms,
@@ -69,6 +77,68 @@ impl From<MediaAsset> for AssetResponse {
             keyframe_offsets,
         }
     }
+}
+
+const SELECT_COLS: &str = "uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json";
+
+/// Find all assets with a given status. Used for startup recovery scans.
+pub async fn find_all_with_status(
+    pool: &SqlitePool,
+    status: &str,
+) -> Result<Vec<MediaAsset>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE status = ?1 ORDER BY uuid",
+        SELECT_COLS
+    );
+    sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(status)
+        .fetch_all(pool)
+        .await
+}
+
+/// Outcome of a startup-recovery sweep over in-flight / failed asset rows.
+#[derive(Debug, Default, Serialize)]
+pub struct RecoveryOutcome {
+    pub purged_for_retry: usize,
+    pub purged_dead: usize,
+    pub kept_dead: usize,
+}
+
+/// Reclaim `error`/`processing` rows whose `current_path` (= source path on those states)
+/// still lives inside the watch folder, so the watcher will re-queue them. The remaining
+/// dead rows are kept (their source file is no longer reachable). Returns counts for logging.
+pub async fn recover_failed_assets(
+    pool: &SqlitePool,
+    watch_folder: &Path,
+    auto_retry: bool,
+) -> Result<RecoveryOutcome, sqlx::Error> {
+    let mut out = RecoveryOutcome::default();
+    if !auto_retry {
+        return Ok(out);
+    }
+    let canonical_watch = watch_folder.canonicalize().unwrap_or_else(|_| watch_folder.to_path_buf());
+    for status in ["error", "processing"] {
+        let rows = find_all_with_status(pool, status).await?;
+        for a in rows {
+            let src_path = std::path::Path::new(&a.current_path);
+            let still_in_watch = src_path
+                .canonicalize()
+                .ok()
+                .map(|c| c.starts_with(&canonical_watch))
+                .unwrap_or(false);
+            let exists = src_path.exists();
+            if still_in_watch {
+                purge_row_by_uuid(pool, &a.uuid).await?;
+                out.purged_for_retry += 1;
+            } else if !exists {
+                purge_row_by_uuid(pool, &a.uuid).await?;
+                out.purged_dead += 1;
+            } else {
+                out.kept_dead += 1;
+            }
+        }
+    }
+    Ok(out)
 }
 
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
@@ -98,6 +168,8 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
             virtual_folder TEXT NOT NULL DEFAULT '/',
             mezzanine_ok BOOLEAN NOT NULL DEFAULT 0,
             fps REAL NOT NULL DEFAULT 0.0,
+            fps_num INTEGER NOT NULL DEFAULT 0,
+            fps_den INTEGER NOT NULL DEFAULT 0,
             total_frames INTEGER NOT NULL DEFAULT 0,
             gop_frames INTEGER NOT NULL DEFAULT 0,
             keyframe_safe_start_ms INTEGER NOT NULL DEFAULT 0,
@@ -117,103 +189,30 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN display_name TEXT NOT NULL DEFAULT ''",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("display_name column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN rating TEXT NOT NULL DEFAULT 'K'",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("rating column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN tp TEXT NOT NULL DEFAULT 'None'",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("tp column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN virtual_folder TEXT NOT NULL DEFAULT '/'",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("virtual_folder column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN mezzanine_ok BOOLEAN NOT NULL DEFAULT 0",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("mezzanine_ok column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN fps REAL NOT NULL DEFAULT 0.0",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("fps column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN total_frames INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("total_frames column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN gop_frames INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("gop_frames column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN keyframe_safe_start_ms INTEGER NOT NULL DEFAULT 0",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("keyframe_safe_start_ms column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN warnings TEXT NOT NULL DEFAULT '[]'",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("warnings column may already exist: {}", e);
-    }
-
-    if let Err(e) = sqlx::query(
-        "ALTER TABLE media_assets ADD COLUMN keyframe_offsets_json TEXT NOT NULL DEFAULT '[]'",
-    )
-    .execute(&pool)
-    .await
-    {
-        tracing::debug!("keyframe_offsets_json column may already exist: {}", e);
+    for (col, default) in [
+        ("display_name", "''"),
+        ("rating", "'K'"),
+        ("tp", "'None'"),
+        ("virtual_folder", "'/'"),
+        ("mezzanine_ok", "0"),
+        ("fps", "0.0"),
+        ("total_frames", "0"),
+        ("gop_frames", "0"),
+        ("keyframe_safe_start_ms", "0"),
+        ("warnings", "'[]'"),
+        ("keyframe_offsets_json", "'[]'"),
+        ("fps_num", "0"),
+        ("fps_den", "0"),
+    ] {
+        let sql = format!(
+            "ALTER TABLE media_assets ADD COLUMN {} {} NOT NULL DEFAULT {}",
+            col,
+            if col == "fps" { "REAL" } else if col == "mezzanine_ok" { "BOOLEAN" } else { "INTEGER" },
+            default
+        );
+        if let Err(e) = sqlx::query(&sql).execute(&pool).await {
+            tracing::debug!("{} column may already exist: {}", col, e);
+        }
     }
 
     {
@@ -252,7 +251,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .await?;
     if result.rows_affected() > 0 {
         tracing::warn!(
-            "Recovered {} orphaned asset row(s) left in 'processing' state (marked 'error')",
+            "Recovered {} orphaned asset row(s) left in 'processing' state (marked 'error'); recovery sweep will purge eligible ones",
             result.rows_affected()
         );
     }
@@ -297,6 +296,8 @@ pub async fn mark_ready(
     duration_ms: i64,
     mezzanine_ok: bool,
     fps: f64,
+    fps_num: i64,
+    fps_den: i64,
     total_frames: i64,
     gop_frames: i64,
     keyframe_safe_start_ms: i64,
@@ -305,23 +306,29 @@ pub async fn mark_ready(
 ) -> Result<(), sqlx::Error> {
     let warnings_json = serde_json::to_string(warnings).unwrap_or_else(|_| "[]".to_string());
     sqlx::query(
-        "UPDATE media_assets SET 
-            current_path = ?1, 
-            duration_ms = ?2, 
+        "UPDATE media_assets SET
+            current_path = ?1,
+            duration_ms = ?2,
+            trim_in_ms = 0,
+            trim_out_ms = ?2,
             status = 'ready',
             mezzanine_ok = ?3,
             fps = ?4,
-            total_frames = ?5,
-            gop_frames = ?6,
-            keyframe_safe_start_ms = ?7,
-            warnings = ?8,
-            keyframe_offsets_json = ?9
-         WHERE uuid = ?10",
+            fps_num = ?5,
+            fps_den = ?6,
+            total_frames = ?7,
+            gop_frames = ?8,
+            keyframe_safe_start_ms = ?9,
+            warnings = ?10,
+            keyframe_offsets_json = ?11
+         WHERE uuid = ?12",
     )
     .bind(output_path)
     .bind(duration_ms)
     .bind(mezzanine_ok)
     .bind(fps)
+    .bind(fps_num)
+    .bind(fps_den)
     .bind(total_frames)
     .bind(gop_frames)
     .bind(keyframe_safe_start_ms)
@@ -341,43 +348,36 @@ pub async fn mark_error(pool: &SqlitePool, uuid: &str) -> Result<(), sqlx::Error
     Ok(())
 }
 
-pub async fn update_path_by_fingerprint(
-    pool: &SqlitePool,
-    fingerprint: i64,
-    new_path: &str,
-) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE media_assets SET current_path = ?1, status = 'ready' WHERE fingerprint = ?2",
-    )
-    .bind(new_path)
-    .bind(fingerprint)
-    .execute(pool)
-    .await?;
-    Ok(result.rows_affected() > 0)
-}
-
 pub async fn find_by_uuid(
     pool: &SqlitePool,
     uuid: &str,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
-    sqlx::query_as::<_, MediaAsset>(
-        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json FROM media_assets WHERE uuid = ?1",
-    )
-    .bind(uuid)
-    .fetch_optional(pool)
-    .await
+    let sql = format!("SELECT {} FROM media_assets WHERE uuid = ?1", SELECT_COLS);
+    sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
 }
 
 pub async fn find_by_fingerprint(
     pool: &SqlitePool,
     fingerprint: i64,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
-    sqlx::query_as::<_, MediaAsset>(
-        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json FROM media_assets WHERE fingerprint = ?1",
+    let sql = format!("SELECT {} FROM media_assets WHERE fingerprint = ?1", SELECT_COLS);
+    sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(fingerprint)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn count_rows_by_path(pool: &SqlitePool, current_path: &str) -> Result<i64, sqlx::Error> {
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM media_assets WHERE current_path = ?1",
     )
-    .bind(fingerprint)
-    .fetch_optional(pool)
-    .await
+    .bind(current_path)
+    .fetch_one(pool)
+    .await?;
+    Ok(count)
 }
 
 pub async fn set_trim(
@@ -402,17 +402,12 @@ pub async fn set_rating(
     uuid: &str,
     rating: &str,
 ) -> Result<bool, sqlx::Error> {
-    let asset = find_by_uuid(pool, uuid).await?;
-    if let Some(a) = asset {
-        let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE fingerprint = ?2")
-            .bind(rating)
-            .bind(a.fingerprint)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
-    } else {
-        Ok(false)
-    }
+    let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE uuid = ?2")
+        .bind(rating)
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn set_tp(
@@ -420,17 +415,12 @@ pub async fn set_tp(
     uuid: &str,
     tp: &str,
 ) -> Result<bool, sqlx::Error> {
-    let asset = find_by_uuid(pool, uuid).await?;
-    if let Some(a) = asset {
-        let result = sqlx::query("UPDATE media_assets SET tp = ?1 WHERE fingerprint = ?2")
-            .bind(tp)
-            .bind(a.fingerprint)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
-    } else {
-        Ok(false)
-    }
+    let result = sqlx::query("UPDATE media_assets SET tp = ?1 WHERE uuid = ?2")
+        .bind(tp)
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
 }
 
 pub async fn create_subclip(
@@ -440,12 +430,14 @@ pub async fn create_subclip(
     display_name: &str,
     trim_in_ms: i64,
     trim_out_ms: i64,
+    mezzanine_ok: bool,
+    warnings: &str,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
     let parent = find_by_uuid(pool, parent_uuid).await?;
     if let Some(p) = parent {
         sqlx::query(
-            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)"
+            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
         )
         .bind(new_uuid)
         .bind(p.fingerprint)
@@ -458,33 +450,73 @@ pub async fn create_subclip(
         .bind(&p.status)
         .bind(display_name)
         .bind(&p.virtual_folder)
-        .bind(p.mezzanine_ok)
+        .bind(mezzanine_ok)
         .bind(p.fps)
+        .bind(p.fps_num)
+        .bind(p.fps_den)
         .bind(p.total_frames)
         .bind(p.gop_frames)
         .bind(p.keyframe_safe_start_ms)
-        .bind(&p.warnings)
+        .bind(warnings)
         .bind(&p.keyframe_offsets_json)
         .execute(pool)
         .await?;
-        
+
         find_by_uuid(pool, new_uuid).await
     } else {
         Ok(None)
     }
 }
 
-pub async fn purge_asset_by_path_or_fingerprint(
-    pool: &SqlitePool,
-    current_path: &str,
-    fingerprint: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM media_assets WHERE current_path = ?1 OR fingerprint = ?2")
-        .bind(current_path)
+pub async fn purge_row_by_uuid(pool: &SqlitePool, uuid: &str) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM media_assets WHERE uuid = ?1")
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+pub async fn purge_rows_by_fingerprint(pool: &SqlitePool, fingerprint: i64) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query("DELETE FROM media_assets WHERE fingerprint = ?1")
         .bind(fingerprint)
         .execute(pool)
         .await?;
     Ok(result.rows_affected())
+}
+
+pub async fn purge_asset_completely(
+    pool: &SqlitePool,
+    uuid: &str,
+) -> Result<PurgeOutcome, sqlx::Error> {
+    let asset = find_by_uuid(pool, uuid).await?;
+    let Some(a) = asset else {
+        return Ok(PurgeOutcome { rows_deleted: 0, file_removed: false });
+    };
+
+    let path = a.current_path.clone();
+    purge_row_by_uuid(pool, uuid).await?;
+
+    let refs = count_rows_by_path(pool, &path).await?;
+    let file_removed = if refs == 0 && !path.is_empty() {
+        match tokio::fs::remove_file(&path).await {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::warn!("Failed to remove physical file at {}: {}", path, e);
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok(PurgeOutcome { rows_deleted: 1, file_removed })
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgeOutcome {
+    pub rows_deleted: u64,
+    pub file_removed: bool,
 }
 
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
@@ -542,19 +574,20 @@ pub async fn find_all(
     pool: &SqlitePool,
     status_filter: Option<&str>,
 ) -> Result<Vec<MediaAsset>, sqlx::Error> {
+    let sql = format!("SELECT {} FROM media_assets ORDER BY uuid", SELECT_COLS);
     if let Some(status) = status_filter {
-        sqlx::query_as::<_, MediaAsset>(
-            "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json FROM media_assets WHERE status = ?1 ORDER BY uuid",
-        )
-        .bind(status)
-        .fetch_all(pool)
-        .await
+        let filtered = format!(
+            "SELECT {} FROM media_assets WHERE status = ?1 ORDER BY uuid",
+            SELECT_COLS
+        );
+        sqlx::query_as::<_, MediaAsset>(&filtered)
+            .bind(status)
+            .fetch_all(pool)
+            .await
     } else {
-        sqlx::query_as::<_, MediaAsset>(
-            "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json FROM media_assets ORDER BY uuid",
-        )
-        .fetch_all(pool)
-        .await
+        sqlx::query_as::<_, MediaAsset>(&sql)
+            .fetch_all(pool)
+            .await
     }
 }
 
@@ -567,8 +600,8 @@ pub async fn find_batch(
     }
     let placeholders = uuids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json FROM media_assets WHERE uuid IN ({})",
-        placeholders
+        "SELECT {} FROM media_assets WHERE uuid IN ({})",
+        SELECT_COLS, placeholders
     );
     let mut query = sqlx::query_as::<_, MediaAsset>(&sql);
     for uuid in uuids {
@@ -605,3 +638,27 @@ pub async fn set_folder_color(
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_is_valid_rating() {
+        assert!(is_valid_rating("K"));
+        assert!(is_valid_rating("12"));
+        assert!(is_valid_rating("18+"));
+        assert!(is_valid_rating(""));
+        assert!(!is_valid_rating("21"));
+    }
+
+    #[test]
+    fn test_is_valid_virtual_folder() {
+        assert!(is_valid_virtual_folder("/"));
+        assert!(is_valid_virtual_folder("/news"));
+        assert!(is_valid_virtual_folder("/a/b"));
+        assert!(!is_valid_virtual_folder(""));
+        assert!(!is_valid_virtual_folder("news"));
+        assert!(!is_valid_virtual_folder("/../etc"));
+        assert!(!is_valid_virtual_folder("/news/"));
+    }
+}

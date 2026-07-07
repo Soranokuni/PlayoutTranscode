@@ -1,10 +1,11 @@
-use crate::bootstrap::ToolPaths;
-use crate::config::AppConfig;
+use crate::bootstrap::{self, ToolPaths};
+use crate::config::{self, AppConfig};
+use crate::db;
 use crate::jobs::JobQueue;
 use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -16,8 +17,11 @@ pub enum ServiceCmd {
 pub struct ServiceHandle {
     pub running: Arc<Mutex<bool>>,
     pub cmd_tx: Arc<Mutex<Option<mpsc::Sender<ServiceCmd>>>>,
+    /// Optional channel for the API to inject manual retries into the processing loop.
+    pub retry_tx: Arc<StdMutex<Option<mpsc::Sender<std::path::PathBuf>>>>,
     pub download_status: Arc<Mutex<Option<String>>>,
     pub log_lines: Arc<Mutex<Vec<String>>>,
+    pub active_pids: Arc<StdMutex<Vec<u32>>>,
 }
 
 impl ServiceHandle {
@@ -25,8 +29,24 @@ impl ServiceHandle {
         Self {
             running: Arc::new(Mutex::new(false)),
             cmd_tx: Arc::new(Mutex::new(None)),
+            retry_tx: Arc::new(StdMutex::new(None)),
             download_status: Arc::new(Mutex::new(None)),
             log_lines: Arc::new(Mutex::new(Vec::new())),
+            active_pids: Arc::new(StdMutex::new(Vec::new())),
+        }
+    }
+
+    /// Submit a manual retry for an input file. Fails if the service is not running.
+    pub fn submit_retry(&self, path: std::path::PathBuf) -> Result<(), String> {
+        if !self.is_running() {
+            return Err("Service is not running".into());
+        }
+        let guard = self.retry_tx.lock().map_err(|e| format!("retry channel lock: {}", e))?;
+        match guard.as_ref() {
+            Some(tx) => tx
+                .try_send(path)
+                .map_err(|e| format!("retry queue full or closed: {}", e)),
+            None => Err("retry channel not established".into()),
         }
     }
 
@@ -45,6 +65,45 @@ impl ServiceHandle {
 
     pub fn is_running(&self) -> bool {
         *self.running.lock()
+    }
+
+    pub fn kill_active_ffmpeg(&self) {
+        let pids: Vec<u32> = {
+            match self.active_pids.lock() {
+                Ok(mut list) => {
+                    let snapshot = list.clone();
+                    list.clear();
+                    snapshot
+                }
+                Err(e) => {
+                    tracing::error!("active_pids lock poisoned: {}", e);
+                    return;
+                }
+            }
+        };
+
+        for pid in pids {
+            kill_process_tree(pid);
+        }
+    }
+}
+
+fn kill_process_tree(pid: u32) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let pid_str = pid.to_string();
+        let _ = std::process::Command::new("taskkill")
+            .args(["/PID", &pid_str, "/T", "/F"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .output();
     }
 }
 
@@ -69,15 +128,62 @@ pub fn start_processing_loop(
     let tools = tools.clone();
     let jobs = job_queue.clone();
     let cfg = config.clone();
+    let active_pids = handle.active_pids.clone();
+    // Clone for the worker thread; the closure below captures this clone by move.
+    let handle_for_thread = handle.clone();
+    // The retry_tx cleanup slot is also held by this handle. Once handle_for_thread moves
+    // into the closure, only the closure can clear it on stop.
+    let cleanup_retry_tx = handle_for_thread.retry_tx.clone();
 
     handle.add_log("info", "Transcoding service started");
+
+    let per_encode_threads = config.encoding.effective_threads_per_encode(config.ingestion.max_concurrency);
+    let total_threads = config.encoding.effective_total_threads(config.ingestion.max_concurrency);
+    handle.add_log(
+        "info",
+        &format!(
+            "CPU budget: {} cores / max_concurrency={} -> {} threads/encode ({} total)",
+            if config.encoding.cpu_cores > 0 {
+                config.encoding.cpu_cores.to_string()
+            } else {
+                "auto".to_string()
+            },
+            config.ingestion.max_concurrency,
+            per_encode_threads,
+            total_threads,
+        ),
+    );
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
             let _ = std::fs::create_dir_all(&target);
 
+            // Recovery sweep: purge DB rows whose source is still in the watch folder so the
+            // watcher re-queues them; also purge rows whose source is gone. This is the
+            // "auto-purge + retry on start" behaviour.
+            match db::recover_failed_assets(&pool, &watch, cfg.ingestion.auto_retry_on_start).await {
+                Ok(o) => {
+                    if o.purged_for_retry > 0 || o.purged_dead > 0 || o.kept_dead > 0 {
+                        handle_for_thread.add_log(
+                            "info",
+                            &format!(
+                                "Recovery: purged {} retryable / {} dead, kept {} dead rows for inspection",
+                                o.purged_for_retry, o.purged_dead, o.kept_dead
+                            ),
+                        );
+                    }
+                }
+                Err(e) => {
+                    handle_for_thread.add_log("error", &format!("Recovery sweep DB error: {}", e));
+                }
+            }
+
             let (file_tx, mut file_rx) = mpsc::channel::<PathBuf>(256);
+            let (retry_tx, mut retry_rx) = mpsc::channel::<PathBuf>(256);
+            if let Ok(mut slot) = handle_for_thread.retry_tx.lock() {
+                *slot = Some(retry_tx);
+            }
             let sem = Arc::new(tokio::sync::Semaphore::new(cfg.ingestion.max_concurrency));
 
             let excl_ext = cfg.ingestion.exclude_extensions.clone();
@@ -99,16 +205,14 @@ pub fn start_processing_loop(
             loop {
                 tokio::select! {
                     Some(path) = file_rx.recv() => {
-                        let t = tools.clone();
-                        let c = cfg.clone();
-                        let jq = jobs.clone();
-                        let tg = target.clone();
-                        let s = sem.clone();
-                        let p = pool.clone();
-                        let _permit = s.acquire_owned().await;
-                        tokio::task::spawn_blocking(move || {
-                            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p);
-                        });
+                        process_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path).await;
+                    }
+                    Some(retry_path) = retry_rx.recv() => {
+                        handle_for_thread.add_log(
+                            "info",
+                            &format!("Manual retry submitted for {}", retry_path.display()),
+                        );
+                        process_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry_path).await;
                     }
                     cmd = cmd_rx.recv() => {
                         if let Some(ServiceCmd::Stop) = cmd {
@@ -119,16 +223,49 @@ pub fn start_processing_loop(
             }
         });
 
+        // Service stopped: clear retry channel so API retries fail fast until the service restarts.
+        if let Ok(mut slot) = cleanup_retry_tx.lock() {
+            *slot = None;
+        }
         *running.lock() = false;
     });
 
     Ok(())
 }
 
+/// Drains one input through the configured concurrency semaphore and into the processor. Used
+/// for both watcher-discovered files and manual retries.
+async fn process_one(
+    tools: &bootstrap::ToolPaths,
+    cfg: &config::AppConfig,
+    jobs: &JobQueue,
+    target: &std::path::Path,
+    sem: &Arc<tokio::sync::Semaphore>,
+    pool: &SqlitePool,
+    active_pids: &Arc<StdMutex<Vec<u32>>>,
+    path: std::path::PathBuf,
+) {
+    let t = tools.clone();
+    let c = cfg.clone();
+    let jq = jobs.clone();
+    let tg = target.to_path_buf();
+    let s = sem.clone();
+    let p = pool.clone();
+    let apids = active_pids.clone();
+    let _permit = s.acquire_owned().await;
+    tokio::task::spawn_blocking(move || {
+        crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p, apids);
+    });
+}
+
 pub fn stop_processing(handle: &ServiceHandle) {
     if let Some(ref tx) = *handle.cmd_tx.lock() {
         let _ = tx.try_send(ServiceCmd::Stop);
     }
+    if let Ok(mut slot) = handle.retry_tx.lock() {
+        *slot = None;
+    }
+    handle.kill_active_ffmpeg();
     handle.add_log("info", "Service stop requested");
 }
 

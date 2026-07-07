@@ -163,6 +163,7 @@ pub async fn watch_loop(
                 current_candidates.iter().map(|c| c.path.clone()).collect();
 
             candidates.retain(|path, _| current_paths.contains(path));
+            queued.retain(|path, _| current_paths.contains(path));
 
             for candidate in &current_candidates {
                 let ext = candidate
