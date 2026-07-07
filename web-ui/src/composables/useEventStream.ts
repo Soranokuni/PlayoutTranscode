@@ -11,6 +11,10 @@ export interface JobRecord {
   current_stage: string
   duration_secs: number
   error?: string
+  /** Verbose diagnostic tail (ffmpeg stderr). Rendered inside a collapsible widget in the UI. */
+  stderr_log?: string[]
+  /** Retry attempt counter (0 = first try, 1 = first retry, ...). */
+  attempt?: number
   created_at: string
   finished_at?: string
   source_frame_count: number
@@ -75,10 +79,33 @@ export interface StatsPayload {
 
 export interface ConfigPayload {
   paths: { watch_folder: string; target_folder: string }
-  encoding: { preset: string; ffmpeg_threads: number; audio_codec: string; audio_bitrate: string; tune: string }
+  encoding: {
+    preset: string
+    ffmpeg_threads: number
+    cpu_cores: number
+    audio_codec: string
+    audio_bitrate: string
+    tune: string
+    probesize: string
+    analyzeduration: string
+    effective_threads_per_encode?: number
+    effective_total_threads?: number
+  }
   profiles: { a: { enabled: boolean; crf: number; maxrate: string; bufsize: string }; b: { enabled: boolean; crf: number; maxrate: string; bufsize: string }; c: { enabled: boolean; crf: number; maxrate: string; bufsize: string } }
-  ingestion: { settle_secs: number; poll_secs: number; max_concurrency: number; stable_polls_min: number; retry_policy: string; clean_source_after_success: boolean }
+  ingestion: {
+    settle_secs: number
+    poll_secs: number
+    max_concurrency: number
+    stable_polls_min: number
+    retry_policy: string
+    auto_retry_on_start: boolean
+    max_attempts: number
+    retry_delay_ms: number
+    clean_source_after_success: boolean
+  }
   logging: { level: string }
+  system?: { available_logical_cores?: number }
+  initialized: boolean
 }
 
 export interface ToolchainPayload {
@@ -175,9 +202,74 @@ export function useEventStream() {
     if (w) watchfolder.value = w
   }
 
+  async function apiPut<T = unknown>(path: string, body: unknown): Promise<T | null> {
+    try {
+      const r = await fetch('/api' + path, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!r.ok) {
+        const err = await r.json().catch(() => ({ error: r.statusText }))
+        throw new Error((err as { error?: string }).error || r.statusText)
+      }
+      const text = await r.text()
+      if (!text || text.trim() === '') return { success: true } as T
+      try {
+        return JSON.parse(text) as T
+      } catch {
+        return { success: true } as T
+      }
+    } catch (error) {
+      console.error('[useEventStream] apiPut failed:', error)
+      throw error
+    }
+  }
+
+  async function putConfig(body: Partial<ConfigPayload>) {
+    await apiPut('/config', body)
+    await fetchConfig()
+  }
   async function fetchConfig() {
     const c = await apiGet<ConfigPayload>('/config')
     if (c) config.value = c
+    return c
+  }
+
+  /** Manually re-queue one failed job for immediate reprocessing. */
+  async function retryJob(id: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const r = await fetch('/api/jobs/' + encodeURIComponent(id) + '/retry', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const text = await r.text()
+      if (!text) return { success: r.ok }
+      const parsed = JSON.parse(text) as { success?: boolean; error?: string }
+      return { success: !!parsed.success, error: parsed.error }
+    } catch (e) {
+      console.error('[useEventStream] retryJob failed:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /** Re-queue all currently-failed jobs in one shot. */
+  async function retryAllFailed(): Promise<{ submitted: number; source_missing: number; errors: number }> {
+    try {
+      const r = await fetch('/api/jobs/retry-failed', { method: 'POST' })
+      const text = await r.text()
+      if (!text) return { submitted: 0, source_missing: 0, errors: 0 }
+      const parsed = JSON.parse(text) as { submitted?: number; source_missing?: number; errors?: number }
+      return {
+        submitted: parsed.submitted ?? 0,
+        source_missing: parsed.source_missing ?? 0,
+        errors: parsed.errors ?? 0,
+      }
+    } catch (e) {
+      console.error('[useEventStream] retryAllFailed failed:', e)
+      return { submitted: 0, source_missing: 0, errors: 1 }
+    }
   }
 
   async function fetchAssets(statusFilter?: string) {
@@ -313,6 +405,7 @@ export function useEventStream() {
     uptimeMs,
     fetchAll,
     fetchConfig,
+    putConfig,
     fetchAssets,
     startService,
     stopService,
@@ -320,6 +413,8 @@ export function useEventStream() {
     installService,
     uninstallService,
     clearLogs,
+    retryJob,
+    retryAllFailed,
     shortFileName,
   }
 }

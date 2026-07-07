@@ -1,7 +1,9 @@
 use crate::{bootstrap, config, db, encoder, fingerprint, identity, jobs, probe, profiles};
 use chrono::Utc;
 use sqlx::SqlitePool;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::sync::{Arc, Mutex as StdMutex};
 use uuid::Uuid;
 
 pub fn process_file_sync(
@@ -11,6 +13,36 @@ pub fn process_file_sync(
     input_path: &Path,
     config: &config::AppConfig,
     pool: &SqlitePool,
+    active_pids: Arc<StdMutex<Vec<u32>>>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        process_file_inner(queue, tools, target_root, input_path, config, pool, active_pids);
+    }));
+
+    if let Err(panic_payload) = result {
+        let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic in process_file_sync".to_string()
+        };
+        tracing::error!("PANIC in process_file_sync for {}: {}", input_path.display(), msg);
+        queue.broadcast("failed", &serde_json::json!({
+            "error": format!("Internal panic: {}", msg),
+            "path": input_path.to_string_lossy(),
+        }).to_string());
+    }
+}
+
+fn process_file_inner(
+    queue: &jobs::JobQueue,
+    tools: &bootstrap::ToolPaths,
+    target_root: &Path,
+    input_path: &Path,
+    config: &config::AppConfig,
+    pool: &SqlitePool,
+    active_pids: Arc<StdMutex<Vec<u32>>>,
 ) {
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
     let canonical_input = input_path.canonicalize().unwrap_or_else(|_| input_path.to_path_buf());
@@ -31,21 +63,31 @@ pub fn process_file_sync(
     };
 
     if let Ok(Some(existing)) = handle.block_on(db::find_by_fingerprint(pool, fingerprint)) {
-        let _ = handle.block_on(db::update_path_by_fingerprint(
-            pool,
-            fingerprint,
-            &input_path.to_string_lossy(),
-        ));
+        if existing.status == "ready"
+            && existing.mezzanine_ok
+            && !existing.current_path.is_empty()
+            && std::path::Path::new(&existing.current_path).exists()
+        {
+            tracing::info!(
+                "Dedup: asset {} already ready with valid mezzanine at {} (fingerprint={}), skipping transcode",
+                existing.uuid,
+                existing.current_path,
+                fingerprint,
+            );
+            return;
+        }
+
         tracing::info!(
-            "Dedup: asset {} already exists (fingerprint={}), updating path",
-            existing.uuid,
+            "Dedup: fingerprint {} matched but existing asset not usable (status={}, mezzanine_ok={}, path_exists={}), re-transcoding",
             fingerprint,
+            existing.status,
+            existing.mezzanine_ok,
+            std::path::Path::new(&existing.current_path).exists(),
         );
-        return;
+        let _ = handle.block_on(db::purge_rows_by_fingerprint(pool, fingerprint));
     }
 
     let metadata_uuid = Uuid::new_v4().to_string();
-    let short_uuid = &metadata_uuid[..8];
     let video_dir = target_root.join("videos");
     let _ = std::fs::create_dir_all(&video_dir);
     let safe_stem = identity::sanitize_filename(
@@ -54,12 +96,8 @@ pub fn process_file_sync(
             .unwrap_or_default()
             .to_string_lossy(),
     );
-    let output_filename = if safe_stem.is_empty() {
-        format!("{}.mp4", short_uuid)
-    } else {
-        format!("{}_{}.mp4", safe_stem, short_uuid)
-    };
-    let output_path = video_dir.join(&output_filename);
+
+    let output_path = build_unique_output_path(&video_dir, &safe_stem, &metadata_uuid);
 
     if let Err(e) = handle.block_on(db::insert_processing(
         pool,
@@ -152,18 +190,32 @@ pub fn process_file_sync(
         }
     });
 
-    let result = encoder::transcode_file(tools, config, input_path, &probe_data, profile_id, &output_path, &metadata_uuid, ptx);
+    let result = encoder::transcode_file(
+        tools, config, input_path, &probe_data, profile_id,
+        &output_path, &metadata_uuid, ptx, Some(active_pids),
+    );
 
     if result.success {
-        wait_for_file_flush(&result.output_path, 3000);
+        wait_for_file_flush(&result.output_path, 5000);
     }
 
     let mut validation_ok = false;
     let mut validation_error = String::new();
     let mut final_probe = None;
 
+    // Capture stderr tail regardless of outcome so the UI collapsible section always has data.
+    let stderr_tail: Vec<String> = if result.success {
+        Vec::new()
+    } else {
+        result.stderr_tail.clone()
+    };
+    if !stderr_tail.is_empty() {
+        queue.update(&job.id, |j| {
+            j.stderr_log = Some(stderr_tail.clone());
+        });
+    }
+
     if result.success {
-        // 1. File existence and size check
         let file_ok = if result.output_path.exists() {
             if let Ok(metadata) = std::fs::metadata(&result.output_path) {
                 metadata.len() > 0
@@ -175,119 +227,110 @@ pub fn process_file_sync(
         };
 
         if !file_ok {
-            validation_error = "File does not exist or has 0 bytes".to_string();
+            validation_error = "Output file missing or 0 bytes".to_string();
         } else {
-            // 2. Write lock verification with exclusive write access
-            #[cfg(target_os = "windows")]
-            let lock_res = {
-                use std::os::windows::fs::OpenOptionsExt;
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .share_mode(0)
-                    .open(&result.output_path)
-            };
-
-            #[cfg(not(target_os = "windows"))]
-            let lock_res = std::fs::OpenOptions::new()
-                .write(true)
-                .open(&result.output_path);
-
-            let lock_ok = match lock_res {
-                Ok(_) => true,
-                Err(e) => {
-                    tracing::error!("Exclusive write lock check failed for output file {:?}: {}", result.output_path, e);
-                    false
-                }
-            };
-
-            if !lock_ok {
-                validation_error = "File write lock check failed (still being written or locked)".to_string();
-            } else {
-                // 3. FFprobe validation run
-                match probe::probe_media(tools, &result.output_path) {
+            if !try_acquire_output_lock(&result.output_path, 5, 400) {
+                // Lock is busy: this happens momentarily on Windows when antivirus / search
+                // indexer touch the freshly-written file. We do NOT hard-fail any more — we
+                // log a warning and proceed to ffprobe, which will surface true lock issues.
+                tracing::warn!(
+                    "Could not acquire exclusive lock on {:?} — proceeding to ffprobe validation",
+                    result.output_path
+                );
+            }
+            match probe_with_retry(tools, &result.output_path, 3, 500) {
+                Ok(p) => match classify_probe_match(p, &probe_data) {
                     Ok(p) => {
-                        // Check for at least one valid video stream and one valid audio stream
-                        if p.width == 0 || p.height == 0 {
-                            validation_error = "No valid video stream found in output file".to_string();
-                        } else if p.audio_codec == "none" {
-                            validation_error = "No valid audio stream found in output file".to_string();
-                        } else {
-                            // Check that duration matches expected duration within a tolerance
-                            let output_duration = p.duration_secs;
-                            let source_duration = probe_data.duration_secs;
-                            let tolerance = (source_duration * 0.05).max(2.0);
-                            if (output_duration - source_duration).abs() > tolerance {
-                                validation_error = format!(
-                                    "Duration mismatch: source={}s output={}s (tolerance={}s)",
-                                    source_duration, output_duration, tolerance
-                                );
-                            } else {
-                                validation_ok = true;
-                                final_probe = Some(p);
-                            }
-                        }
+                        validation_ok = true;
+                        final_probe = Some(p);
                     }
-                    Err(e) => {
-                        validation_error = format!("FFprobe validation failed on output file: {}", e);
-                    }
-                }
+                    Err(e) => validation_error = e,
+                },
+                Err(e) => validation_error = e,
             }
         }
     } else {
-        validation_error = result.error.unwrap_or_else(|| "FFmpeg encoding failed".to_string());
+        validation_error = result
+            .error
+            .clone()
+            .unwrap_or_else(|| "FFmpeg encoding failed".to_string());
     }
 
     if validation_ok && final_probe.is_some() {
         let output_probe = final_probe.unwrap();
-        
+
         let keyframe_safe_start_ms = probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
-        
+
         let mut warnings_list = Vec::new();
         let mut mezzanine_ok = true;
 
         let fps = output_probe.fps();
-        let expected_fps = 25.0;
+        let expected_fps = probe_data.fps();
         if (fps - expected_fps).abs() > 0.01 {
             warnings_list.push(format!("fps_mismatch: got {:.3} expected {:.3}", fps, expected_fps));
             mezzanine_ok = false;
         }
 
         let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
-        if duration_ms == 0 {
+        if duration_ms <= 0 {
             warnings_list.push("zero_duration".to_string());
             mezzanine_ok = false;
         }
 
+        if output_probe.audio_sample_rate != 48000 {
+            warnings_list.push(format!("audio_sample_rate_not_48k: got {} Hz", output_probe.audio_sample_rate));
+            mezzanine_ok = false;
+        }
+
         let total_frames = output_probe.frame_count;
-        let gop_frames = 50; // default closed GOP size in our profiles
+        let gop_frames = compute_gop_from_fps(fps);
+
+        let keyframe_offsets = extract_keyframe_offsets_ms(
+            tools.ffprobe.to_str().unwrap_or(""),
+            &result.output_path,
+        );
+        let closed_gop_ok = verify_closed_gop(&keyframe_offsets, gop_frames, fps);
+        if !closed_gop_ok {
+            warnings_list.push("closed_gop_violation".to_string());
+            mezzanine_ok = false;
+        }
+
+        let faststart_ok = verify_faststart(&result.output_path);
+        if !faststart_ok {
+            warnings_list.push("missing_faststart".to_string());
+            mezzanine_ok = false;
+        }
 
         let _ = identity::write_sidecar_next_to_video(
-            &result.output_path, 
-            &metadata_uuid, 
-            &probe_data, 
-            &output_probe, 
-            &profile_name, 
-            "h264", 
+            &result.output_path,
+            &metadata_uuid,
+            &probe_data,
+            &output_probe,
+            &profile_name,
+            "h264",
             &config.encoding.audio_codec,
+            duration_ms,
             mezzanine_ok,
             fps,
+            output_probe.fps_num,
+            output_probe.fps_den,
             total_frames,
             gop_frames,
             keyframe_safe_start_ms,
             &warnings_list,
         );
 
-        let ffprobe_str = tools.ffprobe.to_str().unwrap_or("");
-        let keyframe_offsets = extract_keyframe_offsets_ms(ffprobe_str, &result.output_path);
         let keyframe_offsets_json = serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
 
         let _ = handle.block_on(db::mark_ready(
-            pool, 
-            &metadata_uuid, 
-            &result.output_path.to_string_lossy(), 
+            pool,
+            &metadata_uuid,
+            &result.output_path.to_string_lossy(),
             duration_ms,
             mezzanine_ok,
             fps,
+            output_probe.fps_num,
+            output_probe.fps_den,
             total_frames,
             gop_frames,
             keyframe_safe_start_ms,
@@ -322,6 +365,192 @@ pub fn process_file_sync(
         }
     }
     queue.prune_old(500);
+}
+
+fn build_unique_output_path(video_dir: &Path, safe_stem: &str, uuid: &str) -> std::path::PathBuf {
+    let base_name = if safe_stem.is_empty() {
+        uuid.to_string()
+    } else {
+        format!("{}_{}", safe_stem, uuid)
+    };
+    let filename = format!("{}.mp4", base_name);
+    let path = video_dir.join(&filename);
+
+    if !path.exists() {
+        return path;
+    }
+
+    for _ in 0..3 {
+        let new_uuid = Uuid::new_v4().to_string();
+        let new_name = if safe_stem.is_empty() {
+            format!("{}.mp4", new_uuid)
+        } else {
+            format!("{}_{}.mp4", safe_stem, new_uuid)
+        };
+        let candidate = video_dir.join(&new_name);
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    let ts = chrono::Utc::now().timestamp_millis();
+    let fallback = format!("{}_{}_{}.mp4", safe_stem, uuid, ts);
+    video_dir.join(fallback)
+}
+
+fn compute_gop_from_fps(fps: f64) -> i64 {
+    let gop = (fps * 2.0).round() as i64;
+    if gop > 0 { gop } else { 50 }
+}
+
+fn verify_closed_gop(keyframe_offsets: &[i64], gop_frames: i64, fps: f64) -> bool {
+    if keyframe_offsets.len() < 2 {
+        return true;
+    }
+    if fps <= 0.0 || gop_frames <= 0 {
+        return true;
+    }
+    let frame_ms = 1000.0 / fps;
+    let gop_ms = frame_ms * gop_frames as f64;
+    let tolerance = frame_ms * 0.5;
+
+    for window in keyframe_offsets.windows(2) {
+        let diff = (window[1] - window[0]) as f64;
+        if (diff - gop_ms).abs() > tolerance && diff < gop_ms - tolerance {
+            return false;
+        }
+    }
+    true
+}
+
+fn verify_faststart(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+
+    let Ok(file_size) = file.metadata().map(|m| m.len()) else {
+        return false;
+    };
+    if file_size < 16 {
+        return false;
+    }
+
+    let mut buf = [0u8; 16];
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
+    if file.read_exact(&mut buf).is_err() {
+        return false;
+    }
+
+    let moov_in_first_64k = {
+        let mut scan_buf = vec![0u8; 65536.min(file_size as usize)];
+        if file.seek(SeekFrom::Start(0)).is_err() {
+            return false;
+        }
+        if file.read(&mut scan_buf).is_err() {
+            return false;
+        }
+        scan_buf.windows(4).any(|w| w == b"moov")
+    };
+
+    moov_in_first_64k
+}
+
+/// Try to acquire an exclusive write lock on the freshly-written mezzanine. Returns true on
+/// success. On Windows, antivirus and the search indexer often hold a brief read-only handle to
+/// the new file; we retry a handful of times with short backoff so those can release it before
+/// we give up. Failure to acquire is **advisory only** — the caller should still attempt ffprobe
+/// validation, which is the real test.
+fn try_acquire_output_lock(path: &Path, attempts: u32, delay_ms: u64) -> bool {
+    for attempt in 0..attempts {
+        #[cfg(target_os = "windows")]
+        let res = {
+            use std::os::windows::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .share_mode(0)
+                .open(path)
+        };
+        #[cfg(not(target_os = "windows"))]
+        let res = std::fs::OpenOptions::new().write(true).open(path);
+
+        match res {
+            Ok(_) => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.raw_os_error() == Some(32) /* ERROR_SHARING_VIOLATION */ =>
+            {
+                if attempt + 1 < attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+            }
+            Err(_) => {
+                // Any other error (not found, etc.) — no point retrying.
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Attempt ffprobe with a small retry loop. Returns the first successful result, or the last
+/// error. Many transient output-file issues (av touching, moov atom still flushed) clear within
+/// a second or two.
+fn probe_with_retry(
+    tools: &bootstrap::ToolPaths,
+    path: &Path,
+    attempts: u32,
+    delay_ms: u64,
+) -> Result<probe::ProbeData, String> {
+    let mut last_err = String::new();
+    for attempt in 0..attempts {
+        match probe::probe_media(tools, path) {
+            Ok(p) => return Ok(p),
+            Err(e) => {
+                last_err = e;
+                if attempt + 1 < attempts {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                }
+            }
+        }
+    }
+    // Best-effort diagnostic: if ffprobe produced an empty error string, surface a more useful
+    // message pointing the operator to where the real diagnostic would be.
+    if last_err.trim() == "ffprobe failed:" || last_err.trim().is_empty() {
+        Err(format!("ffprobe returned an error without message (output may be premature or unreadable); see logs"))
+    } else {
+        Err(last_err)
+    }
+}
+
+/// Validate that the probed mezzanine matches the source expectation: video + audio streams
+/// present, and duration within tolerance of the source (a couple of frames).
+fn classify_probe_match(
+    p: probe::ProbeData,
+    source: &probe::ProbeData,
+) -> Result<probe::ProbeData, String> {
+    if p.width == 0 || p.height == 0 {
+        return Err("No valid video stream in output".into());
+    }
+    if p.audio_codec == "none" {
+        // Audio missing is non-fatal for some source media (clean switches). Warn instead.
+        tracing::warn!("Output has no audio stream (source had codec={})", source.audio_codec);
+    }
+    let output_duration = p.duration_secs;
+    let source_duration = source.duration_secs;
+    let fps = p.fps();
+    let frame_duration_ms = if fps > 0.0 { (1000.0 / fps).round() as f64 } else { 40.0 };
+    let tolerance_ms = (frame_duration_ms * 2.0).max(40.0);
+    let diff_ms = ((output_duration - source_duration).abs() * 1000.0).round() as f64;
+    if diff_ms > tolerance_ms {
+        return Err(format!(
+            "Duration mismatch: source={:.3}s output={:.3}s (diff={}ms, tolerance={}ms)",
+            source_duration, output_duration, diff_ms, tolerance_ms
+        ));
+    }
+    Ok(p)
 }
 
 fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
@@ -360,22 +589,25 @@ fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
 }
 
 fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
-    let output = match std::process::Command::new(ffprobe)
-        .args(&[
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-skip_frame",
-            "nokey",
-            "-show_entries",
-            "frame=pkt_pts_time",
-            "-of",
-            "csv=p=0",
-        ])
-        .arg(path)
-        .output()
-    {
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+    #[cfg(target_os = "windows")]
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+    let mut cmd = std::process::Command::new(ffprobe);
+    cmd.args(&[
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-skip_frame", "nokey",
+        "-show_entries", "frame=pts_time",
+        "-of", "csv=p=0",
+    ]);
+    cmd.arg(path);
+
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = match cmd.output() {
         Ok(out) => out,
         Err(e) => {
             tracing::error!("Failed to execute ffprobe for keyframe scanning: {}", e);
@@ -393,8 +625,31 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
     stdout_str
         .lines()
         .map(|line| line.trim())
-        .filter(|line| !line.is_empty())
+        .filter(|line| !line.is_empty() && *line != "N/A")
         .filter_map(|line| line.parse::<f64>().ok())
         .map(|t| (t * 1000.0).round() as i64)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_verify_closed_gop_uniform() {
+        let offsets = vec![0, 2000, 4000, 6000];
+        assert!(verify_closed_gop(&offsets, 50, 25.0));
+    }
+
+    #[test]
+    fn test_verify_closed_gop_violation() {
+        let offsets = vec![0, 1000, 2000, 4000];
+        assert!(!verify_closed_gop(&offsets, 50, 25.0));
+    }
+
+    #[test]
+    fn test_compute_gop_from_fps() {
+        assert_eq!(compute_gop_from_fps(25.0), 50);
+        assert_eq!(compute_gop_from_fps(29.97), 60);
+    }
 }

@@ -7,6 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, LazyLock};
+use std::sync::{Arc, Mutex};
 
 static TIME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
 static FRAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"frame=\s*(\d+)").unwrap());
@@ -35,7 +36,45 @@ pub struct EncodeProgress {
 pub struct EncodeResult {
     pub output_path: PathBuf,
     pub success: bool,
+    /// One-line human-readable summary suitable for UI display.
     pub error: Option<String>,
+    /// Verbose stderr tail from ffmpeg; rendered inside a collapsible UI element.
+    pub stderr_tail: Vec<String>,
+    #[allow(dead_code)]
+    pub exit_pid: Option<u32>,
+}
+
+/// Reduce a stderr buffer to a single human-readable summary line.
+/// ffmpeg's last log line is usually "Conversion failed!" preceded by the actual cause; we walk
+/// backwards and pick the first non-trivial diagnostic line we can find.
+fn summarize_stderr(lines: &[String]) -> Option<String> {
+    const BORING: &[&str] = &[
+        "Conversion failed!",
+        "At least one output file must be specified",
+        "frame=",
+        "Press [q] to stop",
+        "[libx264 @",
+        "[mp4 @",
+        "[aac @",
+        "[libmp3lame @",
+    ];
+    for line in lines.iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("frame=") {
+            continue;
+        }
+        if BORING.iter().any(|b| trimmed.starts_with(b)) || trimmed == "Conversion failed!" {
+            continue;
+        }
+        if trimmed.len() < 6 {
+            continue;
+        }
+        return Some(trimmed.to_string());
+    }
+    if let Some(last) = lines.iter().rev().find(|l| !l.is_empty()) {
+        return Some(last.trim().to_string());
+    }
+    None
 }
 
 pub fn transcode_file(
@@ -47,21 +86,21 @@ pub fn transcode_file(
     output_path: &Path,
     metadata_uuid: &str,
     progress_tx: mpsc::Sender<EncodeProgress>,
+    active_pids: Option<Arc<Mutex<Vec<u32>>>>,
 ) -> EncodeResult {
     let profile = EncodingProfile::by_id(profile_id);
     let mut args = profile.build_ffmpeg_args(
         config,
         &input_path.to_string_lossy(),
         &output_path.to_string_lossy(),
+        source_probe.fps_num,
+        source_probe.fps_den,
     );
 
-    let metadata_arg = format!("playoutvue_id:{}", metadata_uuid);
     let output_path_str = output_path.to_string_lossy();
     let insert_pos = args.iter().position(|a| a == output_path_str.as_ref()).unwrap_or(args.len());
     args.insert(insert_pos, "-metadata".to_string());
-    args.insert(insert_pos + 1, format!("comment={}", metadata_arg));
-    args.insert(insert_pos + 2, "-metadata".to_string());
-    args.insert(insert_pos + 3, format!("playoutvue_id={}", metadata_uuid));
+    args.insert(insert_pos + 1, format!("playoutvue_id={}", metadata_uuid));
 
     let total_frames = source_probe.frame_count;
     let duration_ms = (source_probe.duration_secs * 1000.0).round() as i64;
@@ -82,9 +121,18 @@ pub fn transcode_file(
                 output_path: output_path.to_path_buf(),
                 success: false,
                 error: Some(format!("Failed to spawn ffmpeg: {}", e)),
+                stderr_tail: Vec::new(),
+                exit_pid: None,
             };
         }
     };
+
+    let pid = child.id();
+    if let Some(ref pids) = active_pids {
+        if let Ok(mut list) = pids.lock() {
+            list.push(pid);
+        }
+    }
 
     let stderr = match child.stderr.take() {
         Some(s) => s,
@@ -94,6 +142,8 @@ pub fn transcode_file(
                 output_path: output_path.to_path_buf(),
                 success: false,
                 error: Some("Failed to pipe stderr from ffmpeg process".to_string()),
+                stderr_tail: Vec::new(),
+                exit_pid: Some(pid),
             };
         }
     };
@@ -167,7 +217,7 @@ pub fn transcode_file(
         let percent = if duration_ms > 0 && current_time_ms > 0 {
             ((current_time_ms as f64 / duration_ms as f64) * 100.0).min(99.0) as f32
         } else if total_frames > 0 {
-            ((last_frame as f32 / total_frames as f32) * 100.0).min(99.0)
+            ((last_frame as f32 / total_frames as f32) * 100.0).min(99.0) as f32
         } else {
             0.0
         };
@@ -189,13 +239,26 @@ pub fn transcode_file(
     let status = match child.wait() {
         Ok(s) => s,
         Err(e) => {
+            if let Some(ref pids) = active_pids {
+                if let Ok(mut list) = pids.lock() {
+                    list.retain(|&x| x != pid);
+                }
+            }
             return EncodeResult {
                 output_path: output_path.to_path_buf(),
                 success: false,
                 error: Some(format!("Failed to wait on ffmpeg: {}", e)),
+                stderr_tail: Vec::new(),
+                exit_pid: Some(pid),
             };
         }
     };
+
+    if let Some(ref pids) = active_pids {
+        if let Ok(mut list) = pids.lock() {
+            list.retain(|&x| x != pid);
+        }
+    }
 
     let _ = progress_tx.send(EncodeProgress {
         frame: total_frames,
@@ -214,22 +277,21 @@ pub fn transcode_file(
             output_path: output_path.to_path_buf(),
             success: true,
             error: None,
+            stderr_tail: Vec::new(),
+            exit_pid: Some(pid),
         }
     } else {
-        let mut error_msg = format!("ffmpeg exited with code {:?}", status.code());
-        if !stderr_lines.is_empty() {
-            let tail_len = stderr_lines.len().min(50);
-            let tail = &stderr_lines[stderr_lines.len() - tail_len..];
-            error_msg.push_str("\n--- FFmpeg stderr (last lines) ---\n");
-            for line in tail {
-                error_msg.push_str(line);
-                error_msg.push('\n');
-            }
-        }
+        let tail_len = stderr_lines.len().min(50);
+        let tail: Vec<String> = stderr_lines[stderr_lines.len() - tail_len..].to_vec();
+        let exit_code = status.code();
+        let short = summarize_stderr(&stderr_lines)
+            .unwrap_or_else(|| format!("ffmpeg exited with code {:?}", exit_code));
         EncodeResult {
             output_path: output_path.to_path_buf(),
             success: false,
-            error: Some(error_msg),
+            error: Some(short),
+            stderr_tail: tail,
+            exit_pid: Some(pid),
         }
     }
 }

@@ -18,6 +18,8 @@ pub struct ProbeData {
     pub height: i64,
     pub video_codec: String,
     pub audio_codec: String,
+    pub audio_sample_rate: i64,
+    pub audio_channels: i64,
     pub fps_num: i64,
     pub fps_den: i64,
     pub field_order: String,
@@ -116,6 +118,8 @@ struct StreamInfo {
     nb_frames: Option<FfprobeValue>,
     display_aspect_ratio: Option<FfprobeValue>,
     field_order: Option<FfprobeValue>,
+    sample_rate: Option<FfprobeValue>,
+    channels: Option<FfprobeValue>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -161,10 +165,21 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
     let width = vstream.and_then(|s| s.width).unwrap_or(0) as i64;
     let height = vstream.and_then(|s| s.height).unwrap_or(0) as i64;
 
-    let (fps_num, fps_den) = vstream
+    let audio_sample_rate = astream
+        .and_then(|s| s.sample_rate.as_ref())
+        .and_then(|v| v.parse_i64())
+        .unwrap_or(0);
+    let audio_channels = astream
+        .and_then(|s| s.channels.as_ref())
+        .and_then(|v| v.parse_i64())
+        .unwrap_or(0);
+
+    let (fps_num_raw, fps_den_raw) = vstream
         .and_then(|s| s.r_frame_rate.as_ref())
         .map(parse_fps_value)
         .unwrap_or((25, 1));
+
+    let (fps_num, fps_den) = snap_fps_rational(fps_num_raw, fps_den_raw);
 
     let field_order = vstream
         .and_then(|s| s.field_order.as_ref())
@@ -178,7 +193,11 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
         .unwrap_or_default();
 
     let duration_secs = resolve_duration(&parsed);
-    let frame_count = (duration_secs * fps_num as f64 / fps_den as f64).round() as i64;
+    let frame_count = if fps_den > 0 {
+        (duration_secs * fps_num as f64 / fps_den as f64).round() as i64
+    } else {
+        0
+    };
 
     if width == 0 || height == 0 {
         return Err("No video stream found".into());
@@ -191,6 +210,8 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
         height,
         video_codec,
         audio_codec,
+        audio_sample_rate,
+        audio_channels,
         fps_num,
         fps_den,
         field_order,
@@ -200,38 +221,47 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
 }
 
 fn resolve_duration(parsed: &FfprobeOutput) -> f64 {
-    let mut candidates: Vec<f64> = Vec::new();
+    let vstream = parsed.streams.iter().find(|s| s.codec_type == "video");
+
+    if let Some(vs) = vstream {
+        if let Some(d) = vs.duration.as_ref().and_then(|v| v.parse_f64()) {
+            return d;
+        }
+        if let (Some(ts), Some(tb)) = (
+            vs.duration_ts.as_ref().and_then(|v| v.parse_i64()),
+            vs.time_base.as_ref().and_then(|v| v.parse_ratio()),
+        ) {
+            let d = ts as f64 * tb;
+            if d.is_finite() && d > 0.0 {
+                return d;
+            }
+        }
+        let fps = vs.avg_frame_rate.as_ref().and_then(|v| v.parse_ratio())
+            .or_else(|| vs.r_frame_rate.as_ref().and_then(|v| v.parse_ratio()));
+        if let (Some(frames), Some(fps)) = (
+            vs.nb_frames.as_ref().and_then(|v| v.parse_i64()),
+            fps,
+        ) {
+            let d = frames as f64 / fps;
+            if d.is_finite() && d > 0.0 {
+                return d;
+            }
+        }
+    }
 
     if let Some(d) = parsed.format.duration.as_ref().and_then(|v| v.parse_f64()) {
-        candidates.push(d);
+        return d;
     }
 
     for stream in &parsed.streams {
-        if let Some(d) = stream.duration.as_ref().and_then(|v| v.parse_f64()) {
-            candidates.push(d);
-        }
-        if let (Some(ts), Some(tb)) = (
-            stream.duration_ts.as_ref().and_then(|v| v.parse_i64()),
-            stream.time_base.as_ref().and_then(|v| v.parse_ratio()),
-        ) {
-            candidates.push(ts as f64 * tb);
-        }
-        let fps_from_rf = stream.r_frame_rate.as_ref().and_then(|v| v.parse_ratio());
-        let fps_from_avg = stream.avg_frame_rate.as_ref().and_then(|v| v.parse_ratio());
-        let fps = fps_from_avg.or(fps_from_rf);
-        if let (Some(frames), Some(fps)) = (
-            stream.nb_frames.as_ref().and_then(|v| v.parse_i64()),
-            fps,
-        ) {
-            candidates.push(frames as f64 / fps);
+        if stream.codec_type == "audio" {
+            if let Some(d) = stream.duration.as_ref().and_then(|v| v.parse_f64()) {
+                return d;
+            }
         }
     }
 
-    candidates
-        .into_iter()
-        .filter(|v| v.is_finite() && *v > 0.0)
-        .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .unwrap_or(0.0)
+    0.0
 }
 
 fn parse_fps_value(value: &FfprobeValue) -> (i64, i64) {
@@ -253,13 +283,30 @@ fn parse_fps_value(value: &FfprobeValue) -> (i64, i64) {
     }
 }
 
+pub fn snap_fps_rational(num: i64, den: i64) -> (i64, i64) {
+    if den <= 0 {
+        return (25, 1);
+    }
+    let fps = num as f64 / den as f64;
+    let near = |a: f64, b: f64| (a - b).abs() < 0.05;
+    if near(fps, 29.97) { return (30000, 1001); }
+    if near(fps, 23.976) { return (24000, 1001); }
+    if near(fps, 59.94) { return (60000, 1001); }
+    if near(fps, 25.0) { return (25, 1); }
+    if near(fps, 50.0) { return (50, 1); }
+    if near(fps, 30.0) { return (30, 1); }
+    if near(fps, 60.0) { return (60, 1); }
+    if near(fps, 24.0) { return (24, 1); }
+    (num, den)
+}
+
 pub fn get_keyframe_safe_start_ms(ffprobe_path: &Path, path: &Path) -> i64 {
     let mut command = Command::new(ffprobe_path);
     command.args([
         "-v", "error",
         "-select_streams", "v:0",
         "-skip_frame", "nokey",
-        "-show_entries", "frame=pkt_pts_time",
+        "-show_entries", "frame=pts_time",
         "-of", "csv=p=0",
     ]);
     command.arg(path);
@@ -268,11 +315,15 @@ pub fn get_keyframe_safe_start_ms(ffprobe_path: &Path, path: &Path) -> i64 {
     command.creation_flags(CREATE_NO_WINDOW);
 
     let out = command.output();
-    
+
     if let Ok(output) = out {
         let text = String::from_utf8_lossy(&output.stdout);
-        if let Some(first_line) = text.lines().next() {
-            if let Ok(t_sec) = first_line.trim().parse::<f64>() {
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed == "N/A" {
+                continue;
+            }
+            if let Ok(t_sec) = trimmed.parse::<f64>() {
                 return (t_sec * 1000.0).round() as i64;
             }
         }
@@ -280,3 +331,34 @@ pub fn get_keyframe_safe_start_ms(ffprobe_path: &Path, path: &Path) -> i64 {
     0
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_snap_fps_pal() {
+        assert_eq!(snap_fps_rational(25, 1), (25, 1));
+    }
+
+    #[test]
+    fn test_snap_fps_ntsc() {
+        assert_eq!(snap_fps_rational(30000, 1001), (30000, 1001));
+        assert_eq!(snap_fps_rational(29970, 1000), (30000, 1001));
+    }
+
+    #[test]
+    fn test_snap_fps_film() {
+        assert_eq!(snap_fps_rational(24000, 1001), (24000, 1001));
+        assert_eq!(snap_fps_rational(23976, 1000), (24000, 1001));
+    }
+
+    #[test]
+    fn test_snap_fps_unknown_preserved() {
+        assert_eq!(snap_fps_rational(48, 1), (48, 1));
+    }
+
+    #[test]
+    fn test_snap_fps_zero_den() {
+        assert_eq!(snap_fps_rational(25, 0), (25, 1));
+    }
+}

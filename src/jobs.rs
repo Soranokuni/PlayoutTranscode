@@ -24,7 +24,15 @@ pub struct JobRecord {
     pub progress: f32,
     pub current_stage: String,
     pub duration_secs: f64,
+    /// One-line, human-readable error summary shown in the UI tile.
     pub error: Option<String>,
+    /// Verbose multi-line diagnostic log (e.g., last ffmpeg stderr lines). Rendered inside a
+    /// collapsible `<details>` element so it never floods the dashboard.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_log: Option<Vec<String>>,
+    /// How many times this job has been retried (incremented on each retry).
+    #[serde(default)]
+    pub attempt: u32,
     pub created_at: String,
     pub finished_at: Option<String>,
     pub source_frame_count: i64,
@@ -49,6 +57,8 @@ impl JobRecord {
             current_stage: "Queued".to_string(),
             duration_secs: 0.0,
             error: None,
+            stderr_log: None,
+            attempt: 0,
             created_at: Utc::now().to_rfc3339(),
             finished_at: None,
             source_frame_count: 0,

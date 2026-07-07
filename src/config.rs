@@ -37,8 +37,12 @@ fn default_bind_address() -> String { "127.0.0.1".to_string() }
 pub struct EncodingConfig {
     #[serde(default = "default_preset")]
     pub preset: String,
+    /// Per-encode ffmpeg/x264 threads. 0 = "auto" (computed from `cpu_cores` / `max_concurrency`).
     #[serde(default = "default_threads")]
     pub ffmpeg_threads: usize,
+    /// Total CPU core budget shared across all concurrent encodes. 0 = "auto" (half of physical cores).
+    #[serde(default = "default_cpu_cores")]
+    pub cpu_cores: usize,
     #[serde(default = "default_audio_codec")]
     pub audio_codec: String,
     #[serde(default = "default_audio_bitrate")]
@@ -53,11 +57,48 @@ pub struct EncodingConfig {
 
 fn default_preset() -> String { "medium".into() }
 fn default_threads() -> usize { 0 }
+fn default_cpu_cores() -> usize { 0 }
 fn default_audio_codec() -> String { "aac".into() }
 fn default_audio_bitrate() -> String { "320k".into() }
 fn default_tune() -> String { "film".into() }
 fn default_probesize() -> String { "500M".into() }
 fn default_analyzeduration() -> String { "500M".into() }
+
+/// Number of physical/logical cores available on this machine.
+pub fn available_logical_cores() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+impl EncodingConfig {
+    /// Returns the per-encode thread count that should be passed to ffmpeg:
+    /// - If `ffmpeg_threads > 0`, that value is honored directly (operator override).
+    /// - Otherwise, derived from `cpu_cores / max_concurrency`:
+    ///     * `cpu_cores == 0` (auto) -> half of available logical cores
+    /// - Result is always >= 1.
+    pub fn effective_threads_per_encode(&self, max_concurrency: usize) -> usize {
+        if self.ffmpeg_threads > 0 {
+            return self.ffmpeg_threads;
+        }
+        let cores = if self.cpu_cores > 0 {
+            self.cpu_cores
+        } else {
+            (available_logical_cores() / 2).max(1)
+        };
+        if max_concurrency == 0 {
+            cores
+        } else {
+            (cores / max_concurrency).max(1)
+        }
+    }
+
+    /// Total thread usage across all concurrent encodes — for display and validation.
+    pub fn effective_total_threads(&self, max_concurrency: usize) -> usize {
+        let per = self.effective_threads_per_encode(max_concurrency);
+        per.saturating_mul(max_concurrency.max(1))
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileConfig {
@@ -100,6 +141,17 @@ pub struct IngestionConfig {
     pub stable_polls_min: u32,
     #[serde(default = "default_retry_policy")]
     pub retry_policy: String,
+    /// On startup, purge error rows whose source file is still in the watch folder so the
+    /// watcher will re-queue them automatically. Rows whose source no longer exists are kept
+    /// for operator inspection.
+    #[serde(default = "default_auto_retry_on_start")]
+    pub auto_retry_on_start: bool,
+    /// How many times to retry an encode before giving up and marking the asset `error`.
+    #[serde(default = "default_max_attempts")]
+    pub max_attempts: u32,
+    /// Delay (ms) between retry attempts for the same input.
+    #[serde(default = "default_retry_delay_ms")]
+    pub retry_delay_ms: u64,
     #[serde(default)]
     pub clean_source_after_success: bool,
     #[serde(default)]
@@ -113,6 +165,9 @@ fn default_poll() -> u64 { 10 }
 fn default_concurrency() -> usize { 2 }
 fn default_stable_polls() -> u32 { 2 }
 fn default_retry_policy() -> String { "once".into() }
+fn default_auto_retry_on_start() -> bool { true }
+fn default_max_attempts() -> u32 { 2 }
+fn default_retry_delay_ms() -> u64 { 2000 }
 
 impl Default for IngestionConfig {
     fn default() -> Self {
@@ -122,6 +177,9 @@ impl Default for IngestionConfig {
             max_concurrency: 2,
             stable_polls_min: 2,
             retry_policy: "once".into(),
+            auto_retry_on_start: true,
+            max_attempts: 2,
+            retry_delay_ms: 2000,
             clean_source_after_success: false,
             include_extensions: Vec::new(),
             exclude_extensions: Vec::new(),
@@ -177,6 +235,7 @@ impl Default for AppConfig {
             encoding: EncodingConfig {
                 preset: "medium".into(),
                 ffmpeg_threads: 0,
+                cpu_cores: 0,
                 audio_codec: "aac".into(),
                 audio_bitrate: "320k".into(),
                 tune: "film".into(),
@@ -318,6 +377,24 @@ impl AppConfig {
 
         if self.ingestion.max_concurrency == 0 {
             return Err("max_concurrency must be at least 1".into());
+        }
+        if self.ingestion.max_attempts == 0 {
+            return Err("max_attempts must be at least 1".into());
+        }
+        let max_cores = available_logical_cores();
+        if self.encoding.cpu_cores > max_cores {
+            return Err(format!(
+                "cpu_cores ({}) exceeds available logical cores ({})",
+                self.encoding.cpu_cores, max_cores
+            ));
+        }
+        // Warn (not fail) if the configured budget can oversubscribe the host.
+        let total = self.encoding.effective_total_threads(self.ingestion.max_concurrency);
+        if total > max_cores {
+            tracing::warn!(
+                "Thread budget oversubscription: effective {} threads across {} encodes on {} logical cores",
+                total, self.ingestion.max_concurrency, max_cores
+            );
         }
 
         Ok(())
