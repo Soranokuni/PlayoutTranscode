@@ -1,6 +1,9 @@
 use crate::config::{AppConfig, ProfileConfig};
 use serde::{Deserialize, Serialize};
 
+pub const TARGET_FPS_NUM: i64 = 25;
+pub const TARGET_FPS_DEN: i64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProfileId {
     ProfileA,
@@ -94,13 +97,13 @@ impl EncodingProfile {
         config: &AppConfig,
         input_path: &str,
         output_path: &str,
-        source_fps_num: i64,
-        source_fps_den: i64,
+        _source_fps_num: i64,
+        _source_fps_den: i64,
     ) -> Vec<String> {
         let profile_cfg = self.config_for(config);
 
-        let fps_num = if source_fps_num > 0 { source_fps_num } else { 25 };
-        let fps_den = if source_fps_den > 0 { source_fps_den } else { 1 };
+        let fps_num = TARGET_FPS_NUM;
+        let fps_den = TARGET_FPS_DEN;
 
         let gop_frames = compute_gop_size(fps_num, fps_den);
 
@@ -231,16 +234,10 @@ impl EncodingProfile {
         let w = self.target_width;
         let h = self.target_height;
 
-        if self.interlaced {
-            format!(
-                "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p"
-            )
-        } else {
-            format!(
-                "fps={n}/{d},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
-                n = fps_num, d = fps_den, w = w, h = h
-            )
-        }
+        format!(
+            "fps={n}/{d},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
+            n = fps_num, d = fps_den, w = w, h = h
+        )
     }
 }
 
@@ -332,14 +329,36 @@ mod tests {
     }
 
     #[test]
-    fn test_build_args_preserves_source_fps() {
+    fn test_build_args_normalizes_to_25fps() {
         let config = AppConfig::default();
         let p = EncodingProfile::by_id(ProfileId::ProfileA);
         let args = p.build_ffmpeg_args(&config, "in.mov", "out.mp4", 30000, 1001);
         let r_idx = args.iter().position(|a| a == "-r").unwrap();
-        assert_eq!(args[r_idx + 1], "30000/1001");
+        assert_eq!(args[r_idx + 1], "25/1");
         let gop_idx = args.iter().position(|a| a == "-g").unwrap();
-        assert_eq!(args[gop_idx + 1], "60");
+        assert_eq!(args[gop_idx + 1], "50");
+    }
+
+    #[test]
+    fn test_build_args_normalizes_50p_to_25fps() {
+        let config = AppConfig::default();
+        let p = EncodingProfile::by_id(ProfileId::ProfileA);
+        let args = p.build_ffmpeg_args(&config, "in.mov", "out.mp4", 50, 1);
+        let r_idx = args.iter().position(|a| a == "-r").unwrap();
+        assert_eq!(args[r_idx + 1], "25/1");
+        let gop_idx = args.iter().position(|a| a == "-g").unwrap();
+        assert_eq!(args[gop_idx + 1], "50");
+    }
+
+    #[test]
+    fn test_build_args_interlaced_also_25fps() {
+        let config = AppConfig::default();
+        let p = EncodingProfile::by_id(ProfileId::ProfileB);
+        let args = p.build_ffmpeg_args(&config, "in.mov", "out.mp4", 50, 1);
+        let r_idx = args.iter().position(|a| a == "-r").unwrap();
+        assert_eq!(args[r_idx + 1], "25/1");
+        let vf_idx = args.iter().position(|a| a == "-vf").unwrap();
+        assert!(args[vf_idx + 1].starts_with("fps=25/1"), "interlaced vf must also normalize fps");
     }
 
     #[test]
