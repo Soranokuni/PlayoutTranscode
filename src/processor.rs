@@ -265,10 +265,15 @@ fn process_file_inner(
         let mut mezzanine_ok = true;
 
         let fps = output_probe.fps();
-        let expected_fps = probe_data.fps();
+        let expected_fps = profiles::TARGET_FPS_NUM as f64 / profiles::TARGET_FPS_DEN as f64;
         if (fps - expected_fps).abs() > 0.01 {
             warnings_list.push(format!("fps_mismatch: got {:.3} expected {:.3}", fps, expected_fps));
             mezzanine_ok = false;
+        }
+
+        let source_fps = probe_data.fps();
+        if (source_fps - expected_fps).abs() > 0.01 {
+            warnings_list.push(format!("fps_converted: source {:.3} -> output {:.3}", source_fps, expected_fps));
         }
 
         let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
