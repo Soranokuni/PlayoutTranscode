@@ -286,6 +286,44 @@ mod integration_tests {
     }
 
     #[test]
+    fn test_boundary_trimmed_subclip_custom_display_name() {
+        let parent = make_ready_asset(
+            "parent-002",
+            "D:/media/videos/parent2.mp4",
+            120_000,
+            25,
+            1,
+        );
+
+        let subclip = AssetResponse {
+            uuid: "subclip-custom-title-99".to_string(),
+            playoutvue_id: "subclip-custom-title-99".to_string(),
+            current_path: parent.current_path.clone(),
+            duration_ms: parent.duration_ms,
+            trim_in_ms: 10_000,
+            trim_out_ms: 20_000,
+            fps_num: 25,
+            fps_den: 1,
+            mezzanine_ok: true,
+            fps: 25.0,
+            total_frames: 3000,
+            gop_frames: 50,
+            keyframe_safe_start_ms: 0,
+        };
+
+        let item = hydrate_item(&subclip);
+        assert_eq!(item.trim_in_ms, 10_000);
+        assert_eq!(item.trim_out_ms, 20_000);
+
+        let trim = compute_frame_trim(&item).expect("custom title subclip must compute frame trim");
+        assert_eq!(trim.in_frame, 250, "10000ms at 25fps = 250 frames");
+        assert_eq!(trim.duration_frames, 250, "10000ms content = 250 frames");
+
+        let cmd = caspar_play_command(1, 10, &item.path, &trim);
+        assert!(cmd.contains("SEEK 250"), "SEEK must handle non-pattern titles");
+    }
+
+    #[test]
     fn test_boundary_hydration_no_repair_needed() {
         let asset = make_ready_asset(
             "repair-test-001",

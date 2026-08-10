@@ -23,4 +23,18 @@
 *.zip
 *.tar.gz
 target/
+
+# SQLite databases & transcode runtime files
+/logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# Test execution files
+test_stderr.txt
+test_stdout.txt
+
+# Reference build error files
+PlayOutVue for reference/src-tauri/compile_err.txt
 
