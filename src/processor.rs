@@ -6,6 +6,45 @@ use std::path::Path;
 use std::sync::{Arc, Mutex as StdMutex};
 use uuid::Uuid;
 
+pub trait Publisher {
+    fn stage_path(&self, final_path: &Path, uuid: &str) -> std::path::PathBuf;
+    fn publish(&self, staged: &Path, final_path: &Path) -> Result<(), String>;
+    fn cleanup_staging(&self, staged: &Path);
+}
+
+pub struct LocalFilePublisher;
+
+impl Publisher for LocalFilePublisher {
+    fn stage_path(&self, final_path: &Path, uuid: &str) -> std::path::PathBuf {
+        let parent = final_path.parent().unwrap_or_else(|| Path::new("."));
+        let filename = final_path.file_name().unwrap_or_default().to_string_lossy();
+        parent.join(format!(".tmp_{}_{}", uuid, filename))
+    }
+
+    fn publish(&self, staged: &Path, final_path: &Path) -> Result<(), String> {
+        if !staged.exists() {
+            return Err(format!("Staging file does not exist: {}", staged.display()));
+        }
+        if final_path.exists() {
+            return Err(format!("Final output path already exists: {}", final_path.display()));
+        }
+        std::fs::rename(staged, final_path).map_err(|e| {
+            format!(
+                "Failed to rename staging file '{}' -> '{}': {}",
+                staged.display(),
+                final_path.display(),
+                e
+            )
+        })
+    }
+
+    fn cleanup_staging(&self, staged: &Path) {
+        if staged.exists() {
+            let _ = std::fs::remove_file(staged);
+        }
+    }
+}
+
 pub fn process_file_sync(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -97,7 +136,10 @@ fn process_file_inner(
             .to_string_lossy(),
     );
 
-    let output_path = build_unique_output_path(&video_dir, &safe_stem, &metadata_uuid);
+    let final_output_path = build_unique_output_path(&video_dir, &safe_stem, &metadata_uuid);
+    let publisher = LocalFilePublisher;
+    let staged_output_path = publisher.stage_path(&final_output_path, &metadata_uuid);
+    publisher.cleanup_staging(&staged_output_path);
 
     if let Err(e) = handle.block_on(db::insert_processing(
         pool,
@@ -128,6 +170,7 @@ fn process_file_inner(
             tracing::error!("Probe failed for {}: {}", input_path.display(), e);
             queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Probe: {}", e)}).to_string());
             let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            publisher.cleanup_staging(&staged_output_path);
             return;
         }
     };
@@ -142,6 +185,7 @@ fn process_file_inner(
         });
         queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": "Profile disabled"}).to_string());
         let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+        publisher.cleanup_staging(&staged_output_path);
         return;
     }
 
@@ -192,7 +236,7 @@ fn process_file_inner(
 
     let result = encoder::transcode_file(
         tools, config, input_path, &probe_data, profile_id,
-        &output_path, &metadata_uuid, ptx, Some(active_pids),
+        &staged_output_path, &metadata_uuid, ptx, Some(active_pids),
     );
 
     if result.success {
@@ -230,9 +274,6 @@ fn process_file_inner(
             validation_error = "Output file missing or 0 bytes".to_string();
         } else {
             if !try_acquire_output_lock(&result.output_path, 5, 400) {
-                // Lock is busy: this happens momentarily on Windows when antivirus / search
-                // indexer touch the freshly-written file. We do NOT hard-fail any more — we
-                // log a warning and proceed to ffprobe, which will surface true lock issues.
                 tracing::warn!(
                     "Could not acquire exclusive lock on {:?} — proceeding to ffprobe validation",
                     result.output_path
@@ -306,8 +347,23 @@ fn process_file_inner(
             mezzanine_ok = false;
         }
 
+        // Atomic publish: rename staged file to final path ONLY after validation passes
+        if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
+            tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
+            queue.update(&job.id, |j| {
+                j.state = jobs::JobState::Failed;
+                j.error = Some(format!("Atomic publish failed: {}", e));
+                j.current_stage = "Failed".into();
+                j.finished_at = Some(Utc::now().to_rfc3339());
+            });
+            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Atomic publish failed: {}", e)}).to_string());
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            publisher.cleanup_staging(&staged_output_path);
+            return;
+        }
+
         let _ = identity::write_sidecar_next_to_video(
-            &result.output_path,
+            &final_output_path,
             &metadata_uuid,
             &probe_data,
             &output_probe,
@@ -330,7 +386,7 @@ fn process_file_inner(
         let _ = handle.block_on(db::mark_ready(
             pool,
             &metadata_uuid,
-            &result.output_path.to_string_lossy(),
+            &final_output_path.to_string_lossy(),
             duration_ms,
             mezzanine_ok,
             fps,
@@ -345,14 +401,14 @@ fn process_file_inner(
         queue.update(&job.id, |j| {
             j.state = jobs::JobState::Completed;
             j.uuid = Some(metadata_uuid.clone());
-            j.output_path = Some(result.output_path.to_string_lossy().into_owned());
+            j.output_path = Some(final_output_path.to_string_lossy().into_owned());
             j.progress = 100.0;
             j.current_stage = "Completed".into();
             j.finished_at = Some(Utc::now().to_rfc3339());
         });
         queue.broadcast("completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
-        tracing::info!("Completed and verified: {} -> {} (uuid={})", input_path.display(), result.output_path.display(), metadata_uuid);
-        if config.ingestion.clean_source_after_success {
+        tracing::info!("Completed and verified: {} -> {} (uuid={})", input_path.display(), final_output_path.display(), metadata_uuid);
+        if config.effective_storage_policy().clean_source_after_success {
             let _ = std::fs::remove_file(input_path);
         }
     } else {
@@ -365,8 +421,9 @@ fn process_file_inner(
         queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": validation_error}).to_string());
         let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
         tracing::error!("Failed transcode validation: {} - {}", input_path.display(), validation_error);
-        if result.output_path.exists() {
-            let _ = std::fs::remove_file(&result.output_path);
+        publisher.cleanup_staging(&staged_output_path);
+        if final_output_path.exists() {
+            let _ = std::fs::remove_file(&final_output_path);
         }
     }
     queue.prune_old(500);
@@ -656,5 +713,63 @@ mod tests {
     fn test_compute_gop_from_fps() {
         assert_eq!(compute_gop_from_fps(25.0), 50);
         assert_eq!(compute_gop_from_fps(29.97), 60);
+    }
+
+    #[test]
+    fn test_local_file_publisher_stage_path() {
+        let publ = LocalFilePublisher;
+        let final_path = Path::new("C:/target/videos/clip1_uuid1.mp4");
+        let staged = publ.stage_path(final_path, "uuid1");
+        assert_eq!(
+            staged,
+            Path::new("C:/target/videos/.tmp_uuid1_clip1_uuid1.mp4")
+        );
+    }
+
+    #[test]
+    fn test_local_file_publisher_atomic_rename_success() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join("pt_v2_2a_test_rename");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let publ = LocalFilePublisher;
+        let final_path = temp_dir.join("final_clip.mp4");
+        let staged_path = publ.stage_path(&final_path, "test1234");
+
+        let mut file = std::fs::File::create(&staged_path).unwrap();
+        writeln!(file, "dummy video content").unwrap();
+        drop(file);
+
+        assert!(staged_path.exists());
+        assert!(!final_path.exists());
+
+        let res = publ.publish(&staged_path, &final_path);
+        assert!(res.is_ok());
+        assert!(!staged_path.exists());
+        assert!(final_path.exists());
+
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_local_file_publisher_fails_if_final_exists() {
+        let temp_dir = std::env::temp_dir().join("pt_v2_2a_test_conflict");
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let publ = LocalFilePublisher;
+        let final_path = temp_dir.join("existing_clip.mp4");
+        let staged_path = publ.stage_path(&final_path, "test5678");
+
+        std::fs::File::create(&staged_path).unwrap();
+        std::fs::File::create(&final_path).unwrap();
+
+        let res = publ.publish(&staged_path, &final_path);
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("Final output path already exists"));
+
+        let _ = std::fs::remove_file(&staged_path);
+        let _ = std::fs::remove_file(&final_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

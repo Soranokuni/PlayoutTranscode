@@ -134,10 +134,23 @@ pub fn write_sidecar_next_to_video(
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("Failed to serialize sidecar: {}", e))?;
 
-    fs::write(&sidecar_path, json)
-        .map_err(|e| format!("Failed to write sidecar '{}': {}", sidecar_path.display(), e))?;
+    let tmp_sidecar_path = sidecar_path.with_extension("tmp_json");
+    if let Err(e) = fs::write(&tmp_sidecar_path, &json) {
+        let _ = fs::remove_file(&tmp_sidecar_path);
+        return Err(format!("Failed to write temporary sidecar '{}': {}", tmp_sidecar_path.display(), e));
+    }
 
-    tracing::info!("Written UUID sidecar: {} (id={})", sidecar_path.display(), uuid);
+    if let Err(e) = fs::rename(&tmp_sidecar_path, &sidecar_path) {
+        let _ = fs::remove_file(&tmp_sidecar_path);
+        return Err(format!(
+            "Failed to rename temporary sidecar '{}' -> '{}': {}",
+            tmp_sidecar_path.display(),
+            sidecar_path.display(),
+            e
+        ));
+    }
+
+    tracing::info!("Written UUID sidecar atomically: {} (id={})", sidecar_path.display(), uuid);
     Ok(sidecar_path)
 }
 

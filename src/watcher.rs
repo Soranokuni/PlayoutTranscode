@@ -15,6 +15,14 @@ pub struct WatchCandidate {
     pub stable_polls: u32,
 }
 
+pub fn is_temp_file_name(path: &Path) -> bool {
+    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
+        file_name.starts_with('.') || file_name.starts_with(".tmp_")
+    } else {
+        false
+    }
+}
+
 pub fn collect_candidates(root: &Path) -> Vec<WatchCandidate> {
     WalkDir::new(root)
         .into_iter()
@@ -22,6 +30,9 @@ pub fn collect_candidates(root: &Path) -> Vec<WatchCandidate> {
         .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| {
             let path = entry.path().to_path_buf();
+            if is_temp_file_name(&path) {
+                return None;
+            }
             let metadata = fs::metadata(&path).ok()?;
             let ext = path.extension()?.to_str()?.to_ascii_lowercase();
             if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
@@ -113,7 +124,7 @@ pub async fn watch_loop(
         if let Some(ref mut rx) = notify_rx {
             while let Ok(event) = rx.try_recv() {
                 for path in &event.paths {
-                    if !path.is_file() {
+                    if !path.is_file() || is_temp_file_name(path) {
                         continue;
                     }
                     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
