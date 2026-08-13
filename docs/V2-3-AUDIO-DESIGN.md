@@ -4,7 +4,7 @@
 - **Slice**: V2-3A — Audio Pipeline Audit and Normalization Design (Design Document Only, No Code Changes)
 - **Baseline HEAD SHA**: `df73c7508f20fcac69702a1959de0076df1ba297`
 - **Branch**: `main`
-- **Scope**: Comprehensive audit of the current audio pipeline, detailed technical design for ITU-R BS.1770-4 / EBU R128 / ATSC A/85 two-pass loudness normalization, multi-channel handling, and verification of zero code drift.
+- **Scope**: Comprehensive audit of the current audio pipeline, technical specification for ITU-R BS.1770-4 / EBU R128 / ATSC A/85 two-pass loudness normalization, deterministic multi-channel routing, edge case handling, and verification of zero code drift.
 
 ---
 
@@ -52,16 +52,16 @@ if audio_codec == "pcm_s16le" {
 3. **`libmp3lame`**:
    `-map 0:a:0? -c:a libmp3lame -b:a 320k -ar 48000 -ac 2`
 
-### 2.2 Channel Layout & Downmix Handling
-- **Mapping**: `-map 0:a:0?` maps the first audio stream if present. If the input contains no audio, encoding succeeds without an audio stream.
+### 2.2 Channel Layout & Downmix Handling in V1
+- **Mapping**: `-map 0:a:0?` selects the first audio stream if present. If the input contains no audio stream, FFmpeg completes the transcode without audio.
 - **Stereo Enforcement (`-ac 2`)**:
-  - **Mono (1 channel)**: FFmpeg's default `swresample` duplicates mono to left and right channels (`dual mono`).
+  - **Mono (1 channel)**: FFmpeg `swresample` duplicates mono to left and right channels (`dual mono`).
   - **Stereo (2 channels)**: Preserved as discrete left and right channels at 48 kHz.
-  - **Multi-channel (5.1 surround, 6 channels)**: FFmpeg applies its internal default downmixing coefficients:
+  - **Multi-channel (5.1 surround, 6 channels)**: FFmpeg applies internal default downmixing coefficients:
     $$\text{FL}_{\text{out}} = \text{FL} + 0.7071 \cdot \text{FC} + 0.7071 \cdot \text{BL}$$
     $$\text{FR}_{\text{out}} = \text{FR} + 0.7071 \cdot \text{FC} + 0.7071 \cdot \text{BR}$$
-    LFE (Low Frequency Effects, subwoofer) is discarded by default.
-  - **7.1 surround (8 channels)**: Downmixed with default panning coefficients without dialogue gain protection.
+    LFE (Low Frequency Effects) is dropped by default.
+  - **7.1 surround (8 channels)**: Downmixed with default panning without dialogue gain protection.
 
 ### 2.3 Current Loudness Processing Status
 - **Zero loudness processing**: There are no audio filters (`-af`), no `loudnorm`, `ebur128`, `volume`, or `dynaudnorm` filters anywhere in `src/profiles.rs`, `src/encoder.rs`, or `src/processor.rs`.
@@ -88,75 +88,111 @@ In `src/config.rs:228-272` & `717-738`:
 - It captures `audio_codec`, `audio_sample_rate`, and `audio_channels`.
 - **Seam Location**: Loudness measurement requires running `ffmpeg` with `-af loudnorm=...:print_format=json -f null -`. This measurement belongs in `src/processor.rs` immediately after `probe::probe_media` during the **Probing / Analysis stage** and *before* entering the transcode attempt loop.
 
-### 2.6 Downstream Playout & Contract Constraints (`PlayOutVue` / `CasparCG`)
-- **CasparCG Media Player**: Expects 48 kHz audio. Non-48k audio can cause audio/video sync drift or buffer underflows on DeckLink SDI outputs.
-- **Contract Boundary Test (`tests/contract_boundary.rs`)**:
-  - Requires `mezzanine_ok = true` only when audio sample rate is exactly 48,000 Hz.
-  - Requires `duration_ms` of output file to match video frame boundaries. Audio filter graphs must not alter video timeline duration or cause container truncation.
+### 2.6 Downstream Playout & Contract Verification (`PlayOutVue` / `CasparCG`)
+- **CasparCG Media Player**: Expects 48 kHz audio. Non-48k audio causes audio/video sync drift or buffer underflows on DeckLink SDI outputs.
+- **Contract Boundary Analysis (`tests/contract_boundary.rs` & `src/processor.rs:278-283`)**:
+  - In `src/processor.rs:278-283`:
+    ```rust
+    if output_probe.audio_channels > 0 && output_probe.audio_sample_rate != 48000 {
+        warnings.push(format!(
+            "audio_sample_rate_not_48k: got {} Hz",
+            output_probe.audio_sample_rate
+        ));
+        mezzanine_ok = false;
+    }
+    ```
+  - **No-Audio vs 48 kHz Audio Distinction**:
+    - If `audio_channels == 0` (video-only asset): `audio_sample_rate_not_48k` is **not** raised; the asset is valid and can be marked `mezzanine_ok = true`.
+    - If `audio_channels > 0` (has audio): `audio_sample_rate == 48000` is strictly enforced. Any other rate (e.g. 44.1 kHz, 96 kHz) sets `mezzanine_ok = false`.
 
 ---
 
-## 3. V2-3 Normalization Technical Design
+## 3. Channel Layout & Multi-Channel Routing Policy
+
+To eliminate ambiguity between channel layout preservation and stereo playout requirements, the channel routing policy is defined per `AudioMode`:
 
 ```
-[ Ingest Candidate ]
-         │
-         ▼
- ┌───────────────┐
- │ Probe Media   │ ── (ffprobe: codec, channels, sample rate)
- └───────┬───────┘
-         │
-         ▼
- ┌───────────────────────────────────────────────┐
- │ Audio Policy Check:                           │
- │   - LegacyV1Encode ──► Skip measurement       │
- │   - EbuR128/AtscA85 ──► Run Pass 1 Measure    │
- └───────┬───────────────────────────────────────┘
-         │
-         ▼
- ┌───────────────────────────────────────────────┐
- │ Pass 1: Audio Measurement (FFmpeg -f null)    │
- │   - Extract input_i, input_tp, input_lra,     │
- │     input_thresh, target_offset               │
- └───────┬───────────────────────────────────────┘
-         │
-         ▼
- ┌───────────────────────────────────────────────┐
- │ Transcode Execution Loop (with Retries)       │
- │   - Pass 2 Filter: loudnorm (linear=true)     │
- │   - Audio pan/downmix matrix if 5.1           │
- │   - Output: 48 kHz stereo (or discrete 5.1)   │
- └───────┬───────────────────────────────────────┘
-         │
-         ▼
- ┌───────────────────────────────────────────────┐
- │ Output Validation & Publication               │
- │   - Verify 48 kHz sample rate                 │
- │   - Embed loudness metadata in sidecar JSON   │
- │   - Atomic publish & DB mark_ready            │
- └───────────────────────────────────────────────┘
+Input Channels
+      │
+      ├─► LegacyV1Encode ──► -ac 2 (FFmpeg default swresample)
+      │
+      └─► EbuR128 / AtscA85
+            │
+            ├─► audio_channels == 0 ──► Skip audio filter; pass -map 0:a:0?
+            ├─► audio_channels == 1 ──► Explicit dual-mono pan matrix (c0|c0)
+            ├─► audio_channels == 2 ──► Direct stereo loudnorm filter
+            ├─► audio_channels == 6 (5.1)
+            │     ├─► preserve_original == true  ──► 6-channel discrete loudnorm (-ac 6)
+            │     └─► preserve_original == false ──► Explicit ITU-R BS.775 pan downmix to stereo
+            └─► Other (>2 ch, 7.1, 4 ch, etc.)
+                  ├─► preserve_original == true  ──► Preserved if layout supported
+                  └─► preserve_original == false ──► Rejected with Permanent error (unsupported_channel_layout)
 ```
 
-### 3.1 Loudness Targets & Broadcast Standard Mapping
+### 3.1 Policy Matrix by AudioMode
 
-| Standard | Mode Enum | Target Integrated ($I$) | Max True Peak ($TP$) | Target LRA | Typical Application |
-|---|---|---|---|---|---|
-| **EBU R128** (Default) | `AudioMode::EbuR128` | **-23.0 LUFS** | **-1.0 dBTP** | **7.0 LU** | European broadcast, CasparCG playout |
-| **ATSC A/85** | `AudioMode::AtscA85` | **-24.0 LKFS** | **-2.0 dBTP** | **11.0 LU** | North American broadcast (CALM Act) |
-| **Custom / Config** | Any with overrides | `target_lufs` | `true_peak_dbtp` | `lra_target` | Custom studio delivery specifications |
+| Channel Count | `LegacyV1Encode` | `EbuR128` / `AtscA85` (`preserve_original=false`) | `EbuR128` / `AtscA85` (`preserve_original=true`) |
+|---|---|---|---|
+| **0 (Silent/Video-only)** | Omit audio track | Omit audio filter; pass `-map 0:a:0?` | Omit audio filter; pass `-map 0:a:0?` |
+| **1 (Mono)** | `-ac 2` (FFmpeg default) | `pan=stereo\|c0=c0\|c1=c0,loudnorm=...` | `-ac 1,loudnorm=...` |
+| **2 (Stereo)** | `-ac 2` | `loudnorm=...` (stereo) | `loudnorm=...` (stereo) |
+| **6 (5.1 Surround)** | `-ac 2` (FFmpeg default) | Explicit BS.775 downmix + `loudnorm=...` | `-ac 6,loudnorm=...` (discrete 5.1) |
+| **8 (7.1 Surround)** | `-ac 2` (FFmpeg default) | **Rejected** (`unsupported_channel_layout`) | `-ac 8,loudnorm=...` (discrete 7.1) |
+| **Other (3, 4, 16 ch)**| `-ac 2` (FFmpeg default) | **Rejected** (`unsupported_channel_layout`) | **Rejected** (`unsupported_channel_layout`) |
 
-### 3.2 Exact Two-Pass Filter Graphs
+### 3.2 Exact FFmpeg 5.1 Channel Order and LFE Treatment
 
-#### Pass 1: Loudness Measurement (Analysis Phase)
-Executed once prior to transcoding. Reads audio packets only without decoding video:
+In FFmpeg `libavutil/channel_layout.h`, standard 5.1 layout (`FL, FR, FC, LFE, BL, BR`) defines channel indices:
+- `c0` = Front Left (`FL`)
+- `c1` = Front Right (`FR`)
+- `c2` = Front Center (`FC`)
+- `c3` = Low Frequency Effects (`LFE`)
+- `c4` = Back Left / Side Left (`BL` / `SL`)
+- `c5` = Back Right / Side Right (`BR` / `SR`)
+
+#### LFE Handling Rationale:
+In broadcast delivery (ITU-R BS.775 §2.2), **LFE is omitted (0 gain)** from the stereo downmix. Folding sub-bass LFE into standard stereo television speakers causes severe intermodulation distortion, phase cancellation with front channels, and amplifier saturation.
+
+#### Downmix Matrix Equation & Headroom Normalization:
+$$\text{FL}_{\text{mix}} = \frac{1}{\sqrt{2}} \cdot \text{FL} + \frac{1}{2} \cdot \text{FC} + \frac{1}{2} \cdot \text{BL} \approx 0.7071 \cdot c_0 + 0.5 \cdot c_2 + 0.5 \cdot c_4$$
+$$\text{FR}_{\text{mix}} = \frac{1}{\sqrt{2}} \cdot \text{FR} + \frac{1}{2} \cdot \text{FC} + \frac{1}{2} \cdot \text{BR} \approx 0.7071 \cdot c_1 + 0.5 \cdot c_2 + 0.5 \cdot c_5$$
+
+To prevent pre-loudnorm digital clipping when all 5 channels sum simultaneously, the coefficients are normalized by factor $1 / (0.7071 + 0.5 + 0.5) \approx 0.5858$:
+- Front Left / Right: $0.7071 \times 0.5858 = \mathbf{0.4142}$
+- Center: $0.5 \times 0.5858 = \mathbf{0.2929}$
+- Surround Left / Right: $0.5 \times 0.5858 = \mathbf{0.2929}$
+
+#### Exact FFmpeg Filter Chain for 5.1 Downmix:
+```text
+pan=stereo|FL=0.4142*c0+0.2929*c2+0.2929*c4|FR=0.4142*c1+0.2929*c2+0.2929*c5,loudnorm=...
+```
+
+---
+
+## 4. Two-Pass Normalization Technical Specification
+
+### 4.1 Loudness Standards Mapping
+
+| Standard | Mode Enum | Target Integrated ($I$) | Max True Peak ($TP$) | Target LRA |
+|---|---|---|---|---|
+| **EBU R128** (Default) | `AudioMode::EbuR128` | **-23.0 LUFS** | **-1.0 dBTP** | **7.0 LU** |
+| **ATSC A/85** | `AudioMode::AtscA85` | **-24.0 LKFS** | **-2.0 dBTP** | **11.0 LU** |
+| **Custom Overrides** | Any | `target_lufs.unwrap_or(...)` | `true_peak_dbtp.unwrap_or(...)` | `lra_target.unwrap_or(...)` |
+
+### 4.2 Exact Filter Graphs
+
+#### Pass 1: Audio Measurement (Analysis Phase)
+Executed once in `src/processor.rs` before transcoding. Only decodes audio packets:
 ```bash
 ffmpeg -hide_banner -nostats \
   -analyzeduration 500M -probesize 500M \
   -i <input_path> \
   -map 0:a:0 -vn -sn -dn \
-  -af "loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json" \
+  -af "{downmix_filter}loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:print_format=json" \
   -f null -
 ```
+*Note: If 5.1 downmixing is active, the pan filter is prepended to Pass 1 so loudness is measured on the downmixed audio stream.*
+
 **Captured stderr JSON**:
 ```json
 {
@@ -173,98 +209,127 @@ ffmpeg -hide_banner -nostats \
 }
 ```
 
-#### Pass 2: Transcode Application (Combined Audio Filter)
-Injected into the FFmpeg transcode command via `-af`:
+#### Pass 2: Transcode Application
+Injected into the transcode command via `-af`:
 ```text
-loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:measured_I={input_i}:measured_TP={input_tp}:measured_LRA={input_lra}:measured_thresh={input_thresh}:offset={target_offset}:linear=true:print_format=summary
+{downmix_filter}loudnorm=I={target_i}:TP={target_tp}:LRA={target_lra}:measured_I={input_i}:measured_TP={input_tp}:measured_LRA={input_lra}:measured_thresh={input_thresh}:offset={target_offset}:linear={is_linear}:print_format=summary
 ```
 
-### 3.3 Multi-Channel Downmix & Sample Rate Specifications
+### 4.3 Deterministic `linear` Mode Eligibility Rules
+`linear=true` applies static gain scaling ($\Delta G = I_{\text{target}} - I_{\text{measured}}$) without dynamic compression, preserving dynamic range. It is **not** unconditional.
 
-1. **Sample Rate Invariant**: Always `-ar 48000`.
-   - *Rationale*: Broadcast SDI/HDMI embedding and CasparCG channel mixers require 48 kHz synchronous audio.
-2. **5.1 Surround to Stereo Downmixing**:
-   - To avoid center channel speech distortion and dialogue clipping, standard ITU-R BS.775 downmixing is combined ahead of `loudnorm`:
-     ```text
-     pan=stereo|FL=0.5*c0+0.707*c2+0.707*c4|FR=0.5*c1+0.707*c2+0.707*c5,loudnorm=...
-     ```
-3. **Mono Upmixing**:
-   - Mono audio is upmixed to dual-mono stereo:
-     ```text
-     pan=stereo|c0=c0|c1=c0,loudnorm=...
-     ```
-4. **Passthrough / Multi-Channel Preservation**:
-   - If `preserve_original = true` or `channels = 6`, audio is normalized per-channel without downmixing.
+**`linear = true` is eligible ONLY IF ALL of the following criteria are met:**
+1. **Measured Integrated Loudness is non-silent**:
+   $$\text{input\_i} > -70.0\text{ LUFS} \quad \text{and is finite}$$
+2. **Projected True Peak does not exceed target True Peak**:
+   $$\text{projected\_tp} = \text{input\_tp} + (\text{target\_i} - \text{input\_i}) \le \text{target\_tp}$$
+3. **Measured LRA does not exceed Target LRA by more than 1.5x**:
+   $$\text{input\_lra} \le \text{target\_lra} \times 1.5$$
 
-### 3.4 Fallback & Failure Behavior (V2-2B RetryClass Alignment)
-
-1. **No Audio Stream in Input (`audio_channels == 0`)**:
-   - Skip loudness measurement completely.
-   - Omit `-af` filter graph; encode with `-map 0:a:0?` as silent video.
-2. **Corrupted Audio Stream / Decoder Errors during Measurement**:
-   - Classify error via `classify_error(...)` as `Permanent`.
-   - Mark asset `status = "error"` with warning `corrupt_audio_stream`.
-3. **Short Clips (< 3 seconds) or Extreme Dynamic Range**:
-   - `loudnorm` in FFmpeg requires minimum sample history. For clips under 3s, pass `linear=false` (dynamic normalization fallback) or fallback to `AudioMode::LegacyV1Encode` with warning `short_clip_loudnorm_fallback`.
-
-### 3.5 Hard Invariant: Legacy Bit-Identity
-When `config.effective_audio_policy().mode == AudioMode::LegacyV1Encode`:
-- Emitted FFmpeg arguments must be **bit-for-bit identical** to the V1 command line.
-- Zero audio filters (`-af`) are emitted.
-- Loudness measurement step is skipped entirely.
-
-### 3.6 Performance Impact & Retry Architecture
-- **Measurement Speed**: Pass 1 runs with `-vn -sn -dn -f null -`, reading only audio frames. Typical processing speed is 150x–350x realtime (e.g., a 10-minute video measures in ~1.8 seconds).
-- **Retry Invariant**: Measurement occurs once in the `Probing` phase. The measured values (`MeasuredLoudness`) are passed into the retry loop. If FFmpeg fails due to transient video encoder issues or OS disk locking, Pass 1 is **not re-run**.
+**If any condition fails**: Pass 2 automatically sets `linear=false`. FFmpeg will apply its dynamic limiter to prevent True Peak overshoots and compress excess LRA while meeting the integrated loudness target.
 
 ---
 
-## 4. Design Decisions & Schema Proposal
+## 5. Deterministic Edge Case Handling
 
-### Open Design Decisions Requiring Human Approval:
+When an explicit normalization policy (`EbuR128` or `AtscA85`) is selected, silent fallback to `LegacyV1Encode` is forbidden. The pipeline behaves as follows:
 
-1. **Sidecar vs Database Storage for Loudness Metrics**:
-   - *Recommendation*: Store full measured metrics (`measured_i`, `measured_tp`, `measured_lra`, `target_i`) in the JSON sidecar (`SidecarPayload`) immediately in V2-3B without altering the SQLite schema.
-   - *Future Schema Decision*: If the Web UI or API needs to query/filter by loudness, add additive columns to `media_assets` in a later schema slice:
-     ```sql
-     ALTER TABLE media_assets ADD COLUMN measured_i_lufs REAL DEFAULT NULL;
-     ALTER TABLE media_assets ADD COLUMN measured_tp_dbtp REAL DEFAULT NULL;
-     ALTER TABLE media_assets ADD COLUMN measured_lra REAL DEFAULT NULL;
-     ```
-2. **5.1 Downmix Default**:
-   - *Recommendation*: Default to ITU-R BS.775 downmix to 48 kHz stereo for broadcast compatibility unless `preserve_original = true` is configured.
-
----
-
-## 5. Test Plan for Slice V2-3B
-
-1. **Filter Graph Generation Unit Tests (`src/profiles.rs`)**:
-   - `test_build_args_legacy_v1_audio_bit_identical`: Confirms exact argument string matching for `LegacyV1Encode`.
-   - `test_build_args_ebu_r128_two_pass_filter`: Confirms correct `-af loudnorm=...` injection with measurement parameters.
-   - `test_build_args_atsc_a85_two_pass_filter`: Confirms -24 LUFS / -2 dBTP injection.
-   - `test_build_args_51_downmix_pan_filter`: Confirms ITU-R BS.775 pan matrix prepended to `loudnorm`.
-2. **Loudness JSON Parsing Unit Tests (`src/probe.rs` / `src/processor.rs`)**:
-   - Parse valid FFmpeg `loudnorm` stderr JSON.
-   - Handle invalid/truncated stderr output gracefully.
-3. **Pipeline Integration Tests**:
-   - Validate that video-only inputs skip measurement and encode cleanly.
-   - Verify `contract_boundary` and `v1_wire_contract` tests remain 100% green.
+| Edge Case | Detection Condition | Pipeline Action | Warning / Error Code |
+|---|---|---|---|
+| **Complete Silence** | `input_i <= -70.0` or `input_i == "-inf"` | Unity gain (no amplification), omit loudnorm filter | Warning: `silent_audio_loudness_skipped` |
+| **Short Clip (< 3s)** | Source duration $< 3000\text{ ms}$ | Execute single-pass dynamic loudnorm (`linear=false`) | Warning: `short_clip_loudnorm_dynamic` |
+| **Malformed JSON in Pass 1** | Stderr JSON parse fails or missing keys | Terminate job with `RetryClass::Permanent` | Error: `audio_measurement_malformed_json` |
+| **Missing `target_offset`** | Key absent in Pass 1 JSON | Compute $\text{target\_offset} = \text{target\_i} - \text{input\_i}$; if invalid, fail | None (if computed) or Error: `missing_target_offset` |
+| **Non-Zero Exit in Pass 1** | FFmpeg measurement process exits $\ne 0$ | Terminate job with `RetryClass::Permanent` | Error: `audio_measurement_process_failed` |
+| **Zero Audio Stream** | `audio_channels == 0` | Skip measurement, omit `-af`, pass `-map 0:a:0?` | None (valid silent video) |
+| **Unsupported Channel Layout** | Channels $\notin \{0, 1, 2, 6\}$ (when not preserved) | Terminate job with `RetryClass::Permanent` | Error: `unsupported_audio_channel_layout` |
 
 ---
 
-## 6. Risk Register & Rollback Strategy
+## 6. Sidecar & Wire Contract Compatibility Strategy
 
-| Risk | Impact | Mitigation Strategy |
-|---|---|---|
-| FFmpeg binary missing `loudnorm` filter | Transcode job failure | Bootstrap checks filter availability during startup toolchain probe. |
-| Very short audio (< 3s) | Measurement inaccurate | Linear loudnorm fallback with `short_clip_loudnorm_fallback` warning. |
-| Zero-audio source file | Potential filter error | Probing checks `audio_channels > 0` before invoking Pass 1 measurement. |
-| Unexpected loudness level shift on legacy setups | Downstream loudness change | Default mode remains `AudioMode::LegacyV1Encode` (strictly opt-in). |
-| Immediate Rollback | N/A | Set `mode = "legacy_v1_encode"` in config or revert V2-3B commits cleanly. |
+### 6.1 `SidecarPayload` Additive Extension (`src/identity.rs`)
+The current `SidecarPayload` struct in `src/identity.rs` is extended with an optional, additive `loudness` field:
+
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct LoudnessInfo {
+    pub integrated_lufs: f64,
+    pub true_peak_dbtp: f64,
+    pub lra: f64,
+    pub threshold: f64,
+    pub target_lufs: f64,
+    pub target_true_peak_dbtp: f64,
+    pub normalization_mode: String,
+    pub linear_applied: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidecarPayload {
+    pub playoutvue_id: String,
+    pub id: String,
+    pub path: String,
+    pub duration_ms: i64,
+    pub trim_in_ms: i64,
+    pub trim_out_ms: i64,
+    pub fps_num: i64,
+    pub fps_den: i64,
+    pub mezzanine_ok: bool,
+    pub filename: String,
+    pub filepath: String,
+    pub transcoded_at: String,
+    pub profile_used: String,
+    pub original_source: SourceInfo,
+    pub output_media: OutputInfo,
+    pub fps: f64,
+    pub total_frames: i64,
+    pub gop_frames: i64,
+    pub keyframe_safe_start_ms: i64,
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loudness: Option<LoudnessInfo>,
+}
+```
+
+### 6.2 Compatibility Invariants
+1. **`LegacyV1Encode` Zero Drift**: When `mode = AudioMode::LegacyV1Encode`, `loudness` is `None` and omitted from the JSON sidecar. The sidecar output is **100% byte-identical** to V1.
+2. **Backward Compatibility for Downstream Consumers**: Existing readers (PlayOutVue, older tools) deserialize `SidecarPayload` without error.
+3. **Database Independence**: No changes are made to `media_assets` table or `media_assets.db` schema in V2-3B. All normalization metadata resides in the JSON sidecar.
 
 ---
 
-## 7. Baseline Verification Results
+## 7. Performance & Retry Architecture
+
+- **Measurement Cost**: Pass 1 runs with `-vn -sn -dn -f null -`, reading only audio stream packets. Benchmarks indicate measurement speeds of 180x–350x realtime (< 1.5 seconds for a 5-minute file).
+- **Measurement-Once Invariant**:
+  - Loudness measurement occurs once in `src/processor.rs` during the `Probing` stage.
+  - The resulting `MeasuredLoudness` struct is passed into the retry loop.
+  - If transcoding fails due to transient video encoder issues or OS file locks, Pass 1 measurement is **never re-run**.
+
+---
+
+## 8. Acceptance Criteria for Slice V2-3B
+
+To be approved and merged, Slice V2-3B must meet the following criteria:
+
+1. **`LegacyV1Encode` Argument Identity**:
+   - Unit tests must verify that `AudioMode::LegacyV1Encode` generates the exact, bit-identical FFmpeg argument list as V1.
+2. **Deterministic Filter Graph Construction**:
+   - Exact filter string assertions for mono upmix, stereo loudnorm, 5.1 downmix pan matrix, and `linear=true/false` selection.
+3. **No Implicit Multichannel Downmix**:
+   - 5.1 downmix uses the explicit BS.775 pan matrix; unsupported multichannel layouts (>6 ch or non-standard) fail with `Permanent` error.
+4. **Measurement-Once Before Retries**:
+   - Unit tests using `MockTranscodeRunner` verify that Pass 1 measurement runs exactly once across retries.
+5. **Deterministic Edge Case Handling**:
+   - Tests covering silence (`-inf`), short clips (< 3s), malformed JSON, and video-only assets.
+6. **Zero Database Migrations**:
+   - `media_assets` table DDL remains 100% unchanged.
+7. **Zero Wire Contract Drift**:
+   - `tests/contract_boundary.rs` and `tests/v1_wire_contract.rs` remain completely green.
+
+---
+
+## 9. Baseline Verification Results
 
 The test suite and frontend build were executed against baseline HEAD `df73c7508f20fcac69702a1959de0076df1ba297` with zero code modifications:
 
