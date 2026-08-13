@@ -1,0 +1,23 @@
+{
+  "id": "9f8e7d6c-5b4a-4321-8765-0fedcba98765",
+  "input_path": "D:/media/in/broadcast_clip.mov",
+  "output_path": "D:/media/out/videos/broadcast_clip_b1a2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d.mp4",
+  "profile": "ProfileA",
+  "uuid": "b1a2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+  "state": "Completed",
+  "progress": 100.0,
+  "current_stage": "Completed",
+  "duration_secs": 10.0,
+  "error": null,
+  "stderr_log": null,
+  "attempt": 0,
+  "created_at": "2026-08-12T10:00:00.000Z",
+  "finished_at": "2026-08-12T10:05:23.000Z",
+  "source_frame_count": 250,
+  "current_frame": 250,
+  "encode_fps": 102.0,
+  "encode_bitrate": "5231.0kbits/s",
+  "encode_speed": "4.07x",
+  "current_time_ms": 10000,
+  "duration_ms": 10000
+}

@@ -1,0 +1,8 @@
+{
+  "status": "ok",
+  "service": "PlayoutTranscode",
+  "version": "1.0.0",
+  "toolchain_ready": true,
+  "service_running": true,
+  "uptime_ms": 86400000
+}
