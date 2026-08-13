@@ -1,0 +1,9 @@
+{
+  "watch_folder": "D:/media/in",
+  "target_folder": "D:/media/out",
+  "settle_secs": 5,
+  "poll_secs": 10,
+  "stable_polls_min": 2,
+  "retry_policy": "once",
+  "max_concurrency": 2
+}

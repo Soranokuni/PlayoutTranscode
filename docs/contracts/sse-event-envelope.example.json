@@ -1,0 +1,37 @@
+[
+  {
+    "event": "job_update",
+    "data": {
+      "id": "9f8e7d6c-5b4a-4321-8765-0fedcba98765",
+      "stage": "Probing"
+    }
+  },
+  {
+    "event": "progress",
+    "data": {
+      "id": "9f8e7d6c-5b4a-4321-8765-0fedcba98765",
+      "percent": 42.5,
+      "current_time_ms": 4250,
+      "duration_ms": 10000,
+      "determinate": true,
+      "fps": 96.32,
+      "bitrate": "5120.0kbits/s",
+      "speed": "3.85x",
+      "stage": "Encoding"
+    }
+  },
+  {
+    "event": "completed",
+    "data": {
+      "id": "9f8e7d6c-5b4a-4321-8765-0fedcba98765",
+      "uuid": "b1a2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+    }
+  },
+  {
+    "event": "failed",
+    "data": {
+      "id": "9f8e7d6c-5b4a-4321-8765-0fedcba98765",
+      "error": "Duration mismatch: source=10.000s output=9.200s (diff=800ms, tolerance=80ms)"
+    }
+  }
+]
