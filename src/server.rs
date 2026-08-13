@@ -1002,7 +1002,12 @@ async fn delete_purge_asset(
     State(state): State<ServerState>,
     Path(uuid): Path<String>,
 ) -> impl IntoResponse {
-    match db::purge_asset_completely(&state.pool, &uuid).await {
+    let mode = if state.config.lock().effective_storage_policy().preserve_subclips_on_purge {
+        db::PurgeMode::PreserveReferencedMezzanine
+    } else {
+        db::PurgeMode::DeleteUnreferencedMezzanine
+    };
+    match db::purge_asset_with_mode(&state.pool, &uuid, mode).await {
         Ok(outcome) => {
             if outcome.rows_deleted == 0 {
                 (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "asset not found"}))).into_response()
@@ -1011,6 +1016,7 @@ async fn delete_purge_asset(
                     "success": true,
                     "purged_records": outcome.rows_deleted,
                     "file_removed": outcome.file_removed,
+                    "sidecar_removed": outcome.sidecar_removed,
                 }))).into_response()
             }
         }
