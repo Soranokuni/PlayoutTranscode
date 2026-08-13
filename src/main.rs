@@ -7,8 +7,8 @@ mod identity;
 mod jobs;
 mod logging;
 mod probe;
-mod profiles;
 mod processor;
+mod profiles;
 mod server;
 mod service_handle;
 mod watcher;
@@ -19,7 +19,11 @@ use service_handle::ServiceHandle;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
-#[command(name = "PlayoutTranscode", version, about = "Broadcast media transcoding service")]
+#[command(
+    name = "PlayoutTranscode",
+    version,
+    about = "Broadcast media transcoding service"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -47,12 +51,12 @@ fn main() -> Result<()> {
         None => {
             run_headless(None);
         }
-        Some(Commands::Wizard) => {
-            match config::AppConfig::run_wizard() {
-                Ok(_) => println!("Wizard complete. Visit the web UI to configure and start the service."),
-                Err(e) => eprintln!("Wizard error: {}", e),
+        Some(Commands::Wizard) => match config::AppConfig::run_wizard() {
+            Ok(_) => {
+                println!("Wizard complete. Visit the web UI to configure and start the service.")
             }
-        }
+            Err(e) => eprintln!("Wizard error: {}", e),
+        },
         Some(Commands::Run { config }) => {
             run_headless(config);
         }
@@ -133,7 +137,12 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
     let jq = job_queue.clone();
     let server_pool = pool.clone();
 
-    let web_ui_dir = if exe_dir.join("web-ui").join("dist").join("index.html").exists() {
+    let web_ui_dir = if exe_dir
+        .join("web-ui")
+        .join("dist")
+        .join("index.html")
+        .exists()
+    {
         exe_dir.join("web-ui").join("dist")
     } else if let Ok(cwd) = std::env::current_dir() {
         if cwd.join("web-ui").join("dist").join("index.html").exists() {
@@ -147,12 +156,16 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
 
     let server_task = tokio::spawn(async move {
         server::run_server(
-            port, &bind_addr, jq,
+            port,
+            &bind_addr,
+            jq,
             server_cfg,
-            toolchain_status.clone(), sh,
+            toolchain_status.clone(),
+            sh,
             web_ui_dir,
             server_pool,
-        ).await
+        )
+        .await
     });
 
     if config_initialized
@@ -163,7 +176,11 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
         service_handle.add_log("info", "Auto-starting service with configured watch folder");
         if let Ok(tools) = bootstrap::ensure_toolchain() {
             let _ = service_handle::start_processing_loop(
-                &service_handle, &app_config, &job_queue, &tools, pool.clone(),
+                &service_handle,
+                &app_config,
+                &job_queue,
+                &tools,
+                pool.clone(),
             );
         } else {
             service_handle.add_log("warn", "FFmpeg not found. Download from the web UI.");

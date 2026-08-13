@@ -174,14 +174,15 @@ pub async fn watch_loop(
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
 
-                    let entry = candidates
-                        .entry(path.to_path_buf())
-                        .or_insert_with(|| WatchCandidate {
-                            path: path.to_path_buf(),
-                            size: 0,
-                            modified_epoch_secs: 0,
-                            stable_polls: 0,
-                        });
+                    let entry =
+                        candidates
+                            .entry(path.to_path_buf())
+                            .or_insert_with(|| WatchCandidate {
+                                path: path.to_path_buf(),
+                                size: 0,
+                                modified_epoch_secs: 0,
+                                stable_polls: 0,
+                            });
 
                     if size > entry.size {
                         entry.stable_polls = 0;
@@ -218,14 +219,15 @@ pub async fn watch_loop(
                     continue;
                 }
 
-                let entry = candidates
-                    .entry(candidate.path.clone())
-                    .or_insert_with(|| WatchCandidate {
-                        path: candidate.path.clone(),
-                        size: 0,
-                        modified_epoch_secs: 0,
-                        stable_polls: 0,
-                    });
+                let entry =
+                    candidates
+                        .entry(candidate.path.clone())
+                        .or_insert_with(|| WatchCandidate {
+                            path: candidate.path.clone(),
+                            size: 0,
+                            modified_epoch_secs: 0,
+                            stable_polls: 0,
+                        });
 
                 if candidate.size > entry.size {
                     entry.stable_polls = 0;
@@ -259,10 +261,7 @@ pub async fn watch_loop(
                 }
 
                 if !is_file_available_for_reading(&candidate.path) {
-                    tracing::debug!(
-                        "Watch: file still locked: {}",
-                        candidate.path.display()
-                    );
+                    tracing::debug!("Watch: file still locked: {}", candidate.path.display());
                     continue;
                 }
 

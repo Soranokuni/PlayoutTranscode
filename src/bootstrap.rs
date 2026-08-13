@@ -76,8 +76,12 @@ pub fn audit_toolchain() -> (ToolPaths, ToolchainStatus) {
         || ffprobe.as_ref().is_some_and(|p| p.starts_with(&bin));
 
     let tools = ToolPaths {
-        ffmpeg: ffmpeg.clone().unwrap_or_else(|| bin.join(executable_name("ffmpeg"))),
-        ffprobe: ffprobe.clone().unwrap_or_else(|| bin.join(executable_name("ffprobe"))),
+        ffmpeg: ffmpeg
+            .clone()
+            .unwrap_or_else(|| bin.join(executable_name("ffmpeg"))),
+        ffprobe: ffprobe
+            .clone()
+            .unwrap_or_else(|| bin.join(executable_name("ffprobe"))),
     };
 
     let status = ToolchainStatus {
@@ -115,62 +119,58 @@ pub fn download_ffmpeg() -> Result<ToolPaths, String> {
     }
 
     let arch = get_arch();
-    let url = format!(
-        "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    );
+    let url = format!("https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip");
 
     tracing::info!("Downloading FFmpeg from {} (arch: {})", url, arch);
     let zip_path = bin.join("ffmpeg-temp.zip");
 
     {
-        let resp = reqwest::blocking::get(&url)
-            .map_err(|e| format!("FFmpeg download failed: {}", e))?;
+        let resp =
+            reqwest::blocking::get(&url).map_err(|e| format!("FFmpeg download failed: {}", e))?;
         if !resp.status().is_success() {
             return Err(format!("FFmpeg download returned HTTP {}", resp.status()));
         }
         let bytes = resp
             .bytes()
             .map_err(|e| format!("FFmpeg download read failed: {}", e))?;
-        fs::write(&zip_path, &bytes)
-            .map_err(|e| format!("Failed to write FFmpeg zip: {}", e))?;
+        fs::write(&zip_path, &bytes).map_err(|e| format!("Failed to write FFmpeg zip: {}", e))?;
     }
 
     tracing::info!("Extracting FFmpeg...");
     {
-        let file = fs::File::open(&zip_path)
-            .map_err(|e| format!("Failed to open FFmpeg zip: {}", e))?;
-        let mut archive = zip::ZipArchive::new(file)
-            .map_err(|e| format!("Failed to read FFmpeg zip: {}", e))?;
+        let file =
+            fs::File::open(&zip_path).map_err(|e| format!("Failed to open FFmpeg zip: {}", e))?;
+        let mut archive =
+            zip::ZipArchive::new(file).map_err(|e| format!("Failed to read FFmpeg zip: {}", e))?;
 
         for i in 0..archive.len() {
-            let mut entry = archive.by_index(i)
+            let mut entry = archive
+                .by_index(i)
                 .map_err(|e| format!("Zip entry {}: {}", i, e))?;
             let name = entry.name().to_string();
 
             if let Some(rel) = name.strip_prefix(|c: char| c != '/') {
                 let rel = rel.to_string();
                 if let Some(inner) = rel.split_once('/').and_then(|(_, rest)| {
-                    if rest.contains("bin/") || rest.contains("ffprobe") || rest.contains("ffmpeg") {
+                    if rest.contains("bin/") || rest.contains("ffprobe") || rest.contains("ffmpeg")
+                    {
                         Some(rest)
                     } else {
                         None
                     }
                 }) {
-                    let dest = bin.join(
-                        Path::new(inner)
-                            .file_name()
-                            .unwrap_or_default(),
-                    );
+                    let dest = bin.join(Path::new(inner).file_name().unwrap_or_default());
                     if let Some(parent) = dest.parent() {
                         let _ = fs::create_dir_all(parent);
                     }
-                        if !entry.is_dir() {
-                            let mut out_file = fs::File::create(&dest)
-                                .unwrap_or_else(|_| std::fs::File::create(dest.with_extension("tmp")).unwrap());
-                            if let Err(e) = std::io::copy(&mut entry, &mut out_file) {
-                                tracing::warn!("Failed to extract {}: {}", inner, e);
-                            }
+                    if !entry.is_dir() {
+                        let mut out_file = fs::File::create(&dest).unwrap_or_else(|_| {
+                            std::fs::File::create(dest.with_extension("tmp")).unwrap()
+                        });
+                        if let Err(e) = std::io::copy(&mut entry, &mut out_file) {
+                            tracing::warn!("Failed to extract {}: {}", inner, e);
                         }
+                    }
                 }
             }
         }
@@ -220,5 +220,3 @@ pub fn check_ffmpeg_update() -> UpdateCheckResult {
         warning: Some(UPDATE_WARNING.to_string()),
     }
 }
-
-

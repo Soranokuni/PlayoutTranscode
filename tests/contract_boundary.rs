@@ -87,7 +87,11 @@ mod contract {
         }
 
         let fps = item.fps_num as f64 / item.fps_den as f64;
-        let total_dur = if item.duration_ms < 0 { 0 } else { item.duration_ms };
+        let total_dur = if item.duration_ms < 0 {
+            0
+        } else {
+            item.duration_ms
+        };
         let in_ms = item.trim_in_ms.clamp(0, total_dur);
         let out_ms = if item.trim_out_ms <= 0 || item.trim_out_ms > total_dur {
             total_dur
@@ -169,7 +173,8 @@ mod integration_tests {
             fps_den,
             mezzanine_ok: true,
             fps: fps_num as f64 / fps_den as f64,
-            total_frames: ((duration_ms as f64 / 1000.0) * (fps_num as f64 / fps_den as f64)).round() as i64,
+            total_frames: ((duration_ms as f64 / 1000.0) * (fps_num as f64 / fps_den as f64))
+                .round() as i64,
             gop_frames: ((fps_num as f64 / fps_den as f64) * 2.0).round() as i64,
             keyframe_safe_start_ms: 0,
         }
@@ -185,24 +190,46 @@ mod integration_tests {
             1,
         );
 
-        assert!(asset.duration_ms > 0, "duration_ms must be resolved before ready");
-        assert!(!asset.current_path.is_empty(), "path must be final before ready");
-        assert!(asset.trim_out_ms > asset.trim_in_ms, "trims must be valid before ready");
-        assert!(asset.fps_num > 0 && asset.fps_den > 0, "fps rational must be present before ready");
-        assert!(asset.mezzanine_ok, "mezzanine_ok must be true for a ready asset");
+        assert!(
+            asset.duration_ms > 0,
+            "duration_ms must be resolved before ready"
+        );
+        assert!(
+            !asset.current_path.is_empty(),
+            "path must be final before ready"
+        );
+        assert!(
+            asset.trim_out_ms > asset.trim_in_ms,
+            "trims must be valid before ready"
+        );
+        assert!(
+            asset.fps_num > 0 && asset.fps_den > 0,
+            "fps rational must be present before ready"
+        );
+        assert!(
+            asset.mezzanine_ok,
+            "mezzanine_ok must be true for a ready asset"
+        );
 
         let item = hydrate_item(&asset);
 
         assert_eq!(item.id, asset.uuid, "id must come from playoutvue_id");
-        assert_eq!(item.path, asset.current_path, "path must be the final playout path");
+        assert_eq!(
+            item.path, asset.current_path,
+            "path must be the final playout path"
+        );
         assert_eq!(item.playoutvue_id, asset.uuid);
         assert_eq!(item.duration_ms, 10_000);
         assert_eq!(item.trim_in_ms, 0);
-        assert_eq!(item.trim_out_ms, 10_000, "trim_out_ms must equal duration_ms (no repair needed)");
+        assert_eq!(
+            item.trim_out_ms, 10_000,
+            "trim_out_ms must equal duration_ms (no repair needed)"
+        );
         assert_eq!(item.fps_num, 25);
         assert_eq!(item.fps_den, 1);
 
-        let trim = compute_frame_trim(&item).expect("frame trim computation must succeed on a ready asset");
+        let trim = compute_frame_trim(&item)
+            .expect("frame trim computation must succeed on a ready asset");
 
         assert_eq!(trim.in_frame, 0);
         assert_eq!(trim.duration_frames, 250, "10s at 25fps = 250 frames");
@@ -215,7 +242,10 @@ mod integration_tests {
         );
 
         let out_ms = expected_out_ms(&trim).expect("expected out ms must be computable");
-        assert_eq!(out_ms, 10_000, "expected out must match the asset's duration");
+        assert_eq!(
+            out_ms, 10_000,
+            "expected out must match the asset's duration"
+        );
     }
 
     #[test]
@@ -232,7 +262,10 @@ mod integration_tests {
 
         assert_eq!(item.fps_num, 30000);
         assert_eq!(item.fps_den, 1001);
-        assert!(!(item.fps_num == 29970 && item.fps_den == 1000), "must use broadcast rational, not float approximation");
+        assert!(
+            !(item.fps_num == 29970 && item.fps_den == 1000),
+            "must use broadcast rational, not float approximation"
+        );
 
         let trim = compute_frame_trim(&item).expect("trim must succeed");
         assert_eq!(trim.fps_rational, "30000/1001");
@@ -244,13 +277,7 @@ mod integration_tests {
 
     #[test]
     fn test_boundary_trimmed_subclip() {
-        let parent = make_ready_asset(
-            "parent-001",
-            "D:/media/videos/parent.mp4",
-            60_000,
-            25,
-            1,
-        );
+        let parent = make_ready_asset("parent-001", "D:/media/videos/parent.mp4", 60_000, 25, 1);
 
         let subclip = AssetResponse {
             uuid: "subclip-001".to_string(),
@@ -279,21 +306,21 @@ mod integration_tests {
 
         let cmd = caspar_play_command(1, 10, &item.path, &trim);
         assert!(cmd.contains("SEEK 125"), "SEEK must use in_frame");
-        assert!(cmd.contains("LENGTH 250"), "LENGTH must use content duration_frames");
+        assert!(
+            cmd.contains("LENGTH 250"),
+            "LENGTH must use content duration_frames"
+        );
 
         let out_ms = expected_out_ms(&trim).expect("out ms must be computable");
-        assert_eq!(out_ms, 10_000, "expected out must be the content duration (10s), not absolute (15s)");
+        assert_eq!(
+            out_ms, 10_000,
+            "expected out must be the content duration (10s), not absolute (15s)"
+        );
     }
 
     #[test]
     fn test_boundary_trimmed_subclip_custom_display_name() {
-        let parent = make_ready_asset(
-            "parent-002",
-            "D:/media/videos/parent2.mp4",
-            120_000,
-            25,
-            1,
-        );
+        let parent = make_ready_asset("parent-002", "D:/media/videos/parent2.mp4", 120_000, 25, 1);
 
         let subclip = AssetResponse {
             uuid: "subclip-custom-title-99".to_string(),
@@ -320,7 +347,10 @@ mod integration_tests {
         assert_eq!(trim.duration_frames, 250, "10000ms content = 250 frames");
 
         let cmd = caspar_play_command(1, 10, &item.path, &trim);
-        assert!(cmd.contains("SEEK 250"), "SEEK must handle non-pattern titles");
+        assert!(
+            cmd.contains("SEEK 250"),
+            "SEEK must handle non-pattern titles"
+        );
     }
 
     #[test]
@@ -353,13 +383,8 @@ mod integration_tests {
         // which would mask the error and produce wrong frame trim for NTSC content.
         // This test validates the contract at the ingestor boundary: if fps is
         // zero, the asset must not be marked ready/mezzanine_ok.
-        let mut asset = make_ready_asset(
-            "bad-fps-001",
-            "D:/media/videos/bad_fps.mp4",
-            10_000,
-            25,
-            1,
-        );
+        let mut asset =
+            make_ready_asset("bad-fps-001", "D:/media/videos/bad_fps.mp4", 10_000, 25, 1);
         asset.fps_num = 0;
         asset.fps_den = 0;
         asset.mezzanine_ok = false;
@@ -370,7 +395,10 @@ mod integration_tests {
             asset.fps_num == 0 || asset.fps_den == 0,
             "this test simulates a broken ingestor output"
         );
-        assert!(!asset.mezzanine_ok, "broken fps must force mezzanine_ok=false");
+        assert!(
+            !asset.mezzanine_ok,
+            "broken fps must force mezzanine_ok=false"
+        );
     }
 
     #[test]

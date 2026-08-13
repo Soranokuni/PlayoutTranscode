@@ -26,7 +26,10 @@ impl Publisher for LocalFilePublisher {
             return Err(format!("Staging file does not exist: {}", staged.display()));
         }
         if final_path.exists() {
-            return Err(format!("Final output path already exists: {}", final_path.display()));
+            return Err(format!(
+                "Final output path already exists: {}",
+                final_path.display()
+            ));
         }
         std::fs::rename(staged, final_path).map_err(|e| {
             format!(
@@ -78,6 +81,9 @@ pub fn classify_error(err_msg: &str, is_validation_failure: bool) -> RetryClass 
         || lower.contains("disk full")
         || lower.contains("space")
         || lower.contains("already exists")
+        || lower.contains("audio measurement failed")
+        || lower.contains("unsupported_audio_channel_layout")
+        || lower.contains("unsupported channel layout")
     {
         return RetryClass::Permanent;
     }
@@ -104,6 +110,8 @@ pub trait TranscodeRunner {
         metadata_uuid: &str,
         progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
         active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+        audio_policy: &config::AudioPolicy,
+        measured_loudness: Option<&probe::MeasuredLoudness>,
     ) -> encoder::EncodeResult;
 }
 
@@ -121,10 +129,21 @@ impl TranscodeRunner for RealTranscodeRunner {
         metadata_uuid: &str,
         progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
         active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+        audio_policy: &config::AudioPolicy,
+        measured_loudness: Option<&probe::MeasuredLoudness>,
     ) -> encoder::EncodeResult {
         encoder::transcode_file(
-            tools, config, input_path, source_probe, profile_id,
-            output_path, metadata_uuid, progress_tx, active_pids,
+            tools,
+            config,
+            input_path,
+            source_probe,
+            profile_id,
+            output_path,
+            metadata_uuid,
+            progress_tx,
+            active_pids,
+            audio_policy,
+            measured_loudness,
         )
     }
 }
@@ -160,8 +179,42 @@ pub fn process_file_sync_with_runner(
     active_pids: Arc<StdMutex<Vec<u32>>>,
     runner: &impl TranscodeRunner,
 ) {
+    process_file_sync_with_runner_and_measurer(
+        queue,
+        tools,
+        target_root,
+        input_path,
+        config,
+        pool,
+        active_pids,
+        runner,
+        &probe::RealLoudnessMeasurer,
+    );
+}
+
+pub fn process_file_sync_with_runner_and_measurer(
+    queue: &jobs::JobQueue,
+    tools: &bootstrap::ToolPaths,
+    target_root: &Path,
+    input_path: &Path,
+    config: &config::AppConfig,
+    pool: &SqlitePool,
+    active_pids: Arc<StdMutex<Vec<u32>>>,
+    runner: &impl TranscodeRunner,
+    measurer: &impl probe::LoudnessMeasurer,
+) {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        process_file_inner(queue, tools, target_root, input_path, config, pool, active_pids, runner);
+        process_file_inner(
+            queue,
+            tools,
+            target_root,
+            input_path,
+            config,
+            pool,
+            active_pids,
+            runner,
+            measurer,
+        );
     }));
 
     if let Err(panic_payload) = result {
@@ -172,11 +225,19 @@ pub fn process_file_sync_with_runner(
         } else {
             "Unknown panic in process_file_sync".to_string()
         };
-        tracing::error!("PANIC in process_file_sync for {}: {}", input_path.display(), msg);
-        queue.broadcast("failed", &serde_json::json!({
-            "error": format!("Internal panic: {}", msg),
-            "path": input_path.to_string_lossy(),
-        }).to_string());
+        tracing::error!(
+            "PANIC in process_file_sync for {}: {}",
+            input_path.display(),
+            msg
+        );
+        queue.broadcast(
+            "failed",
+            &serde_json::json!({
+                "error": format!("Internal panic: {}", msg),
+                "path": input_path.to_string_lossy(),
+            })
+            .to_string(),
+        );
     }
 }
 
@@ -189,10 +250,15 @@ fn process_file_inner(
     pool: &SqlitePool,
     active_pids: Arc<StdMutex<Vec<u32>>>,
     runner: &impl TranscodeRunner,
+    measurer: &impl probe::LoudnessMeasurer,
 ) {
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
-    let canonical_input = input_path.canonicalize().unwrap_or_else(|_| input_path.to_path_buf());
-    let canonical_watch = watch_root.canonicalize().unwrap_or_else(|_| watch_root.to_path_buf());
+    let canonical_input = input_path
+        .canonicalize()
+        .unwrap_or_else(|_| input_path.to_path_buf());
+    let canonical_watch = watch_root
+        .canonicalize()
+        .unwrap_or_else(|_| watch_root.to_path_buf());
     if !canonical_input.starts_with(&canonical_watch) {
         tracing::warn!("Rejected path traversal attempt: {}", input_path.display());
         return;
@@ -236,12 +302,8 @@ fn process_file_inner(
     let metadata_uuid = Uuid::new_v4().to_string();
     let video_dir = target_root.join("videos");
     let _ = std::fs::create_dir_all(&video_dir);
-    let safe_stem = identity::sanitize_filename(
-        &input_path
-            .file_stem()
-            .unwrap_or_default()
-            .to_string_lossy(),
-    );
+    let safe_stem =
+        identity::sanitize_filename(&input_path.file_stem().unwrap_or_default().to_string_lossy());
 
     let final_output_path = build_unique_output_path(&video_dir, &safe_stem, &metadata_uuid);
     let publisher = LocalFilePublisher;
@@ -255,7 +317,11 @@ fn process_file_inner(
         &input_path.to_string_lossy(),
         &safe_stem,
     )) {
-        tracing::error!("DB insert processing failed for {}: {}", input_path.display(), e);
+        tracing::error!(
+            "DB insert processing failed for {}: {}",
+            input_path.display(),
+            e
+        );
     }
 
     let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
@@ -263,7 +329,10 @@ fn process_file_inner(
     job.current_stage = "Probing".to_string();
     job.uuid = Some(metadata_uuid.clone());
     queue.push(job.clone());
-    queue.broadcast("job_update", &serde_json::json!({"id": job.id, "stage": "Probing"}).to_string());
+    queue.broadcast(
+        "job_update",
+        &serde_json::json!({"id": job.id, "stage": "Probing"}).to_string(),
+    );
 
     let probe_data = match probe::probe_media(tools, input_path) {
         Ok(p) => p,
@@ -275,7 +344,10 @@ fn process_file_inner(
                 j.finished_at = Some(Utc::now().to_rfc3339());
             });
             tracing::error!("Probe failed for {}: {}", input_path.display(), e);
-            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Probe: {}", e)}).to_string());
+            queue.broadcast(
+                "failed",
+                &serde_json::json!({"id": job.id, "error": format!("Probe: {}", e)}).to_string(),
+            );
             let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
             publisher.cleanup_staging(&staged_output_path);
             return;
@@ -290,11 +362,42 @@ fn process_file_inner(
             j.state = jobs::JobState::Failed;
             j.error = Some("Profile disabled".into());
         });
-        queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": "Profile disabled"}).to_string());
+        queue.broadcast(
+            "failed",
+            &serde_json::json!({"id": job.id, "error": "Profile disabled"}).to_string(),
+        );
         let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
         publisher.cleanup_staging(&staged_output_path);
         return;
     }
+
+    let audio_policy = config.effective_audio_policy();
+    let measured_loudness = match measurer.measure_loudness(
+        tools,
+        input_path,
+        probe_data.audio_channels,
+        probe_data.duration_secs,
+        &audio_policy,
+    ) {
+        Ok(m) => m,
+        Err(e) => {
+            queue.update(&job.id, |j| {
+                j.state = jobs::JobState::Failed;
+                j.error = Some(format!("Audio measurement failed: {}", e));
+                j.current_stage = "Failed".into();
+                j.finished_at = Some(Utc::now().to_rfc3339());
+            });
+            tracing::error!(
+                "Audio measurement failed for {}: {}",
+                input_path.display(),
+                e
+            );
+            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Audio measurement failed: {}", e)}).to_string());
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            publisher.cleanup_staging(&staged_output_path);
+            return;
+        }
+    };
 
     let retry_policy = config.effective_retry_policy();
     let max_attempts = (retry_policy.max_attempts as usize).max(1);
@@ -307,7 +410,10 @@ fn process_file_inner(
         publisher.cleanup_staging(&staged_output_path);
 
         let stage_label = if max_attempts > 1 {
-            format!("Encoding {} (attempt {}/{})", profile_name, attempt, max_attempts)
+            format!(
+                "Encoding {} (attempt {}/{})",
+                profile_name, attempt, max_attempts
+            )
         } else {
             format!("Encoding {}", profile_name)
         };
@@ -336,30 +442,49 @@ fn process_file_inner(
                     j.encode_speed = p.speed.clone();
                     j.current_time_ms = p.current_time_ms;
                     j.duration_ms = p.duration_ms;
-                    j.current_stage = if pct >= 100.0 { "Finalizing".into() } else { format!("Encoding {:.0}%", pct) };
+                    j.current_stage = if pct >= 100.0 {
+                        "Finalizing".into()
+                    } else {
+                        format!("Encoding {:.0}%", pct)
+                    };
                 });
                 let now = std::time::Instant::now();
-                if now.duration_since(last_broadcast).as_millis() as u64 >= THROTTLE_MS || pct >= 100.0 {
+                if now.duration_since(last_broadcast).as_millis() as u64 >= THROTTLE_MS
+                    || pct >= 100.0
+                {
                     last_broadcast = now;
                     let determinate = p.duration_ms > 0 || p.total_frames > 0;
-                    let _ = qc.broadcast("progress", &serde_json::json!({
-                        "id": jid,
-                        "percent": pct,
-                        "current_time_ms": p.current_time_ms,
-                        "duration_ms": p.duration_ms,
-                        "determinate": determinate,
-                        "fps": p.fps,
-                        "bitrate": p.bitrate,
-                        "speed": p.speed,
-                        "stage": if pct >= 100.0 { "Finalizing" } else { "Encoding" },
-                    }).to_string());
+                    let _ = qc.broadcast(
+                        "progress",
+                        &serde_json::json!({
+                            "id": jid,
+                            "percent": pct,
+                            "current_time_ms": p.current_time_ms,
+                            "duration_ms": p.duration_ms,
+                            "determinate": determinate,
+                            "fps": p.fps,
+                            "bitrate": p.bitrate,
+                            "speed": p.speed,
+                            "stage": if pct >= 100.0 { "Finalizing" } else { "Encoding" },
+                        })
+                        .to_string(),
+                    );
                 }
             }
         });
 
         let result = runner.run_transcode(
-            tools, config, input_path, &probe_data, profile_id,
-            &staged_output_path, &metadata_uuid, ptx, Some(active_pids.clone()),
+            tools,
+            config,
+            input_path,
+            &probe_data,
+            profile_id,
+            &staged_output_path,
+            &metadata_uuid,
+            ptx,
+            Some(active_pids.clone()),
+            &audio_policy,
+            measured_loudness.as_ref(),
         );
 
         if result.success {
@@ -419,24 +544,40 @@ fn process_file_inner(
                 .unwrap_or_else(|| "FFmpeg encoding failed".to_string());
         }
 
-        if validation_ok && final_probe.is_some() {
+        if validation_ok {
             let output_probe = final_probe.unwrap();
 
-            let keyframe_safe_start_ms = probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
+            let keyframe_safe_start_ms =
+                probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
 
             let mut warnings_list = Vec::new();
             let mut mezzanine_ok = true;
 
+            if let Some(ref ml) = measured_loudness {
+                if ml.is_silent {
+                    warnings_list.push("silent_audio_loudness_skipped".to_string());
+                }
+                if ml.is_short {
+                    warnings_list.push("short_clip_loudnorm_dynamic".to_string());
+                }
+            }
+
             let fps = output_probe.fps();
             let expected_fps = profiles::TARGET_FPS_NUM as f64 / profiles::TARGET_FPS_DEN as f64;
             if (fps - expected_fps).abs() > 0.01 {
-                warnings_list.push(format!("fps_mismatch: got {:.3} expected {:.3}", fps, expected_fps));
+                warnings_list.push(format!(
+                    "fps_mismatch: got {:.3} expected {:.3}",
+                    fps, expected_fps
+                ));
                 mezzanine_ok = false;
             }
 
             let source_fps = probe_data.fps();
             if (source_fps - expected_fps).abs() > 0.01 {
-                warnings_list.push(format!("fps_converted: source {:.3} -> output {:.3}", source_fps, expected_fps));
+                warnings_list.push(format!(
+                    "fps_converted: source {:.3} -> output {:.3}",
+                    source_fps, expected_fps
+                ));
             }
 
             let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
@@ -446,7 +587,10 @@ fn process_file_inner(
             }
 
             if output_probe.audio_sample_rate != 48000 {
-                warnings_list.push(format!("audio_sample_rate_not_48k: got {} Hz", output_probe.audio_sample_rate));
+                warnings_list.push(format!(
+                    "audio_sample_rate_not_48k: got {} Hz",
+                    output_probe.audio_sample_rate
+                ));
                 mezzanine_ok = false;
             }
 
@@ -484,6 +628,21 @@ fn process_file_inner(
                 return;
             }
 
+            let sidecar_loudness = measured_loudness.as_ref().map(|ml| identity::LoudnessInfo {
+                integrated_lufs: ml.input_i,
+                true_peak_dbtp: ml.input_tp,
+                lra: ml.input_lra,
+                threshold: ml.input_thresh,
+                target_lufs: ml.target_i,
+                target_true_peak_dbtp: ml.target_tp,
+                normalization_mode: match audio_policy.mode {
+                    config::AudioMode::EbuR128 => "ebu_r128".to_string(),
+                    config::AudioMode::AtscA85 => "atsc_a85".to_string(),
+                    _ => "legacy".to_string(),
+                },
+                linear_applied: ml.is_linear,
+            });
+
             let _ = identity::write_sidecar_next_to_video(
                 &final_output_path,
                 &metadata_uuid,
@@ -501,9 +660,11 @@ fn process_file_inner(
                 gop_frames,
                 keyframe_safe_start_ms,
                 &warnings_list,
+                sidecar_loudness,
             );
 
-            let keyframe_offsets_json = serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
+            let keyframe_offsets_json =
+                serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
 
             let _ = handle.block_on(db::mark_ready(
                 pool,
@@ -528,8 +689,16 @@ fn process_file_inner(
                 j.current_stage = "Completed".into();
                 j.finished_at = Some(Utc::now().to_rfc3339());
             });
-            queue.broadcast("completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
-            tracing::info!("Completed and verified: {} -> {} (uuid={})", input_path.display(), final_output_path.display(), metadata_uuid);
+            queue.broadcast(
+                "completed",
+                &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string(),
+            );
+            tracing::info!(
+                "Completed and verified: {} -> {} (uuid={})",
+                input_path.display(),
+                final_output_path.display(),
+                metadata_uuid
+            );
             if config.effective_storage_policy().clean_source_after_success {
                 let _ = std::fs::remove_file(input_path);
             }
@@ -546,12 +715,20 @@ fn process_file_inner(
         if retry_class == RetryClass::Retryable && attempt < max_attempts {
             tracing::warn!(
                 "Transcode attempt {}/{} failed for {} ({}). Retrying in {}ms...",
-                attempt, max_attempts, input_path.display(), validation_error, retry_delay_ms
+                attempt,
+                max_attempts,
+                input_path.display(),
+                validation_error,
+                retry_delay_ms
             );
-            queue.broadcast("progress", &serde_json::json!({
-                "id": job.id,
-                "stage": format!("Retrying attempt {}/{}", attempt + 1, max_attempts),
-            }).to_string());
+            queue.broadcast(
+                "progress",
+                &serde_json::json!({
+                    "id": job.id,
+                    "stage": format!("Retrying attempt {}/{}", attempt + 1, max_attempts),
+                })
+                .to_string(),
+            );
 
             if retry_delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
@@ -560,7 +737,11 @@ fn process_file_inner(
         } else {
             tracing::error!(
                 "Final transcode failure for {} (attempt {}/{}, class={:?}): {}",
-                input_path.display(), attempt, max_attempts, retry_class, last_error
+                input_path.display(),
+                attempt,
+                max_attempts,
+                retry_class,
+                last_error
             );
             queue.update(&job.id, |j| {
                 j.state = jobs::JobState::Failed;
@@ -568,7 +749,10 @@ fn process_file_inner(
                 j.current_stage = "Failed".into();
                 j.finished_at = Some(Utc::now().to_rfc3339());
             });
-            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": last_error}).to_string());
+            queue.broadcast(
+                "failed",
+                &serde_json::json!({"id": job.id, "error": last_error}).to_string(),
+            );
             let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
             if final_output_path.exists() {
                 let _ = std::fs::remove_file(&final_output_path);
@@ -613,7 +797,11 @@ fn build_unique_output_path(video_dir: &Path, safe_stem: &str, uuid: &str) -> st
 
 fn compute_gop_from_fps(fps: f64) -> i64 {
     let gop = (fps * 2.0).round() as i64;
-    if gop > 0 { gop } else { 50 }
+    if gop > 0 {
+        gop
+    } else {
+        50
+    }
 }
 
 fn verify_closed_gop(keyframe_offsets: &[i64], gop_frames: i64, fps: f64) -> bool {
@@ -749,12 +937,19 @@ fn classify_probe_match(
     }
     if p.audio_codec == "none" {
         // Audio missing is non-fatal for some source media (clean switches). Warn instead.
-        tracing::warn!("Output has no audio stream (source had codec={})", source.audio_codec);
+        tracing::warn!(
+            "Output has no audio stream (source had codec={})",
+            source.audio_codec
+        );
     }
     let output_duration = p.duration_secs;
     let source_duration = source.duration_secs;
     let fps = p.fps();
-    let frame_duration_ms = if fps > 0.0 { (1000.0 / fps).round() as f64 } else { 40.0 };
+    let frame_duration_ms = if fps > 0.0 {
+        (1000.0 / fps).round() as f64
+    } else {
+        40.0
+    };
     let tolerance_ms = (frame_duration_ms * 2.0).max(40.0);
     let diff_ms = ((output_duration - source_duration).abs() * 1000.0).round() as f64;
     if diff_ms > tolerance_ms {
@@ -809,11 +1004,16 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
 
     let mut cmd = std::process::Command::new(ffprobe);
     cmd.args(&[
-        "-v", "error",
-        "-select_streams", "v:0",
-        "-skip_frame", "nokey",
-        "-show_entries", "frame=pts_time",
-        "-of", "csv=p=0",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-skip_frame",
+        "nokey",
+        "-show_entries",
+        "frame=pts_time",
+        "-of",
+        "csv=p=0",
     ]);
     cmd.arg(path);
 
@@ -847,6 +1047,8 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::probe::LoudnessMeasurer;
+    use std::path::PathBuf;
 
     #[test]
     fn test_verify_closed_gop_uniform() {
@@ -917,7 +1119,9 @@ mod tests {
 
         let res = publ.publish(&staged_path, &final_path);
         assert!(res.is_err());
-        assert!(res.unwrap_err().contains("Final output path already exists"));
+        assert!(res
+            .unwrap_err()
+            .contains("Final output path already exists"));
 
         let _ = std::fs::remove_file(&staged_path);
         let _ = std::fs::remove_file(&final_path);
@@ -969,8 +1173,11 @@ mod tests {
             _metadata_uuid: &str,
             _progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
             _active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+            _audio_policy: &config::AudioPolicy,
+            _measured_loudness: Option<&probe::MeasuredLoudness>,
         ) -> encoder::EncodeResult {
-            self.attempts_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.attempts_seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut list = self.responses.lock().unwrap();
             if !list.is_empty() {
                 let res = list.remove(0);
@@ -986,6 +1193,31 @@ mod tests {
                     stderr_tail: Vec::new(),
                     exit_pid: None,
                 }
+            }
+        }
+    }
+
+    struct MockLoudnessMeasurer {
+        measurements: std::sync::Mutex<Vec<Result<Option<probe::MeasuredLoudness>, String>>>,
+        calls_seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl probe::LoudnessMeasurer for MockLoudnessMeasurer {
+        fn measure_loudness(
+            &self,
+            _tools: &bootstrap::ToolPaths,
+            _input_path: &Path,
+            _channels: i64,
+            _duration_secs: f64,
+            _policy: &config::AudioPolicy,
+        ) -> Result<Option<probe::MeasuredLoudness>, String> {
+            self.calls_seen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut list = self.measurements.lock().unwrap();
+            if !list.is_empty() {
+                list.remove(0)
+            } else {
+                Ok(None)
             }
         }
     }
@@ -1052,10 +1284,15 @@ mod tests {
             input_path: "input.mp4".into(),
         };
 
+        let dummy_policy = config::AudioPolicy::default();
+
         while attempt <= max_attempts {
             attempts_executed += 1;
             let res = runner.run_transcode(
-                &bootstrap::ToolPaths { ffmpeg: PathBuf::new(), ffprobe: PathBuf::new() },
+                &bootstrap::ToolPaths {
+                    ffmpeg: PathBuf::new(),
+                    ffprobe: PathBuf::new(),
+                },
                 &config::AppConfig::default(),
                 Path::new("input.mp4"),
                 &dummy_probe,
@@ -1063,6 +1300,8 @@ mod tests {
                 Path::new("staged.mp4"),
                 "uuid",
                 std::sync::mpsc::channel().0,
+                None,
+                &dummy_policy,
                 None,
             );
             let cls = classify_error(res.error.as_deref().unwrap_or(""), false);
@@ -1074,6 +1313,186 @@ mod tests {
         }
 
         assert_eq!(attempts_executed, 2);
-        assert_eq!(runner.attempts_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(
+            runner
+                .attempts_seen
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[test]
+    fn test_sidecar_loudness_field_omitted_in_legacy_mode() {
+        let dummy_probe = probe::ProbeData {
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            fps_num: 25,
+            fps_den: 1,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "input.mp4".into(),
+        };
+
+        let sidecar = identity::SidecarPayload::new(
+            "test-uuid",
+            "C:/target/videos/clip.mp4",
+            &dummy_probe,
+            &dummy_probe,
+            "profile_a",
+            "h264",
+            "aac",
+            10000,
+            true,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &[],
+            None,
+        );
+
+        let json = serde_json::to_string(&sidecar).unwrap();
+        assert!(
+            !json.contains("loudness"),
+            "Loudness field must be omitted when None in Legacy mode"
+        );
+    }
+
+    #[test]
+    fn test_sidecar_loudness_field_additive_and_optional() {
+        let dummy_probe = probe::ProbeData {
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            fps_num: 25,
+            fps_den: 1,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "input.mp4".into(),
+        };
+
+        let loudness = identity::LoudnessInfo {
+            integrated_lufs: -24.5,
+            true_peak_dbtp: -1.5,
+            lra: 6.5,
+            threshold: -34.5,
+            target_lufs: -23.0,
+            target_true_peak_dbtp: -1.0,
+            normalization_mode: "ebu_r128".to_string(),
+            linear_applied: true,
+        };
+
+        let sidecar = identity::SidecarPayload::new(
+            "test-uuid",
+            "C:/target/videos/clip.mp4",
+            &dummy_probe,
+            &dummy_probe,
+            "profile_a",
+            "h264",
+            "aac",
+            10000,
+            true,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &[],
+            Some(loudness),
+        );
+
+        let json = serde_json::to_string(&sidecar).unwrap();
+        assert!(
+            json.contains("\"loudness\":{"),
+            "Sidecar must include loudness object when present"
+        );
+        assert!(json.contains("\"integrated_lufs\":-24.5"));
+        assert!(json.contains("\"normalization_mode\":\"ebu_r128\""));
+        assert!(json.contains("\"linear_applied\":true"));
+    }
+
+    #[test]
+    fn test_legacy_mode_skips_measurement() {
+        let _measurer = MockLoudnessMeasurer {
+            measurements: std::sync::Mutex::new(Vec::new()),
+            calls_seen: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let policy = config::AudioPolicy {
+            mode: config::AudioMode::LegacyV1Encode,
+            ..Default::default()
+        };
+        let real_measurer = probe::RealLoudnessMeasurer;
+        let res = real_measurer
+            .measure_loudness(
+                &bootstrap::ToolPaths {
+                    ffmpeg: PathBuf::new(),
+                    ffprobe: PathBuf::new(),
+                },
+                Path::new("in.mp4"),
+                2,
+                10.0,
+                &policy,
+            )
+            .unwrap();
+        assert!(
+            res.is_none(),
+            "LegacyV1Encode must skip measurement completely"
+        );
+    }
+
+    #[test]
+    fn test_video_only_input_skips_measurement() {
+        let policy = config::AudioPolicy {
+            mode: config::AudioMode::EbuR128,
+            ..Default::default()
+        };
+        let real_measurer = probe::RealLoudnessMeasurer;
+        let res = real_measurer
+            .measure_loudness(
+                &bootstrap::ToolPaths {
+                    ffmpeg: PathBuf::new(),
+                    ffprobe: PathBuf::new(),
+                },
+                Path::new("in.mp4"),
+                0, // 0 audio channels
+                10.0,
+                &policy,
+            )
+            .unwrap();
+        assert!(
+            res.is_none(),
+            "Video-only input (0 channels) must skip measurement completely"
+        );
+    }
+
+    #[test]
+    fn test_classified_permanent_on_audio_measurement_failure() {
+        let cls = classify_error("Audio measurement failed: invalid json", false);
+        assert_eq!(
+            cls,
+            RetryClass::Permanent,
+            "Measurement failure must be classified as Permanent"
+        );
+
+        let cls_layout = classify_error("unsupported_audio_channel_layout", false);
+        assert_eq!(
+            cls_layout,
+            RetryClass::Permanent,
+            "Unsupported channel layout must be classified as Permanent"
+        );
     }
 }
