@@ -7,7 +7,9 @@ use std::fs;
 use std::path::PathBuf;
 
 fn contracts_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("docs").join("contracts")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("docs")
+        .join("contracts")
 }
 
 fn read_contract_json(filename: &str) -> Value {
@@ -22,9 +24,18 @@ fn read_contract_json(filename: &str) -> Value {
 fn test_golden_asset_response_contract() {
     let json = read_contract_json("asset-response.example.json");
 
-    assert_eq!(json["uuid"], json["playoutvue_id"], "uuid and playoutvue_id must match");
-    assert!(json["duration_ms"].as_i64().unwrap() > 0, "duration_ms must be > 0 on ready");
-    assert!(json["trim_in_ms"].as_i64().unwrap() >= 0, "trim_in_ms must be >= 0");
+    assert_eq!(
+        json["uuid"], json["playoutvue_id"],
+        "uuid and playoutvue_id must match"
+    );
+    assert!(
+        json["duration_ms"].as_i64().unwrap() > 0,
+        "duration_ms must be > 0 on ready"
+    );
+    assert!(
+        json["trim_in_ms"].as_i64().unwrap() >= 0,
+        "trim_in_ms must be >= 0"
+    );
     assert!(
         json["trim_out_ms"].as_i64().unwrap() > json["trim_in_ms"].as_i64().unwrap(),
         "trim_out_ms must be > trim_in_ms"
@@ -37,17 +48,29 @@ fn test_golden_asset_response_contract() {
     assert!(json["fps_den"].as_i64().unwrap() > 0, "fps_den must be > 0");
     assert_eq!(json["status"].as_str().unwrap(), "ready");
     assert!(json["warnings"].is_array(), "warnings must be a JSON array");
-    assert!(json["keyframe_offsets"].is_array(), "keyframe_offsets must be a JSON array");
+    assert!(
+        json["keyframe_offsets"].is_array(),
+        "keyframe_offsets must be a JSON array"
+    );
 }
 
 #[test]
 fn test_golden_asset_sidecar_contract() {
     let json = read_contract_json("asset-sidecar.example.json");
 
-    assert_eq!(json["playoutvue_id"], json["id"], "playoutvue_id and id must match");
-    assert_eq!(json["filepath"], json["path"], "filepath and path must match");
+    assert_eq!(
+        json["playoutvue_id"], json["id"],
+        "playoutvue_id and id must match"
+    );
+    assert_eq!(
+        json["filepath"], json["path"],
+        "filepath and path must match"
+    );
     assert!(json["duration_ms"].as_i64().unwrap() > 0);
-    assert_eq!(json["output_media"]["audio_sample_rate"].as_i64().unwrap(), 48000);
+    assert_eq!(
+        json["output_media"]["audio_sample_rate"].as_i64().unwrap(),
+        48000
+    );
     assert_eq!(json["output_media"]["audio_channels"].as_i64().unwrap(), 2);
 }
 
@@ -140,7 +163,10 @@ async fn test_live_axum_wire_contract_endpoints() {
         .route("/health", get(move || async move { Json(health_h) }))
         .route("/config", get(move || async move { Json(config_h) }))
         .route("/stats", get(move || async move { Json(stats_h) }))
-        .route("/watchfolder", get(move || async move { Json(watchfolder_h) }))
+        .route(
+            "/watchfolder",
+            get(move || async move { Json(watchfolder_h) }),
+        )
         .route("/assets", get(|| async { Json(serde_json::json!([])) }));
 
     let app = Router::new().nest("/api", api);
@@ -160,7 +186,11 @@ async fn test_live_axum_wire_contract_endpoints() {
     let base = format!("http://127.0.0.1:{}/api", addr.port());
 
     // 1. GET /api/health
-    let res = client.get(format!("{}/health", base)).send().await.expect("GET /health failed");
+    let res = client
+        .get(format!("{}/health", base))
+        .send()
+        .await
+        .expect("GET /health failed");
     assert_eq!(res.status(), 200);
     let text = res.text().await.unwrap();
     let health_res: Value = serde_json::from_str(&text).unwrap();
@@ -168,28 +198,44 @@ async fn test_live_axum_wire_contract_endpoints() {
     assert_eq!(health_res["service"], "PlayoutTranscode");
 
     // 2. GET /api/config
-    let res = client.get(format!("{}/config", base)).send().await.expect("GET /config failed");
+    let res = client
+        .get(format!("{}/config", base))
+        .send()
+        .await
+        .expect("GET /config failed");
     assert_eq!(res.status(), 200);
     let text = res.text().await.unwrap();
     let config_res: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(config_res["server"]["web_port"], 4353);
 
     // 3. GET /api/stats
-    let res = client.get(format!("{}/stats", base)).send().await.expect("GET /stats failed");
+    let res = client
+        .get(format!("{}/stats", base))
+        .send()
+        .await
+        .expect("GET /stats failed");
     assert_eq!(res.status(), 200);
     let text = res.text().await.unwrap();
     let stats_res: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(stats_res["total"], 47);
 
     // 4. GET /api/watchfolder
-    let res = client.get(format!("{}/watchfolder", base)).send().await.expect("GET /watchfolder failed");
+    let res = client
+        .get(format!("{}/watchfolder", base))
+        .send()
+        .await
+        .expect("GET /watchfolder failed");
     assert_eq!(res.status(), 200);
     let text = res.text().await.unwrap();
     let wf_res: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(wf_res["settle_secs"], 5);
 
     // 5. GET /api/assets
-    let res = client.get(format!("{}/assets", base)).send().await.expect("GET /assets failed");
+    let res = client
+        .get(format!("{}/assets", base))
+        .send()
+        .await
+        .expect("GET /assets failed");
     assert_eq!(res.status(), 200);
     let text = res.text().await.unwrap();
     let assets_res: Value = serde_json::from_str(&text).unwrap();

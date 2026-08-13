@@ -9,10 +9,12 @@ use std::process::{Command, Stdio};
 use std::sync::{mpsc, LazyLock};
 use std::sync::{Arc, Mutex};
 
-static TIME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
+static TIME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
 static FRAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"frame=\s*(\d+)").unwrap());
 static FPS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"fps=\s*([\d.]+)").unwrap());
-static BITRATE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"bitrate=\s*([\d.]+kbits/s)").unwrap());
+static BITRATE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"bitrate=\s*([\d.]+kbits/s)").unwrap());
 static SPEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"speed=\s*([\d.]+x)").unwrap());
 
 #[cfg(target_os = "windows")]
@@ -87,18 +89,37 @@ pub fn transcode_file(
     metadata_uuid: &str,
     progress_tx: mpsc::Sender<EncodeProgress>,
     active_pids: Option<Arc<Mutex<Vec<u32>>>>,
+    audio_policy: &crate::config::AudioPolicy,
+    measured_loudness: Option<&crate::probe::MeasuredLoudness>,
 ) -> EncodeResult {
     let profile = EncodingProfile::by_id(profile_id);
-    let mut args = profile.build_ffmpeg_args(
+    let mut args = match profile.build_ffmpeg_args_with_audio(
         config,
         &input_path.to_string_lossy(),
         &output_path.to_string_lossy(),
         source_probe.fps_num,
         source_probe.fps_den,
-    );
+        audio_policy,
+        measured_loudness,
+        source_probe.audio_channels,
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            return EncodeResult {
+                output_path: output_path.to_path_buf(),
+                success: false,
+                error: Some(format!("Failed to build FFmpeg arguments: {}", e)),
+                stderr_tail: Vec::new(),
+                exit_pid: None,
+            };
+        }
+    };
 
     let output_path_str = output_path.to_string_lossy();
-    let insert_pos = args.iter().position(|a| a == output_path_str.as_ref()).unwrap_or(args.len());
+    let insert_pos = args
+        .iter()
+        .position(|a| a == output_path_str.as_ref())
+        .unwrap_or(args.len());
     args.insert(insert_pos, "-metadata".to_string());
     args.insert(insert_pos + 1, format!("playoutvue_id={}", metadata_uuid));
 
@@ -180,7 +201,10 @@ pub fn transcode_file(
         }
 
         if let Some(caps) = frame_re.captures(line) {
-            last_frame = caps.get(1).and_then(|m| m.as_str().parse::<i64>().ok()).unwrap_or(last_frame);
+            last_frame = caps
+                .get(1)
+                .and_then(|m| m.as_str().parse::<i64>().ok())
+                .unwrap_or(last_frame);
         }
 
         let time_str = time_re.captures(line).map(|caps| {
@@ -193,24 +217,31 @@ pub fn transcode_file(
             )
         });
 
-        let current_time_ms = time_str.as_ref().map(|ts| {
-            let parts: Vec<f64> = ts.split(':').filter_map(|p| p.parse().ok()).collect();
-            if parts.len() == 4 {
-                (parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] + parts[3] / 100.0) as i64 * 1000
-            } else {
-                0
-            }
-        }).unwrap_or(0);
+        let current_time_ms = time_str
+            .as_ref()
+            .map(|ts| {
+                let parts: Vec<f64> = ts.split(':').filter_map(|p| p.parse().ok()).collect();
+                if parts.len() == 4 {
+                    (parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] + parts[3] / 100.0) as i64
+                        * 1000
+                } else {
+                    0
+                }
+            })
+            .unwrap_or(0);
 
-        let fps_val = fps_re.captures(line)
+        let fps_val = fps_re
+            .captures(line)
             .and_then(|caps| caps.get(1).and_then(|m| m.as_str().parse::<f64>().ok()))
             .unwrap_or(0.0);
 
-        let bitrate = bitrate_re.captures(line)
+        let bitrate = bitrate_re
+            .captures(line)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
             .unwrap_or_default();
 
-        let speed = speed_re.captures(line)
+        let speed = speed_re
+            .captures(line)
             .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
             .unwrap_or_default();
 
@@ -272,7 +303,11 @@ pub fn transcode_file(
     });
 
     if status.success() {
-        tracing::debug!("FFmpeg stderr ({} lines):\n{}", stderr_lines.len(), stderr_lines.join("\n"));
+        tracing::debug!(
+            "FFmpeg stderr ({} lines):\n{}",
+            stderr_lines.len(),
+            stderr_lines.join("\n")
+        );
         EncodeResult {
             output_path: output_path.to_path_buf(),
             success: true,

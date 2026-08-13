@@ -74,7 +74,10 @@ mod tests {
 
         let fp1 = compute_fnv1a64(&path1).unwrap();
         let fp2 = compute_fnv1a64(&path2).unwrap();
-        assert_eq!(fp1, fp2, "Identical content should produce identical fingerprints");
+        assert_eq!(
+            fp1, fp2,
+            "Identical content should produce identical fingerprints"
+        );
 
         let _ = std::fs::remove_file(&path1);
         let _ = std::fs::remove_file(&path2);
@@ -97,7 +100,10 @@ mod tests {
 
         let fp_a = compute_fnv1a64(&path_a).unwrap();
         let fp_b = compute_fnv1a64(&path_b).unwrap();
-        assert_ne!(fp_a, fp_b, "Different content should produce different fingerprints");
+        assert_ne!(
+            fp_a, fp_b,
+            "Different content should produce different fingerprints"
+        );
 
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);

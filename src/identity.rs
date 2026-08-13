@@ -4,6 +4,18 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LoudnessInfo {
+    pub integrated_lufs: f64,
+    pub true_peak_dbtp: f64,
+    pub lra: f64,
+    pub threshold: f64,
+    pub target_lufs: f64,
+    pub target_true_peak_dbtp: f64,
+    pub normalization_mode: String,
+    pub linear_applied: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarPayload {
     pub playoutvue_id: String,
@@ -26,6 +38,82 @@ pub struct SidecarPayload {
     pub gop_frames: i64,
     pub keyframe_safe_start_ms: i64,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loudness: Option<LoudnessInfo>,
+}
+
+impl SidecarPayload {
+    pub fn new(
+        uuid: &str,
+        path: &str,
+        source_probe: &ProbeData,
+        output_probe: &ProbeData,
+        profile_name: &str,
+        target_codec: &str,
+        target_audio_codec: &str,
+        duration_ms: i64,
+        mezzanine_ok: bool,
+        fps: f64,
+        fps_num: i64,
+        fps_den: i64,
+        total_frames: i64,
+        gop_frames: i64,
+        keyframe_safe_start_ms: i64,
+        warnings: &[String],
+        loudness: Option<LoudnessInfo>,
+    ) -> Self {
+        let p = Path::new(path);
+        let filename = p
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        Self {
+            playoutvue_id: uuid.to_string(),
+            id: uuid.to_string(),
+            path: path.to_string(),
+            duration_ms,
+            trim_in_ms: 0,
+            trim_out_ms: duration_ms,
+            fps_num,
+            fps_den,
+            mezzanine_ok,
+            filename,
+            filepath: path.to_string(),
+            transcoded_at: Utc::now().to_rfc3339(),
+            profile_used: profile_name.to_string(),
+            original_source: SourceInfo {
+                path: source_probe.input_path.clone(),
+                codec: source_probe.video_codec.clone(),
+                duration_secs: source_probe.duration_secs,
+                frame_count: source_probe.frame_count,
+                width: source_probe.width,
+                height: source_probe.height,
+                fps: source_probe.fps(),
+                fps_num: source_probe.fps_num,
+                fps_den: source_probe.fps_den,
+                field_order: source_probe.field_order.clone(),
+            },
+            output_media: OutputInfo {
+                duration_secs: output_probe.duration_secs,
+                frame_count: output_probe.frame_count,
+                width: output_probe.width,
+                height: output_probe.height,
+                codec: target_codec.to_string(),
+                audio_codec: target_audio_codec.to_string(),
+                audio_sample_rate: output_probe.audio_sample_rate,
+                audio_channels: output_probe.audio_channels,
+                fps_num: output_probe.fps_num,
+                fps_den: output_probe.fps_den,
+            },
+            fps,
+            total_frames,
+            gop_frames,
+            keyframe_safe_start_ms,
+            warnings: warnings.to_vec(),
+            loudness,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,59 +165,28 @@ pub fn write_sidecar_next_to_video(
     gop_frames: i64,
     keyframe_safe_start_ms: i64,
     warnings: &[String],
+    loudness: Option<LoudnessInfo>,
 ) -> Result<PathBuf, String> {
     let sidecar_path = sidecar_path_for(output_path);
-    let filename = output_path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .into_owned();
-    let filepath = output_path.to_string_lossy().into_owned();
-
-    let payload = SidecarPayload {
-        playoutvue_id: uuid.to_string(),
-        id: uuid.to_string(),
-        path: filepath.clone(),
+    let payload = SidecarPayload::new(
+        uuid,
+        &output_path.to_string_lossy(),
+        source_probe,
+        output_probe,
+        profile_name,
+        target_codec,
+        target_audio_codec,
         duration_ms,
-        trim_in_ms: 0,
-        trim_out_ms: duration_ms,
+        mezzanine_ok,
+        fps,
         fps_num,
         fps_den,
-        mezzanine_ok,
-        filename: filename.clone(),
-        filepath: filepath.clone(),
-        transcoded_at: Utc::now().to_rfc3339(),
-        profile_used: profile_name.to_string(),
-        original_source: SourceInfo {
-            path: source_probe.input_path.clone(),
-            codec: source_probe.video_codec.clone(),
-            duration_secs: source_probe.duration_secs,
-            frame_count: source_probe.frame_count,
-            width: source_probe.width,
-            height: source_probe.height,
-            fps: source_probe.fps(),
-            fps_num: source_probe.fps_num,
-            fps_den: source_probe.fps_den,
-            field_order: source_probe.field_order.clone(),
-        },
-        output_media: OutputInfo {
-            duration_secs: output_probe.duration_secs,
-            frame_count: output_probe.frame_count,
-            width: output_probe.width,
-            height: output_probe.height,
-            codec: target_codec.to_string(),
-            audio_codec: target_audio_codec.to_string(),
-            audio_sample_rate: output_probe.audio_sample_rate,
-            audio_channels: output_probe.audio_channels,
-            fps_num: output_probe.fps_num,
-            fps_den: output_probe.fps_den,
-        },
-        fps,
         total_frames,
         gop_frames,
         keyframe_safe_start_ms,
-        warnings: warnings.to_vec(),
-    };
+        warnings,
+        loudness,
+    );
 
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("Failed to serialize sidecar: {}", e))?;
@@ -137,7 +194,11 @@ pub fn write_sidecar_next_to_video(
     let tmp_sidecar_path = sidecar_path.with_extension("tmp_json");
     if let Err(e) = fs::write(&tmp_sidecar_path, &json) {
         let _ = fs::remove_file(&tmp_sidecar_path);
-        return Err(format!("Failed to write temporary sidecar '{}': {}", tmp_sidecar_path.display(), e));
+        return Err(format!(
+            "Failed to write temporary sidecar '{}': {}",
+            tmp_sidecar_path.display(),
+            e
+        ));
     }
 
     if let Err(e) = fs::rename(&tmp_sidecar_path, &sidecar_path) {
@@ -150,7 +211,11 @@ pub fn write_sidecar_next_to_video(
         ));
     }
 
-    tracing::info!("Written UUID sidecar atomically: {} (id={})", sidecar_path.display(), uuid);
+    tracing::info!(
+        "Written UUID sidecar atomically: {} (id={})",
+        sidecar_path.display(),
+        uuid
+    );
     Ok(sidecar_path)
 }
 

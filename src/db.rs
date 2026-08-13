@@ -53,7 +53,8 @@ pub struct AssetResponse {
 impl From<MediaAsset> for AssetResponse {
     fn from(a: MediaAsset) -> Self {
         let warnings: Vec<String> = serde_json::from_str(&a.warnings).unwrap_or_default();
-        let keyframe_offsets: Vec<i64> = serde_json::from_str(&a.keyframe_offsets_json).unwrap_or_default();
+        let keyframe_offsets: Vec<i64> =
+            serde_json::from_str(&a.keyframe_offsets_json).unwrap_or_default();
         Self {
             uuid: a.uuid.clone(),
             playoutvue_id: a.uuid,
@@ -116,7 +117,9 @@ pub async fn recover_failed_assets(
     if !auto_retry {
         return Ok(out);
     }
-    let canonical_watch = watch_folder.canonicalize().unwrap_or_else(|_| watch_folder.to_path_buf());
+    let canonical_watch = watch_folder
+        .canonicalize()
+        .unwrap_or_else(|_| watch_folder.to_path_buf());
     for status in ["error", "processing"] {
         let rows = find_all_with_status(pool, status).await?;
         for a in rows {
@@ -207,7 +210,13 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         let sql = format!(
             "ALTER TABLE media_assets ADD COLUMN {} {} NOT NULL DEFAULT {}",
             col,
-            if col == "fps" { "REAL" } else if col == "mezzanine_ok" { "BOOLEAN" } else { "INTEGER" },
+            if col == "fps" {
+                "REAL"
+            } else if col == "mezzanine_ok" {
+                "BOOLEAN"
+            } else {
+                "INTEGER"
+            },
             default
         );
         if let Err(e) = sqlx::query(&sql).execute(&pool).await {
@@ -216,11 +225,10 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     }
 
     {
-        let rows: Vec<(String, String)> = sqlx::query_as(
-            "SELECT uuid, current_path FROM media_assets WHERE display_name = ''",
-        )
-        .fetch_all(&pool)
-        .await?;
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT uuid, current_path FROM media_assets WHERE display_name = ''")
+                .fetch_all(&pool)
+                .await?;
 
         if !rows.is_empty() {
             tracing::info!(
@@ -233,22 +241,19 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| uuid.clone());
                 let display_name: String = stem.chars().take(255).collect();
-                let _ = sqlx::query(
-                    "UPDATE media_assets SET display_name = ?1 WHERE uuid = ?2",
-                )
-                .bind(&display_name)
-                .bind(uuid)
-                .execute(&pool)
-                .await;
+                let _ = sqlx::query("UPDATE media_assets SET display_name = ?1 WHERE uuid = ?2")
+                    .bind(&display_name)
+                    .bind(uuid)
+                    .execute(&pool)
+                    .await;
             }
         }
     }
 
-    let result = sqlx::query(
-        "UPDATE media_assets SET status = 'error' WHERE status = 'processing'",
-    )
-    .execute(&pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE media_assets SET status = 'error' WHERE status = 'processing'")
+            .execute(&pool)
+            .await?;
     if result.rows_affected() > 0 {
         tracing::warn!(
             "Recovered {} orphaned asset row(s) left in 'processing' state (marked 'error'); recovery sweep will purge eligible ones",
@@ -363,7 +368,10 @@ pub async fn find_by_fingerprint(
     pool: &SqlitePool,
     fingerprint: i64,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
-    let sql = format!("SELECT {} FROM media_assets WHERE fingerprint = ?1", SELECT_COLS);
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE fingerprint = ?1",
+        SELECT_COLS
+    );
     sqlx::query_as::<_, MediaAsset>(&sql)
         .bind(fingerprint)
         .fetch_optional(pool)
@@ -371,12 +379,11 @@ pub async fn find_by_fingerprint(
 }
 
 pub async fn count_rows_by_path(pool: &SqlitePool, current_path: &str) -> Result<i64, sqlx::Error> {
-    let (count,): (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM media_assets WHERE current_path = ?1",
-    )
-    .bind(current_path)
-    .fetch_one(pool)
-    .await?;
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_assets WHERE current_path = ?1")
+            .bind(current_path)
+            .fetch_one(pool)
+            .await?;
     Ok(count)
 }
 
@@ -386,22 +393,17 @@ pub async fn set_trim(
     trim_in_ms: i64,
     trim_out_ms: i64,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE media_assets SET trim_in_ms = ?1, trim_out_ms = ?2 WHERE uuid = ?3",
-    )
-    .bind(trim_in_ms)
-    .bind(trim_out_ms)
-    .bind(uuid)
-    .execute(pool)
-    .await?;
+    let result =
+        sqlx::query("UPDATE media_assets SET trim_in_ms = ?1, trim_out_ms = ?2 WHERE uuid = ?3")
+            .bind(trim_in_ms)
+            .bind(trim_out_ms)
+            .bind(uuid)
+            .execute(pool)
+            .await?;
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn set_rating(
-    pool: &SqlitePool,
-    uuid: &str,
-    rating: &str,
-) -> Result<bool, sqlx::Error> {
+pub async fn set_rating(pool: &SqlitePool, uuid: &str, rating: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE uuid = ?2")
         .bind(rating)
         .bind(uuid)
@@ -410,11 +412,7 @@ pub async fn set_rating(
     Ok(result.rows_affected() > 0)
 }
 
-pub async fn set_tp(
-    pool: &SqlitePool,
-    uuid: &str,
-    tp: &str,
-) -> Result<bool, sqlx::Error> {
+pub async fn set_tp(pool: &SqlitePool, uuid: &str, tp: &str) -> Result<bool, sqlx::Error> {
     let result = sqlx::query("UPDATE media_assets SET tp = ?1 WHERE uuid = ?2")
         .bind(tp)
         .bind(uuid)
@@ -476,7 +474,10 @@ pub async fn purge_row_by_uuid(pool: &SqlitePool, uuid: &str) -> Result<u64, sql
     Ok(result.rows_affected())
 }
 
-pub async fn purge_rows_by_fingerprint(pool: &SqlitePool, fingerprint: i64) -> Result<u64, sqlx::Error> {
+pub async fn purge_rows_by_fingerprint(
+    pool: &SqlitePool,
+    fingerprint: i64,
+) -> Result<u64, sqlx::Error> {
     let result = sqlx::query("DELETE FROM media_assets WHERE fingerprint = ?1")
         .bind(fingerprint)
         .execute(pool)
@@ -540,7 +541,11 @@ pub async fn purge_asset_with_mode(
                 Ok(_) => sidecar_removed = true,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => sidecar_removed = false,
                 Err(e) => {
-                    tracing::warn!("Failed to remove sidecar file at {}: {}", sidecar_path.display(), e);
+                    tracing::warn!(
+                        "Failed to remove sidecar file at {}: {}",
+                        sidecar_path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -627,9 +632,7 @@ pub async fn find_all(
             .fetch_all(pool)
             .await
     } else {
-        sqlx::query_as::<_, MediaAsset>(&sql)
-            .fetch_all(pool)
-            .await
+        sqlx::query_as::<_, MediaAsset>(&sql).fetch_all(pool).await
     }
 }
 
@@ -722,13 +725,33 @@ mod tests {
         std::fs::File::create(&sidecar_path).unwrap();
 
         let uuid = "parent-1";
-        insert_processing(&pool, uuid, 12345, &video_path.to_string_lossy(), "video1").await.unwrap();
-        mark_ready(&pool, uuid, &video_path.to_string_lossy(), 10000, true, 25.0, 25, 1, 250, 50, 0, &[], "[]").await.unwrap();
+        insert_processing(&pool, uuid, 12345, &video_path.to_string_lossy(), "video1")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            uuid,
+            &video_path.to_string_lossy(),
+            10000,
+            true,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &[],
+            "[]",
+        )
+        .await
+        .unwrap();
 
         assert!(video_path.exists());
         assert!(sidecar_path.exists());
 
-        let outcome = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        let outcome = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine)
+            .await
+            .unwrap();
         assert_eq!(outcome.rows_deleted, 1);
         assert!(outcome.file_removed);
         assert!(outcome.sidecar_removed);
@@ -752,31 +775,92 @@ mod tests {
         let parent_uuid = "parent-shared";
         let subclip_uuid = "subclip-shared";
 
-        insert_processing(&pool, parent_uuid, 67890, &video_path.to_string_lossy(), "shared").await.unwrap();
-        mark_ready(&pool, parent_uuid, &video_path.to_string_lossy(), 20000, true, 25.0, 25, 1, 500, 50, 0, &[], "[]").await.unwrap();
+        insert_processing(
+            &pool,
+            parent_uuid,
+            67890,
+            &video_path.to_string_lossy(),
+            "shared",
+        )
+        .await
+        .unwrap();
+        mark_ready(
+            &pool,
+            parent_uuid,
+            &video_path.to_string_lossy(),
+            20000,
+            true,
+            25.0,
+            25,
+            1,
+            500,
+            50,
+            0,
+            &[],
+            "[]",
+        )
+        .await
+        .unwrap();
 
-        create_subclip(&pool, subclip_uuid, parent_uuid, "subclip_1", 5000, 15000, true, "[]").await.unwrap();
+        create_subclip(
+            &pool,
+            subclip_uuid,
+            parent_uuid,
+            "subclip_1",
+            5000,
+            15000,
+            true,
+            "[]",
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(count_rows_by_path(&pool, &video_path.to_string_lossy()).await.unwrap(), 2);
+        assert_eq!(
+            count_rows_by_path(&pool, &video_path.to_string_lossy())
+                .await
+                .unwrap(),
+            2
+        );
 
         // Purge parent only
-        let outcome = purge_asset_with_mode(&pool, parent_uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        let outcome =
+            purge_asset_with_mode(&pool, parent_uuid, PurgeMode::PreserveReferencedMezzanine)
+                .await
+                .unwrap();
         assert_eq!(outcome.rows_deleted, 1);
-        assert!(!outcome.file_removed, "Mezzanine file MUST be preserved while subclip references it");
-        assert!(!outcome.sidecar_removed, "Sidecar MUST be preserved while subclip references it");
+        assert!(
+            !outcome.file_removed,
+            "Mezzanine file MUST be preserved while subclip references it"
+        );
+        assert!(
+            !outcome.sidecar_removed,
+            "Sidecar MUST be preserved while subclip references it"
+        );
 
         assert!(video_path.exists());
         assert!(sidecar_path.exists());
         assert!(find_by_uuid(&pool, parent_uuid).await.unwrap().is_none());
 
-        let subclip = find_by_uuid(&pool, subclip_uuid).await.unwrap().expect("Subclip must still exist in DB");
+        let subclip = find_by_uuid(&pool, subclip_uuid)
+            .await
+            .unwrap()
+            .expect("Subclip must still exist in DB");
         assert_eq!(subclip.current_path, video_path.to_string_lossy());
 
         // Now purge subclip (final reference)
-        let outcome2 = purge_asset_with_mode(&pool, subclip_uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        let outcome2 =
+            purge_asset_with_mode(&pool, subclip_uuid, PurgeMode::PreserveReferencedMezzanine)
+                .await
+                .unwrap();
         assert_eq!(outcome2.rows_deleted, 1);
-        assert!(outcome2.file_removed, "Mezzanine file MUST be removed once final reference is purged");
-        assert!(outcome2.sidecar_removed, "Sidecar MUST be removed once final reference is purged");
+        assert!(
+            outcome2.file_removed,
+            "Mezzanine file MUST be removed once final reference is purged"
+        );
+        assert!(
+            outcome2.sidecar_removed,
+            "Sidecar MUST be removed once final reference is purged"
+        );
 
         assert!(!video_path.exists());
         assert!(!sidecar_path.exists());
@@ -794,19 +878,59 @@ mod tests {
         let sub1 = "subclip-1";
         let sub2 = "subclip-2";
 
-        insert_processing(&pool, parent_uuid, 11111, &video_path.to_string_lossy(), "multi").await.unwrap();
-        mark_ready(&pool, parent_uuid, &video_path.to_string_lossy(), 30000, true, 25.0, 25, 1, 750, 50, 0, &[], "[]").await.unwrap();
+        insert_processing(
+            &pool,
+            parent_uuid,
+            11111,
+            &video_path.to_string_lossy(),
+            "multi",
+        )
+        .await
+        .unwrap();
+        mark_ready(
+            &pool,
+            parent_uuid,
+            &video_path.to_string_lossy(),
+            30000,
+            true,
+            25.0,
+            25,
+            1,
+            750,
+            50,
+            0,
+            &[],
+            "[]",
+        )
+        .await
+        .unwrap();
 
-        create_subclip(&pool, sub1, parent_uuid, "sub1", 1000, 5000, true, "[]").await.unwrap();
-        create_subclip(&pool, sub2, parent_uuid, "sub2", 6000, 10000, true, "[]").await.unwrap();
+        create_subclip(&pool, sub1, parent_uuid, "sub1", 1000, 5000, true, "[]")
+            .await
+            .unwrap();
+        create_subclip(&pool, sub2, parent_uuid, "sub2", 6000, 10000, true, "[]")
+            .await
+            .unwrap();
 
-        assert_eq!(count_rows_by_path(&pool, &video_path.to_string_lossy()).await.unwrap(), 3);
+        assert_eq!(
+            count_rows_by_path(&pool, &video_path.to_string_lossy())
+                .await
+                .unwrap(),
+            3
+        );
 
-        let out = purge_asset_with_mode(&pool, sub1, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        let out = purge_asset_with_mode(&pool, sub1, PurgeMode::PreserveReferencedMezzanine)
+            .await
+            .unwrap();
         assert_eq!(out.rows_deleted, 1);
         assert!(!out.file_removed);
         assert!(video_path.exists());
-        assert_eq!(count_rows_by_path(&pool, &video_path.to_string_lossy()).await.unwrap(), 2);
+        assert_eq!(
+            count_rows_by_path(&pool, &video_path.to_string_lossy())
+                .await
+                .unwrap(),
+            2
+        );
 
         let _ = std::fs::remove_file(&video_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
@@ -819,11 +943,18 @@ mod tests {
         std::fs::File::create(&staging_path).unwrap();
 
         let uuid = "failed-staging-asset";
-        insert_processing(&pool, uuid, 99999, &staging_path.to_string_lossy(), "video").await.unwrap();
+        insert_processing(&pool, uuid, 99999, &staging_path.to_string_lossy(), "video")
+            .await
+            .unwrap();
 
-        let out = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        let out = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine)
+            .await
+            .unwrap();
         assert_eq!(out.rows_deleted, 1);
-        assert!(!out.file_removed, "Staging file must not be deleted through asset purge");
+        assert!(
+            !out.file_removed,
+            "Staging file must not be deleted through asset purge"
+        );
 
         let _ = std::fs::remove_file(&staging_path);
         let _ = std::fs::remove_dir_all(&temp_dir);

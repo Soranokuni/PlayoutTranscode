@@ -19,8 +19,12 @@ pub struct PathsConfig {
     pub target_folder: String,
 }
 
-fn default_watch() -> String { String::new() }
-fn default_target() -> String { String::new() }
+fn default_watch() -> String {
+    String::new()
+}
+fn default_target() -> String {
+    String::new()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
@@ -30,8 +34,12 @@ pub struct ServerConfig {
     pub bind_address: String,
 }
 
-fn default_web_port() -> u16 { 4353 }
-fn default_bind_address() -> String { "127.0.0.1".to_string() }
+fn default_web_port() -> u16 {
+    4353
+}
+fn default_bind_address() -> String {
+    "127.0.0.1".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EncodingConfig {
@@ -55,14 +63,30 @@ pub struct EncodingConfig {
     pub analyzeduration: String,
 }
 
-fn default_preset() -> String { "medium".into() }
-fn default_threads() -> usize { 0 }
-fn default_cpu_cores() -> usize { 0 }
-fn default_audio_codec() -> String { "aac".into() }
-fn default_audio_bitrate() -> String { "320k".into() }
-fn default_tune() -> String { "film".into() }
-fn default_probesize() -> String { "500M".into() }
-fn default_analyzeduration() -> String { "500M".into() }
+fn default_preset() -> String {
+    "medium".into()
+}
+fn default_threads() -> usize {
+    0
+}
+fn default_cpu_cores() -> usize {
+    0
+}
+fn default_audio_codec() -> String {
+    "aac".into()
+}
+fn default_audio_bitrate() -> String {
+    "320k".into()
+}
+fn default_tune() -> String {
+    "film".into()
+}
+fn default_probesize() -> String {
+    "500M".into()
+}
+fn default_analyzeduration() -> String {
+    "500M".into()
+}
 
 /// Number of physical/logical cores available on this machine.
 pub fn available_logical_cores() -> usize {
@@ -109,23 +133,45 @@ pub struct ProfileConfig {
     pub bufsize: String,
 }
 
-fn default_enabled() -> bool { true }
+fn default_enabled() -> bool {
+    true
+}
 
 impl Default for ProfileConfig {
     fn default() -> Self {
-        Self { enabled: true, crf: 24, maxrate: "15M".into(), bufsize: "16M".into() }
+        Self {
+            enabled: true,
+            crf: 24,
+            maxrate: "15M".into(),
+            bufsize: "16M".into(),
+        }
     }
 }
 
 impl ProfileConfig {
     pub fn profile_a_default() -> Self {
-        Self { enabled: true, crf: 24, maxrate: "15M".into(), bufsize: "16M".into() }
+        Self {
+            enabled: true,
+            crf: 24,
+            maxrate: "15M".into(),
+            bufsize: "16M".into(),
+        }
     }
     pub fn profile_b_default() -> Self {
-        Self { enabled: true, crf: 23, maxrate: "15M".into(), bufsize: "16M".into() }
+        Self {
+            enabled: true,
+            crf: 23,
+            maxrate: "15M".into(),
+            bufsize: "16M".into(),
+        }
     }
     pub fn profile_c_default() -> Self {
-        Self { enabled: true, crf: 20, maxrate: "5M".into(), bufsize: "6M".into() }
+        Self {
+            enabled: true,
+            crf: 20,
+            maxrate: "5M".into(),
+            bufsize: "6M".into(),
+        }
     }
 }
 
@@ -160,14 +206,30 @@ pub struct IngestionConfig {
     pub exclude_extensions: Vec<String>,
 }
 
-fn default_settle() -> u64 { 5 }
-fn default_poll() -> u64 { 10 }
-fn default_concurrency() -> usize { 2 }
-fn default_stable_polls() -> u32 { 2 }
-fn default_retry_policy() -> String { "once".into() }
-fn default_auto_retry_on_start() -> bool { true }
-fn default_max_attempts() -> u32 { 2 }
-fn default_retry_delay_ms() -> u64 { 2000 }
+fn default_settle() -> u64 {
+    5
+}
+fn default_poll() -> u64 {
+    10
+}
+fn default_concurrency() -> usize {
+    2
+}
+fn default_stable_polls() -> u32 {
+    2
+}
+fn default_retry_policy() -> String {
+    "once".into()
+}
+fn default_auto_retry_on_start() -> bool {
+    true
+}
+fn default_max_attempts() -> u32 {
+    2
+}
+fn default_retry_delay_ms() -> u64 {
+    2000
+}
 
 impl Default for IngestionConfig {
     fn default() -> Self {
@@ -195,12 +257,19 @@ pub struct LoggingConfig {
     pub log_file: String,
 }
 
-fn default_log_level() -> String { "info".into() }
-fn default_log_file() -> String { "transcode.log".into() }
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_log_file() -> String {
+    "transcode.log".into()
+}
 
 impl Default for LoggingConfig {
     fn default() -> Self {
-        Self { level: "info".into(), log_file: "transcode.log".into() }
+        Self {
+            level: "info".into(),
+            log_file: "transcode.log".into(),
+        }
     }
 }
 
@@ -250,8 +319,12 @@ pub struct AudioPolicy {
     pub preserve_original: bool,
 }
 
-fn default_sample_rate() -> u32 { 48000 }
-fn default_channels() -> u32 { 2 }
+fn default_sample_rate() -> u32 {
+    48000
+}
+fn default_channels() -> u32 {
+    2
+}
 
 impl Default for AudioPolicy {
     fn default() -> Self {
@@ -285,8 +358,12 @@ pub struct ValidationPolicy {
     pub strict_ready_blocking: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_dur_tolerance() -> i64 { 80 }
+fn default_true() -> bool {
+    true
+}
+fn default_dur_tolerance() -> i64 {
+    80
+}
 
 impl Default for ValidationPolicy {
     fn default() -> Self {
@@ -360,7 +437,9 @@ impl Default for ToolchainPolicy {
     }
 }
 
-fn default_config_version() -> u32 { 1 }
+fn default_config_version() -> u32 {
+    1
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -398,14 +477,22 @@ pub struct AppConfig {
     pub toolchain_policy: Option<ToolchainPolicy>,
 }
 
-fn default_initialized() -> bool { false }
+fn default_initialized() -> bool {
+    false
+}
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
             version: 1,
-            paths: PathsConfig { watch_folder: String::new(), target_folder: String::new() },
-            server: ServerConfig { web_port: 4353, bind_address: "127.0.0.1".into() },
+            paths: PathsConfig {
+                watch_folder: String::new(),
+                target_folder: String::new(),
+            },
+            server: ServerConfig {
+                web_port: 4353,
+                bind_address: "127.0.0.1".into(),
+            },
             encoding: EncodingConfig {
                 preset: "medium".into(),
                 ffmpeg_threads: 0,
@@ -502,9 +589,7 @@ impl AppConfig {
     }
 
     pub fn load(path: Option<&str>) -> Result<(Self, PathBuf), String> {
-        let config_path = path
-            .map(PathBuf::from)
-            .unwrap_or_else(default_config_path);
+        let config_path = path.map(PathBuf::from).unwrap_or_else(default_config_path);
 
         if !config_path.exists() {
             let defaults = Self::default();
@@ -549,10 +634,8 @@ impl AppConfig {
             &config.paths.target_folder,
         )?;
 
-        let port_str = prompt_with_default(
-            "Web Monitor Port",
-            &config.server.web_port.to_string(),
-        )?;
+        let port_str =
+            prompt_with_default("Web Monitor Port", &config.server.web_port.to_string())?;
         if let Ok(p) = port_str.parse::<u16>() {
             config.server.web_port = p;
         }
@@ -563,14 +646,27 @@ impl AppConfig {
             &config.encoding.preset,
         )?;
 
-        let crf_a = prompt_with_default("Profile A (HD Progressive) CRF", &config.profile_a.crf.to_string())?;
-        if let Ok(c) = crf_a.parse() { config.profile_a.crf = c; }
+        let crf_a = prompt_with_default(
+            "Profile A (HD Progressive) CRF",
+            &config.profile_a.crf.to_string(),
+        )?;
+        if let Ok(c) = crf_a.parse() {
+            config.profile_a.crf = c;
+        }
 
-        let crf_b = prompt_with_default("Profile B (HD Interlaced) CRF", &config.profile_b.crf.to_string())?;
-        if let Ok(c) = crf_b.parse() { config.profile_b.crf = c; }
+        let crf_b = prompt_with_default(
+            "Profile B (HD Interlaced) CRF",
+            &config.profile_b.crf.to_string(),
+        )?;
+        if let Ok(c) = crf_b.parse() {
+            config.profile_b.crf = c;
+        }
 
-        let crf_c = prompt_with_default("Profile C (SD PAL) CRF", &config.profile_c.crf.to_string())?;
-        if let Ok(c) = crf_c.parse() { config.profile_c.crf = c; }
+        let crf_c =
+            prompt_with_default("Profile C (SD PAL) CRF", &config.profile_c.crf.to_string())?;
+        if let Ok(c) = crf_c.parse() {
+            config.profile_c.crf = c;
+        }
 
         let audio_opts = "aac|pcm_s16le";
         config.encoding.audio_codec = prompt_with_default(
@@ -579,13 +675,16 @@ impl AppConfig {
         )?;
 
         let tune_opts = "film|grain|animation|none";
-        config.encoding.tune = prompt_with_default(
-            &format!("x264 tune ({})", tune_opts),
-            &config.encoding.tune,
-        )?;
+        config.encoding.tune =
+            prompt_with_default(&format!("x264 tune ({})", tune_opts), &config.encoding.tune)?;
 
-        let concurrency = prompt_with_default("Max concurrent encodes", &config.ingestion.max_concurrency.to_string())?;
-        if let Ok(c) = concurrency.parse() { config.ingestion.max_concurrency = c; }
+        let concurrency = prompt_with_default(
+            "Max concurrent encodes",
+            &config.ingestion.max_concurrency.to_string(),
+        )?;
+        if let Ok(c) = concurrency.parse() {
+            config.ingestion.max_concurrency = c;
+        }
 
         config.initialized = true;
         let path = default_config_path();
@@ -605,23 +704,47 @@ impl AppConfig {
         }
         let watch = std::path::Path::new(&self.paths.watch_folder);
         if !watch.exists() || !watch.is_dir() {
-            return Err(format!("Watch folder does not exist: {}", self.paths.watch_folder));
+            return Err(format!(
+                "Watch folder does not exist: {}",
+                self.paths.watch_folder
+            ));
         }
         fs::create_dir_all(&self.paths.target_folder)
             .map_err(|e| format!("Cannot create target folder: {}", e))?;
 
-        let valid_presets = ["ultrafast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"];
+        let valid_presets = [
+            "ultrafast",
+            "veryfast",
+            "faster",
+            "fast",
+            "medium",
+            "slow",
+            "slower",
+            "veryslow",
+        ];
         if !valid_presets.contains(&self.encoding.preset.as_str()) {
-            return Err(format!("Invalid preset '{}'. Valid: {:?}", self.encoding.preset, valid_presets));
+            return Err(format!(
+                "Invalid preset '{}'. Valid: {:?}",
+                self.encoding.preset, valid_presets
+            ));
         }
         let valid_audio = ["aac", "pcm_s16le", "libmp3lame"];
         if !valid_audio.contains(&self.encoding.audio_codec.as_str()) {
-            return Err(format!("Invalid audio codec '{}'. Valid: {:?}", self.encoding.audio_codec, valid_audio));
+            return Err(format!(
+                "Invalid audio codec '{}'. Valid: {:?}",
+                self.encoding.audio_codec, valid_audio
+            ));
         }
 
-        if self.profile_a.crf > 51 { return Err("Profile A CRF must be 0-51".into()); }
-        if self.profile_b.crf > 51 { return Err("Profile B CRF must be 0-51".into()); }
-        if self.profile_c.crf > 51 { return Err("Profile C CRF must be 0-51".into()); }
+        if self.profile_a.crf > 51 {
+            return Err("Profile A CRF must be 0-51".into());
+        }
+        if self.profile_b.crf > 51 {
+            return Err("Profile B CRF must be 0-51".into());
+        }
+        if self.profile_c.crf > 51 {
+            return Err("Profile C CRF must be 0-51".into());
+        }
 
         if self.ingestion.max_concurrency == 0 {
             return Err("max_concurrency must be at least 1".into());
@@ -637,7 +760,9 @@ impl AppConfig {
             ));
         }
         // Warn (not fail) if the configured budget can oversubscribe the host.
-        let total = self.encoding.effective_total_threads(self.ingestion.max_concurrency);
+        let total = self
+            .encoding
+            .effective_total_threads(self.ingestion.max_concurrency);
         if total > max_cores {
             tracing::warn!(
                 "Thread budget oversubscription: effective {} threads across {} encodes on {} logical cores",
@@ -650,12 +775,18 @@ impl AppConfig {
         if audio_pol.mode == AudioMode::EbuR128 || audio_pol.mode == AudioMode::AtscA85 {
             if let Some(lufs) = audio_pol.target_lufs {
                 if !(-70.0..=0.0).contains(&lufs) {
-                    return Err(format!("AudioPolicy target_lufs ({}) must be between -70.0 and 0.0", lufs));
+                    return Err(format!(
+                        "AudioPolicy target_lufs ({}) must be between -70.0 and 0.0",
+                        lufs
+                    ));
                 }
             }
             if let Some(tp) = audio_pol.true_peak_dbtp {
                 if !(-10.0..=0.0).contains(&tp) {
-                    return Err(format!("AudioPolicy true_peak_dbtp ({}) must be between -10.0 and 0.0", tp));
+                    return Err(format!(
+                        "AudioPolicy true_peak_dbtp ({}) must be between -10.0 and 0.0",
+                        tp
+                    ));
                 }
             }
         }
@@ -682,10 +813,14 @@ fn prompt(label: &str, default: &str) -> Result<String, String> {
         print!(" [{}]", default);
     }
     print!(": ");
-    io::stdout().flush().map_err(|e| format!("IO error: {}", e))?;
+    io::stdout()
+        .flush()
+        .map_err(|e| format!("IO error: {}", e))?;
 
     let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(|e| format!("IO error: {}", e))?;
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| format!("IO error: {}", e))?;
     let trimmed = input.trim().to_string();
     if trimmed.is_empty() && !default.is_empty() {
         Ok(default.to_string())
@@ -727,10 +862,16 @@ clean_source_after_success = true
 
         let cfg: AppConfig = toml::from_str(v1_toml).expect("V1 TOML must parse without error");
 
-        assert_eq!(cfg.version, 1, "Unversioned config must default to version 1");
+        assert_eq!(
+            cfg.version, 1,
+            "Unversioned config must default to version 1"
+        );
         assert_eq!(cfg.paths.watch_folder, "C:/test/in");
         assert_eq!(cfg.encoding.preset, "fast");
-        assert!(cfg.audio_policy.is_none(), "Unversioned config must have None for explicit audio_policy");
+        assert!(
+            cfg.audio_policy.is_none(),
+            "Unversioned config must have None for explicit audio_policy"
+        );
 
         let effective_audio = cfg.effective_audio_policy();
         assert_eq!(effective_audio.mode, AudioMode::LegacyV1Encode);
@@ -815,10 +956,16 @@ clean_source_after_success = false
             preserve_original: false,
         });
 
-        assert!(cfg.validate().is_err(), "Invalid target_lufs (-90) must fail validation");
+        assert!(
+            cfg.validate().is_err(),
+            "Invalid target_lufs (-90) must fail validation"
+        );
 
         cfg.audio_policy.as_mut().unwrap().target_lufs = Some(-23.0);
-        assert!(cfg.validate().is_ok(), "Valid LUFS (-23) must pass validation");
+        assert!(
+            cfg.validate().is_ok(),
+            "Valid LUFS (-23) must pass validation"
+        );
     }
 
     #[test]
@@ -842,12 +989,19 @@ clean_source_after_success = false
         });
 
         let serialized = toml::to_string_pretty(&cfg).expect("Serialization must succeed");
-        let deserialized: AppConfig = toml::from_str(&serialized).expect("Deserialization must succeed");
+        let deserialized: AppConfig =
+            toml::from_str(&serialized).expect("Deserialization must succeed");
 
         assert_eq!(deserialized.version, 2);
         assert_eq!(deserialized.paths.watch_folder, "D:/in");
-        assert_eq!(deserialized.effective_audio_policy().mode, AudioMode::AtscA85);
-        assert_eq!(deserialized.effective_audio_policy().target_lufs, Some(-24.0));
+        assert_eq!(
+            deserialized.effective_audio_policy().mode,
+            AudioMode::AtscA85
+        );
+        assert_eq!(
+            deserialized.effective_audio_policy().target_lufs,
+            Some(-24.0)
+        );
     }
 
     #[test]
@@ -864,7 +1018,8 @@ target_folder = "C:/test/out"
 feature_x = true
 "#;
 
-        let cfg: AppConfig = toml::from_str(future_toml).expect("Unknown future fields must be ignored");
+        let cfg: AppConfig =
+            toml::from_str(future_toml).expect("Unknown future fields must be ignored");
         assert_eq!(cfg.version, 3);
         assert_eq!(cfg.paths.watch_folder, "C:/test/in");
     }

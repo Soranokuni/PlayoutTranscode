@@ -41,7 +41,10 @@ impl ServiceHandle {
         if !self.is_running() {
             return Err("Service is not running".into());
         }
-        let guard = self.retry_tx.lock().map_err(|e| format!("retry channel lock: {}", e))?;
+        let guard = self
+            .retry_tx
+            .lock()
+            .map_err(|e| format!("retry channel lock: {}", e))?;
         match guard.as_ref() {
             Some(tx) => tx
                 .try_send(path)
@@ -137,8 +140,12 @@ pub fn start_processing_loop(
 
     handle.add_log("info", "Transcoding service started");
 
-    let per_encode_threads = config.encoding.effective_threads_per_encode(config.ingestion.max_concurrency);
-    let total_threads = config.encoding.effective_total_threads(config.ingestion.max_concurrency);
+    let per_encode_threads = config
+        .encoding
+        .effective_threads_per_encode(config.ingestion.max_concurrency);
+    let total_threads = config
+        .encoding
+        .effective_total_threads(config.ingestion.max_concurrency);
     handle.add_log(
         "info",
         &format!(
@@ -279,14 +286,12 @@ pub fn trigger_download(handle: &ServiceHandle) -> bool {
     handle.add_log("info", "Starting FFmpeg download (full build)...");
 
     let h = handle.clone();
-    std::thread::spawn(move || {
-        match crate::bootstrap::download_ffmpeg() {
-            Ok(_) => {
-                *h.download_status.lock() = Some("ok".to_string());
-            }
-            Err(e) => {
-                *h.download_status.lock() = Some(format!("error: {}", e));
-            }
+    std::thread::spawn(move || match crate::bootstrap::download_ffmpeg() {
+        Ok(_) => {
+            *h.download_status.lock() = Some("ok".to_string());
+        }
+        Err(e) => {
+            *h.download_status.lock() = Some(format!("error: {}", e));
         }
     });
     true
