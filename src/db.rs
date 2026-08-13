@@ -484,39 +484,81 @@ pub async fn purge_rows_by_fingerprint(pool: &SqlitePool, fingerprint: i64) -> R
     Ok(result.rows_affected())
 }
 
-pub async fn purge_asset_completely(
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PurgeMode {
+    #[default]
+    PreserveReferencedMezzanine,
+    DeleteUnreferencedMezzanine,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PurgeOutcome {
+    pub rows_deleted: u64,
+    pub file_removed: bool,
+    pub sidecar_removed: bool,
+}
+
+pub async fn purge_asset_with_mode(
     pool: &SqlitePool,
     uuid: &str,
+    mode: PurgeMode,
 ) -> Result<PurgeOutcome, sqlx::Error> {
     let asset = find_by_uuid(pool, uuid).await?;
     let Some(a) = asset else {
-        return Ok(PurgeOutcome { rows_deleted: 0, file_removed: false });
+        return Ok(PurgeOutcome {
+            rows_deleted: 0,
+            file_removed: false,
+            sidecar_removed: false,
+        });
     };
 
     let path = a.current_path.clone();
     purge_row_by_uuid(pool, uuid).await?;
 
-    let refs = count_rows_by_path(pool, &path).await?;
-    let file_removed = if refs == 0 && !path.is_empty() {
-        match tokio::fs::remove_file(&path).await {
-            Ok(_) => true,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-            Err(e) => {
-                tracing::warn!("Failed to remove physical file at {}: {}", path, e);
-                false
-            }
-        }
-    } else {
-        false
+    let remaining_refs = count_rows_by_path(pool, &path).await?;
+    let should_remove_file = match mode {
+        PurgeMode::PreserveReferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
+        PurgeMode::DeleteUnreferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
     };
 
-    Ok(PurgeOutcome { rows_deleted: 1, file_removed })
+    let mut file_removed = false;
+    let mut sidecar_removed = false;
+
+    if should_remove_file {
+        let media_path = Path::new(&path);
+        if !crate::watcher::is_temp_file_name(media_path) {
+            match tokio::fs::remove_file(media_path).await {
+                Ok(_) => file_removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => file_removed = false,
+                Err(e) => {
+                    tracing::warn!("Failed to remove physical file at {}: {}", path, e);
+                }
+            }
+
+            let sidecar_path = crate::identity::sidecar_path_for(media_path);
+            match tokio::fs::remove_file(&sidecar_path).await {
+                Ok(_) => sidecar_removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => sidecar_removed = false,
+                Err(e) => {
+                    tracing::warn!("Failed to remove sidecar file at {}: {}", sidecar_path.display(), e);
+                }
+            }
+        }
+    }
+
+    Ok(PurgeOutcome {
+        rows_deleted: 1,
+        file_removed,
+        sidecar_removed,
+    })
 }
 
-#[derive(Debug, Serialize)]
-pub struct PurgeOutcome {
-    pub rows_deleted: u64,
-    pub file_removed: bool,
+#[allow(dead_code)]
+pub async fn purge_asset_completely(
+    pool: &SqlitePool,
+    uuid: &str,
+) -> Result<PurgeOutcome, sqlx::Error> {
+    purge_asset_with_mode(pool, uuid, PurgeMode::PreserveReferencedMezzanine).await
 }
 
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
@@ -660,5 +702,130 @@ mod tests {
         assert!(!is_valid_virtual_folder("news"));
         assert!(!is_valid_virtual_folder("/../etc"));
         assert!(!is_valid_virtual_folder("/news/"));
+    }
+
+    async fn setup_test_pool() -> (SqlitePool, std::path::PathBuf) {
+        let temp_dir = std::env::temp_dir().join(format!("pt_test_purge_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let db_path = temp_dir.join("test.db");
+        let pool = init_pool(&db_path).await.expect("init_pool failed");
+        (pool, temp_dir)
+    }
+
+    #[tokio::test]
+    async fn test_purge_parent_with_no_subclips() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let video_path = temp_dir.join("video1.mp4");
+        let sidecar_path = crate::identity::sidecar_path_for(&video_path);
+
+        std::fs::File::create(&video_path).unwrap();
+        std::fs::File::create(&sidecar_path).unwrap();
+
+        let uuid = "parent-1";
+        insert_processing(&pool, uuid, 12345, &video_path.to_string_lossy(), "video1").await.unwrap();
+        mark_ready(&pool, uuid, &video_path.to_string_lossy(), 10000, true, 25.0, 25, 1, 250, 50, 0, &[], "[]").await.unwrap();
+
+        assert!(video_path.exists());
+        assert!(sidecar_path.exists());
+
+        let outcome = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        assert_eq!(outcome.rows_deleted, 1);
+        assert!(outcome.file_removed);
+        assert!(outcome.sidecar_removed);
+
+        assert!(!video_path.exists());
+        assert!(!sidecar_path.exists());
+        assert!(find_by_uuid(&pool, uuid).await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_purge_parent_while_virtual_subclip_still_references_it() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let video_path = temp_dir.join("shared_mezzanine.mp4");
+        let sidecar_path = crate::identity::sidecar_path_for(&video_path);
+
+        std::fs::File::create(&video_path).unwrap();
+        std::fs::File::create(&sidecar_path).unwrap();
+
+        let parent_uuid = "parent-shared";
+        let subclip_uuid = "subclip-shared";
+
+        insert_processing(&pool, parent_uuid, 67890, &video_path.to_string_lossy(), "shared").await.unwrap();
+        mark_ready(&pool, parent_uuid, &video_path.to_string_lossy(), 20000, true, 25.0, 25, 1, 500, 50, 0, &[], "[]").await.unwrap();
+
+        create_subclip(&pool, subclip_uuid, parent_uuid, "subclip_1", 5000, 15000, true, "[]").await.unwrap();
+
+        assert_eq!(count_rows_by_path(&pool, &video_path.to_string_lossy()).await.unwrap(), 2);
+
+        // Purge parent only
+        let outcome = purge_asset_with_mode(&pool, parent_uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        assert_eq!(outcome.rows_deleted, 1);
+        assert!(!outcome.file_removed, "Mezzanine file MUST be preserved while subclip references it");
+        assert!(!outcome.sidecar_removed, "Sidecar MUST be preserved while subclip references it");
+
+        assert!(video_path.exists());
+        assert!(sidecar_path.exists());
+        assert!(find_by_uuid(&pool, parent_uuid).await.unwrap().is_none());
+
+        let subclip = find_by_uuid(&pool, subclip_uuid).await.unwrap().expect("Subclip must still exist in DB");
+        assert_eq!(subclip.current_path, video_path.to_string_lossy());
+
+        // Now purge subclip (final reference)
+        let outcome2 = purge_asset_with_mode(&pool, subclip_uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        assert_eq!(outcome2.rows_deleted, 1);
+        assert!(outcome2.file_removed, "Mezzanine file MUST be removed once final reference is purged");
+        assert!(outcome2.sidecar_removed, "Sidecar MUST be removed once final reference is purged");
+
+        assert!(!video_path.exists());
+        assert!(!sidecar_path.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_purge_one_of_multiple_subclips() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let video_path = temp_dir.join("multi_subclips.mp4");
+        std::fs::File::create(&video_path).unwrap();
+
+        let parent_uuid = "parent-multi";
+        let sub1 = "subclip-1";
+        let sub2 = "subclip-2";
+
+        insert_processing(&pool, parent_uuid, 11111, &video_path.to_string_lossy(), "multi").await.unwrap();
+        mark_ready(&pool, parent_uuid, &video_path.to_string_lossy(), 30000, true, 25.0, 25, 1, 750, 50, 0, &[], "[]").await.unwrap();
+
+        create_subclip(&pool, sub1, parent_uuid, "sub1", 1000, 5000, true, "[]").await.unwrap();
+        create_subclip(&pool, sub2, parent_uuid, "sub2", 6000, 10000, true, "[]").await.unwrap();
+
+        assert_eq!(count_rows_by_path(&pool, &video_path.to_string_lossy()).await.unwrap(), 3);
+
+        let out = purge_asset_with_mode(&pool, sub1, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        assert_eq!(out.rows_deleted, 1);
+        assert!(!out.file_removed);
+        assert!(video_path.exists());
+        assert_eq!(count_rows_by_path(&pool, &video_path.to_string_lossy()).await.unwrap(), 2);
+
+        let _ = std::fs::remove_file(&video_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_purge_never_deletes_staging_files() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let staging_path = temp_dir.join(".tmp_uuid1_video.mp4");
+        std::fs::File::create(&staging_path).unwrap();
+
+        let uuid = "failed-staging-asset";
+        insert_processing(&pool, uuid, 99999, &staging_path.to_string_lossy(), "video").await.unwrap();
+
+        let out = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine).await.unwrap();
+        assert_eq!(out.rows_deleted, 1);
+        assert!(!out.file_removed, "Staging file must not be deleted through asset purge");
+
+        let _ = std::fs::remove_file(&staging_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }
