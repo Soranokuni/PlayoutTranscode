@@ -1,0 +1,177 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2026-08-13T14:00:00Z",
+  "toolchain_note": "SHA-256 hashes are toolchain-specific and informational. Primary verification relies on normalized probe properties.",
+  "fixtures": [
+    {
+      "name": "video_only.mp4",
+      "class": "video_only",
+      "description": "Progressive HD video source (1920x1080, 25fps) without audio stream",
+      "expected_probe": {
+        "has_video": true,
+        "has_audio": false,
+        "duration_ms": 5000,
+        "width": 1920,
+        "height": 1080,
+        "fps_num": 25,
+        "fps_den": 1,
+        "video_codec": "h264",
+        "field_order": "progressive"
+      },
+      "expected_classification": {
+        "profile": "ProfileA",
+        "expected_status": "ready",
+        "expected_mezzanine_ok": true
+      }
+    },
+    {
+      "name": "audio_only.mp3",
+      "class": "audio_only",
+      "description": "Stereo MP3 audio source (44.1 kHz, 2ch) without video stream",
+      "expected_probe": {
+        "has_video": false,
+        "has_audio": true,
+        "duration_ms": 5000,
+        "audio_codec": "mp3",
+        "sample_rate": 44100,
+        "channels": 2
+      },
+      "expected_classification": {
+        "profile": "None",
+        "expected_status": "error",
+        "expected_mezzanine_ok": false
+      }
+    },
+    {
+      "name": "video_stereo.mp4",
+      "class": "video_stereo",
+      "description": "Progressive HD video source (1920x1080, 25fps) with 48 kHz stereo AAC audio",
+      "expected_probe": {
+        "has_video": true,
+        "has_audio": true,
+        "duration_ms": 5000,
+        "width": 1920,
+        "height": 1080,
+        "fps_num": 25,
+        "fps_den": 1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2,
+        "field_order": "progressive"
+      },
+      "expected_classification": {
+        "profile": "ProfileA",
+        "expected_status": "ready",
+        "expected_mezzanine_ok": true
+      }
+    },
+    {
+      "name": "multichannel.mkv",
+      "class": "multichannel",
+      "description": "Progressive HD video source (1920x1080, 25fps) with 5.1 / 6-channel PCM audio",
+      "expected_probe": {
+        "has_video": true,
+        "has_audio": true,
+        "duration_ms": 5000,
+        "width": 1920,
+        "height": 1080,
+        "fps_num": 25,
+        "fps_den": 1,
+        "video_codec": "h264",
+        "audio_codec": "pcm_s16le",
+        "sample_rate": 48000,
+        "channels": 6,
+        "field_order": "progressive"
+      },
+      "expected_classification": {
+        "profile": "ProfileA",
+        "expected_status": "ready",
+        "expected_mezzanine_ok": true
+      }
+    },
+    {
+      "name": "vfr_source.mp4",
+      "class": "vfr_source",
+      "description": "Variable frame rate video source normalized to 25/1 CFR by V1 transcoder",
+      "expected_probe": {
+        "has_video": true,
+        "has_audio": true,
+        "duration_ms": 5000,
+        "width": 1920,
+        "height": 1080,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2
+      },
+      "expected_classification": {
+        "profile": "ProfileA",
+        "expected_status": "ready",
+        "expected_mezzanine_ok": true
+      }
+    },
+    {
+      "name": "interlaced_tff.mp4",
+      "class": "interlaced_tff",
+      "description": "Interlaced 1080i50 top-field-first HD video source with stereo audio",
+      "expected_probe": {
+        "has_video": true,
+        "has_audio": true,
+        "duration_ms": 5000,
+        "width": 1920,
+        "height": 1080,
+        "fps_num": 25,
+        "fps_den": 1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2
+      },
+      "expected_classification": {
+        "profile": "ProfileB",
+        "expected_status": "ready",
+        "expected_mezzanine_ok": true
+      }
+    },
+    {
+      "name": "corrupt_truncated.mp4",
+      "class": "corrupt_truncated",
+      "description": "Corrupt or truncated MP4 container file expecting probe/encode failure",
+      "expected_probe": {
+        "has_video": false,
+        "has_audio": false,
+        "duration_ms": 0
+      },
+      "expected_classification": {
+        "profile": "None",
+        "expected_status": "error",
+        "expected_mezzanine_ok": false
+      }
+    },
+    {
+      "name": "mezzanine_compliant.mp4",
+      "class": "mezzanine_compliant",
+      "description": "Fully compliant broadcast mezzanine file (Profile A, closed GOP 50, faststart, 48 kHz stereo AAC)",
+      "expected_probe": {
+        "has_video": true,
+        "has_audio": true,
+        "duration_ms": 5000,
+        "width": 1920,
+        "height": 1080,
+        "fps_num": 25,
+        "fps_den": 1,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "sample_rate": 48000,
+        "channels": 2,
+        "field_order": "progressive"
+      },
+      "expected_classification": {
+        "profile": "ProfileA",
+        "expected_status": "ready",
+        "expected_mezzanine_ok": true
+      }
+    }
+  ]
+}
