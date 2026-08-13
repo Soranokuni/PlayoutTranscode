@@ -133,7 +133,17 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
     let jq = job_queue.clone();
     let server_pool = pool.clone();
 
-    let web_ui_dir = exe_dir.join("web-ui").join("dist");
+    let web_ui_dir = if exe_dir.join("web-ui").join("dist").join("index.html").exists() {
+        exe_dir.join("web-ui").join("dist")
+    } else if let Ok(cwd) = std::env::current_dir() {
+        if cwd.join("web-ui").join("dist").join("index.html").exists() {
+            cwd.join("web-ui").join("dist")
+        } else {
+            exe_dir.join("web-ui").join("dist")
+        }
+    } else {
+        exe_dir.join("web-ui").join("dist")
+    };
 
     let server_task = tokio::spawn(async move {
         server::run_server(
