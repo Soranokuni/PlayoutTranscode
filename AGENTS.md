@@ -96,6 +96,18 @@ If you touch this repo, do not merge changes that alter:
 
 Any such change must update both repos and the contract together.
 
+## Development Workflow & Slice Boundaries
+
+- **Single Reliability Boundary per Slice**: Never combine atomic output staging, retry classification, watcher filtering, or database purge rules into a single PR/slice. Split them into isolated sub-slices (`V2-xA`, `V2-xB`, etc.).
+- **Atomic Publication Invariants**:
+  - Write transcode output to temporary staging path (`.tmp_{uuid}_{filename}`) on the same volume as the target directory.
+  - Probe and validate media streams while in staging.
+  - Atomically rename staging file to final path (`std::fs::rename`).
+  - Write sidecar JSON atomically via staging -> rename.
+  - Call `db::mark_ready` ONLY AFTER the final published file exists.
+  - Clean up staging files on every error/panic path.
+- **Commit Traceability Invariant**: Always create detailed commit messages listing modified components, exact changes, and verification results immediately after slice completion.
+
 ## Build
 
 ```

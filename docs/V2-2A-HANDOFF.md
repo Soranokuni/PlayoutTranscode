@@ -6,7 +6,7 @@ Slice V2-2A implements **Atomic Output Staging and Publication** for PlayoutTran
 ---
 
 ## 2. Baseline & HEAD Information
-- **V2-2A Final HEAD SHA**: `1b1b4c5665747efb026d6eeef9439b890a508ef5`
+- **V2-2A Implementation SHA**: `06abb1c64eb3a48bfdbdeaa1b94d9ce6a21ec6bf`
 - **Branch**: `main`
 - **Scope**: V2-2A Atomic Staging and Publication PR only.
 
