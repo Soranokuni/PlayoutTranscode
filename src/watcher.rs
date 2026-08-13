@@ -7,6 +7,19 @@ use walkdir::WalkDir;
 
 static SUPPORTED_EXTENSIONS: &[&str] = &["mp4", "mov", "mxf", "mkv", "avi", "webm", "ts", "m2ts"];
 
+static TEMP_EXTENSIONS: &[&str] = &[
+    "tmp",
+    "temp",
+    "part",
+    "partial",
+    "crdownload",
+    "download",
+    "filepart",
+    "upload",
+    "incomplete",
+    "json",
+];
+
 #[derive(Debug, Clone)]
 pub struct WatchCandidate {
     pub path: PathBuf,
@@ -16,11 +29,30 @@ pub struct WatchCandidate {
 }
 
 pub fn is_temp_file_name(path: &Path) -> bool {
-    if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-        file_name.starts_with('.') || file_name.starts_with(".tmp_")
-    } else {
-        false
+    let file_name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return true,
+    };
+
+    // Hidden files, temporary staging files, or editor backup files
+    if file_name.starts_with('.') || file_name.starts_with(".tmp_") || file_name.starts_with('~') {
+        return true;
     }
+
+    // Sidecar metadata files (e.g. video.mp4.uuid.json or *.json)
+    if file_name.ends_with(".uuid.json") || file_name.ends_with(".json") {
+        return true;
+    }
+
+    // In-flight or partial download extensions
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        let lower = ext.to_ascii_lowercase();
+        if TEMP_EXTENSIONS.contains(&lower.as_str()) {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub fn collect_candidates(root: &Path) -> Vec<WatchCandidate> {
@@ -281,4 +313,97 @@ fn create_notify_watcher(
         .map_err(|e| format!("Failed to watch directory: {}", e))?;
 
     Ok((watcher, rx))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_is_temp_file_name_hidden_and_prefixes() {
+        assert!(is_temp_file_name(Path::new(".hidden.mp4")));
+        assert!(is_temp_file_name(Path::new(".DS_Store")));
+        assert!(is_temp_file_name(Path::new(".tmp_uuid_clip.mp4")));
+        assert!(is_temp_file_name(Path::new("~$clip.mp4")));
+    }
+
+    #[test]
+    fn test_is_temp_file_name_sidecar_json() {
+        assert!(is_temp_file_name(Path::new("clip.mp4.uuid.json")));
+        assert!(is_temp_file_name(Path::new("metadata.json")));
+    }
+
+    #[test]
+    fn test_is_temp_file_name_in_flight_extensions() {
+        assert!(is_temp_file_name(Path::new("movie.mp4.crdownload")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.part")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.partial")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.download")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.tmp")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.filepart")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.upload")));
+        assert!(is_temp_file_name(Path::new("movie.mp4.incomplete")));
+    }
+
+    #[test]
+    fn test_is_temp_file_name_valid_media() {
+        assert!(!is_temp_file_name(Path::new("news_intro.mp4")));
+        assert!(!is_temp_file_name(Path::new("interview.mov")));
+        assert!(!is_temp_file_name(Path::new("commercial.mxf")));
+        assert!(!is_temp_file_name(Path::new("feature.mkv")));
+        assert!(!is_temp_file_name(Path::new("bumper.ts")));
+    }
+
+    #[test]
+    fn test_is_extension_allowed() {
+        // Default allowed
+        assert!(is_extension_allowed("mp4", &[], &[]));
+        assert!(is_extension_allowed("MOV", &[], &[]));
+        assert!(!is_extension_allowed("txt", &[], &[]));
+        assert!(!is_extension_allowed("exe", &[], &[]));
+
+        // With include list
+        let inc = vec!["mp4".to_string(), "mov".to_string()];
+        assert!(is_extension_allowed("mp4", &inc, &[]));
+        assert!(!is_extension_allowed("mxf", &inc, &[]));
+
+        // With exclude list
+        let exc = vec!["avi".to_string()];
+        assert!(!is_extension_allowed("avi", &[], &exc));
+        assert!(is_extension_allowed("mp4", &[], &exc));
+    }
+
+    #[test]
+    fn test_collect_candidates_skips_temp_files() {
+        let temp_dir = std::env::temp_dir().join("pt_v2_2c_test_watch");
+        let _ = fs::create_dir_all(&temp_dir);
+
+        // Create valid media
+        let valid_file = temp_dir.join("valid_video.mp4");
+        let mut f = fs::File::create(&valid_file).unwrap();
+        writeln!(f, "fake video data").unwrap();
+        drop(f);
+
+        // Create temporary files
+        let tmp_file = temp_dir.join(".tmp_uuid_valid_video.mp4");
+        fs::File::create(&tmp_file).unwrap();
+
+        let part_file = temp_dir.join("downloading.mp4.part");
+        fs::File::create(&part_file).unwrap();
+
+        let json_file = temp_dir.join("valid_video.mp4.uuid.json");
+        fs::File::create(&json_file).unwrap();
+
+        let candidates = collect_candidates(&temp_dir);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, valid_file);
+
+        // Cleanup
+        let _ = fs::remove_file(&valid_file);
+        let _ = fs::remove_file(&tmp_file);
+        let _ = fs::remove_file(&part_file);
+        let _ = fs::remove_file(&json_file);
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
 }
