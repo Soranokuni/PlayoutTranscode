@@ -180,7 +180,15 @@ async fn get_config(State(state): State<ServerState>) -> Json<serde_json::Value>
         let per_encode_threads = config.encoding.effective_threads_per_encode(max_concurrency);
         let total_threads = config.encoding.effective_total_threads(max_concurrency);
         let available_cores = crate::config::available_logical_cores();
+
+        let effective_audio = config.effective_audio_policy();
+        let effective_validation = config.effective_validation_policy();
+        let effective_storage = config.effective_storage_policy();
+        let effective_retry = config.effective_retry_policy();
+        let effective_toolchain = config.effective_toolchain_policy();
+
         Json(serde_json::json!({
+            "version": config.version,
             "paths": {
                 "watch_folder": config.paths.watch_folder,
                 "target_folder": config.paths.target_folder,
@@ -240,11 +248,18 @@ async fn get_config(State(state): State<ServerState>) -> Json<serde_json::Value>
                 "available_logical_cores": available_cores,
             },
             "initialized": config.initialized,
+            "audio_policy": effective_audio,
+            "validation_policy": effective_validation,
+            "storage_policy": effective_storage,
+            "retry_policy_v2": effective_retry,
+            "toolchain_policy": effective_toolchain,
         }))
 }
 
 #[derive(Deserialize)]
 struct ConfigUpdate {
+    #[serde(default)]
+    version: Option<u32>,
     #[serde(default)]
     paths: Option<PathsConfigUpdate>,
     #[serde(default)]
@@ -257,6 +272,16 @@ struct ConfigUpdate {
     profile_c: Option<ProfileConfigUpdate>,
     #[serde(default)]
     ingestion: Option<IngestionConfigUpdate>,
+    #[serde(default)]
+    audio_policy: Option<crate::config::AudioPolicy>,
+    #[serde(default)]
+    validation_policy: Option<crate::config::ValidationPolicy>,
+    #[serde(default)]
+    storage_policy: Option<crate::config::StoragePolicy>,
+    #[serde(default)]
+    retry_policy_v2: Option<crate::config::RetryPolicyV2>,
+    #[serde(default)]
+    toolchain_policy: Option<crate::config::ToolchainPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -327,6 +352,7 @@ async fn put_config(
 ) -> impl IntoResponse {
     {
         let mut config = state.config.lock();
+        if let Some(v) = body.version { config.version = v; }
         if let Some(p) = body.paths {
             if let Some(w) = p.watch_folder { config.paths.watch_folder = w; }
             if let Some(t) = p.target_folder { config.paths.target_folder = t; }
@@ -369,6 +395,26 @@ async fn put_config(
             if let Some(v) = i.max_attempts { config.ingestion.max_attempts = v; }
             if let Some(v) = i.retry_delay_ms { config.ingestion.retry_delay_ms = v; }
             if let Some(v) = i.clean_source_after_success { config.ingestion.clean_source_after_success = v; }
+        }
+        if let Some(ap) = body.audio_policy {
+            config.audio_policy = Some(ap);
+            config.version = 2;
+        }
+        if let Some(vp) = body.validation_policy {
+            config.validation_policy = Some(vp);
+            config.version = 2;
+        }
+        if let Some(sp) = body.storage_policy {
+            config.storage_policy = Some(sp);
+            config.version = 2;
+        }
+        if let Some(rp) = body.retry_policy_v2 {
+            config.retry_policy_v2 = Some(rp);
+            config.version = 2;
+        }
+        if let Some(tp) = body.toolchain_policy {
+            config.toolchain_policy = Some(tp);
+            config.version = 2;
         }
 
         config.initialized = true;
