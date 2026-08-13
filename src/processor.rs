@@ -45,6 +45,90 @@ impl Publisher for LocalFilePublisher {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    Retryable,
+    Permanent,
+    Cancelled,
+}
+
+pub fn classify_error(err_msg: &str, is_validation_failure: bool) -> RetryClass {
+    if is_validation_failure {
+        return RetryClass::Permanent;
+    }
+    let lower = err_msg.to_ascii_lowercase();
+    if lower.contains("cancelled") || lower.contains("canceled") || lower.contains("stop") {
+        return RetryClass::Cancelled;
+    }
+    if lower.contains("os error 32")
+        || lower.contains("file locked")
+        || lower.contains("sharing violation")
+        || lower.contains("lock")
+        || lower.contains("busy")
+    {
+        return RetryClass::Retryable;
+    }
+    if lower.contains("probe:")
+        || lower.contains("profile disabled")
+        || lower.contains("invalid input")
+        || lower.contains("no such file or directory")
+        || lower.contains("unsupported codec")
+        || lower.contains("permission denied")
+        || lower.contains("access is denied")
+        || lower.contains("disk full")
+        || lower.contains("space")
+        || lower.contains("already exists")
+    {
+        return RetryClass::Permanent;
+    }
+    if lower.contains("timeout")
+        || lower.contains("resource temporarily unavailable")
+        || lower.contains("ffmpeg exited with code")
+        || lower.contains("failed to spawn ffmpeg")
+        || lower.contains("output file missing or 0 bytes")
+    {
+        return RetryClass::Retryable;
+    }
+    RetryClass::Retryable
+}
+
+pub trait TranscodeRunner {
+    fn run_transcode(
+        &self,
+        tools: &bootstrap::ToolPaths,
+        config: &config::AppConfig,
+        input_path: &Path,
+        source_probe: &probe::ProbeData,
+        profile_id: profiles::ProfileId,
+        output_path: &Path,
+        metadata_uuid: &str,
+        progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
+        active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+    ) -> encoder::EncodeResult;
+}
+
+pub struct RealTranscodeRunner;
+
+impl TranscodeRunner for RealTranscodeRunner {
+    fn run_transcode(
+        &self,
+        tools: &bootstrap::ToolPaths,
+        config: &config::AppConfig,
+        input_path: &Path,
+        source_probe: &probe::ProbeData,
+        profile_id: profiles::ProfileId,
+        output_path: &Path,
+        metadata_uuid: &str,
+        progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
+        active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+    ) -> encoder::EncodeResult {
+        encoder::transcode_file(
+            tools, config, input_path, source_probe, profile_id,
+            output_path, metadata_uuid, progress_tx, active_pids,
+        )
+    }
+}
+
 pub fn process_file_sync(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -54,8 +138,30 @@ pub fn process_file_sync(
     pool: &SqlitePool,
     active_pids: Arc<StdMutex<Vec<u32>>>,
 ) {
+    process_file_sync_with_runner(
+        queue,
+        tools,
+        target_root,
+        input_path,
+        config,
+        pool,
+        active_pids,
+        &RealTranscodeRunner,
+    );
+}
+
+pub fn process_file_sync_with_runner(
+    queue: &jobs::JobQueue,
+    tools: &bootstrap::ToolPaths,
+    target_root: &Path,
+    input_path: &Path,
+    config: &config::AppConfig,
+    pool: &SqlitePool,
+    active_pids: Arc<StdMutex<Vec<u32>>>,
+    runner: &impl TranscodeRunner,
+) {
     let result = catch_unwind(AssertUnwindSafe(|| {
-        process_file_inner(queue, tools, target_root, input_path, config, pool, active_pids);
+        process_file_inner(queue, tools, target_root, input_path, config, pool, active_pids, runner);
     }));
 
     if let Err(panic_payload) = result {
@@ -82,6 +188,7 @@ fn process_file_inner(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: Arc<StdMutex<Vec<u32>>>,
+    runner: &impl TranscodeRunner,
 ) {
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
     let canonical_input = input_path.canonicalize().unwrap_or_else(|_| input_path.to_path_buf());
@@ -189,243 +296,287 @@ fn process_file_inner(
         return;
     }
 
-    queue.update(&job.id, |j| {
-        j.profile = profile_name.clone();
-        j.current_stage = format!("Encoding {}", profile_name);
-        j.source_frame_count = probe_data.frame_count;
-        j.duration_secs = probe_data.duration_secs;
-        j.duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
-    });
+    let retry_policy = config.effective_retry_policy();
+    let max_attempts = (retry_policy.max_attempts as usize).max(1);
+    let retry_delay_ms = retry_policy.retry_delay_ms;
 
-    let (ptx, prx) = std::sync::mpsc::channel::<encoder::EncodeProgress>();
-    let jid = job.id.clone();
-    let qc = queue.clone();
-    std::thread::spawn(move || {
-        let mut last_broadcast = std::time::Instant::now();
-        const THROTTLE_MS: u64 = 250;
-        while let Ok(p) = prx.recv() {
-            let pct = p.percent;
-            qc.update(&jid, |j| {
-                j.progress = pct;
-                j.current_frame = p.frame;
-                j.encode_fps = p.fps;
-                j.encode_bitrate = p.bitrate.clone();
-                j.encode_speed = p.speed.clone();
-                j.current_time_ms = p.current_time_ms;
-                j.duration_ms = p.duration_ms;
-                j.current_stage = if pct >= 100.0 { "Finalizing".into() } else { format!("Encoding {:.0}%", pct) };
-            });
-            let now = std::time::Instant::now();
-            if now.duration_since(last_broadcast).as_millis() as u64 >= THROTTLE_MS || pct >= 100.0 {
-                last_broadcast = now;
-                let determinate = p.duration_ms > 0 || p.total_frames > 0;
-                let _ = qc.broadcast("progress", &serde_json::json!({
-                    "id": jid,
-                    "percent": pct,
-                    "current_time_ms": p.current_time_ms,
-                    "duration_ms": p.duration_ms,
-                    "determinate": determinate,
-                    "fps": p.fps,
-                    "bitrate": p.bitrate,
-                    "speed": p.speed,
-                    "stage": if pct >= 100.0 { "Finalizing" } else { "Encoding" },
-                }).to_string());
-            }
-        }
-    });
+    let mut attempt = 1;
+    let mut last_error;
 
-    let result = encoder::transcode_file(
-        tools, config, input_path, &probe_data, profile_id,
-        &staged_output_path, &metadata_uuid, ptx, Some(active_pids),
-    );
+    while attempt <= max_attempts {
+        publisher.cleanup_staging(&staged_output_path);
 
-    if result.success {
-        wait_for_file_flush(&result.output_path, 5000);
-    }
-
-    let mut validation_ok = false;
-    let mut validation_error = String::new();
-    let mut final_probe = None;
-
-    // Capture stderr tail regardless of outcome so the UI collapsible section always has data.
-    let stderr_tail: Vec<String> = if result.success {
-        Vec::new()
-    } else {
-        result.stderr_tail.clone()
-    };
-    if !stderr_tail.is_empty() {
-        queue.update(&job.id, |j| {
-            j.stderr_log = Some(stderr_tail.clone());
-        });
-    }
-
-    if result.success {
-        let file_ok = if result.output_path.exists() {
-            if let Ok(metadata) = std::fs::metadata(&result.output_path) {
-                metadata.len() > 0
-            } else {
-                false
-            }
+        let stage_label = if max_attempts > 1 {
+            format!("Encoding {} (attempt {}/{})", profile_name, attempt, max_attempts)
         } else {
-            false
+            format!("Encoding {}", profile_name)
         };
 
-        if !file_ok {
-            validation_error = "Output file missing or 0 bytes".to_string();
-        } else {
-            if !try_acquire_output_lock(&result.output_path, 5, 400) {
-                tracing::warn!(
-                    "Could not acquire exclusive lock on {:?} — proceeding to ffprobe validation",
-                    result.output_path
-                );
+        queue.update(&job.id, |j| {
+            j.profile = profile_name.clone();
+            j.current_stage = stage_label.clone();
+            j.source_frame_count = probe_data.frame_count;
+            j.duration_secs = probe_data.duration_secs;
+            j.duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
+        });
+
+        let (ptx, prx) = std::sync::mpsc::channel::<encoder::EncodeProgress>();
+        let jid = job.id.clone();
+        let qc = queue.clone();
+        std::thread::spawn(move || {
+            let mut last_broadcast = std::time::Instant::now();
+            const THROTTLE_MS: u64 = 250;
+            while let Ok(p) = prx.recv() {
+                let pct = p.percent;
+                qc.update(&jid, |j| {
+                    j.progress = pct;
+                    j.current_frame = p.frame;
+                    j.encode_fps = p.fps;
+                    j.encode_bitrate = p.bitrate.clone();
+                    j.encode_speed = p.speed.clone();
+                    j.current_time_ms = p.current_time_ms;
+                    j.duration_ms = p.duration_ms;
+                    j.current_stage = if pct >= 100.0 { "Finalizing".into() } else { format!("Encoding {:.0}%", pct) };
+                });
+                let now = std::time::Instant::now();
+                if now.duration_since(last_broadcast).as_millis() as u64 >= THROTTLE_MS || pct >= 100.0 {
+                    last_broadcast = now;
+                    let determinate = p.duration_ms > 0 || p.total_frames > 0;
+                    let _ = qc.broadcast("progress", &serde_json::json!({
+                        "id": jid,
+                        "percent": pct,
+                        "current_time_ms": p.current_time_ms,
+                        "duration_ms": p.duration_ms,
+                        "determinate": determinate,
+                        "fps": p.fps,
+                        "bitrate": p.bitrate,
+                        "speed": p.speed,
+                        "stage": if pct >= 100.0 { "Finalizing" } else { "Encoding" },
+                    }).to_string());
+                }
             }
-            match probe_with_retry(tools, &result.output_path, 3, 500) {
-                Ok(p) => match classify_probe_match(p, &probe_data) {
-                    Ok(p) => {
-                        validation_ok = true;
-                        final_probe = Some(p);
-                    }
-                    Err(e) => validation_error = e,
-                },
-                Err(e) => validation_error = e,
-            }
-        }
-    } else {
-        validation_error = result
-            .error
-            .clone()
-            .unwrap_or_else(|| "FFmpeg encoding failed".to_string());
-    }
+        });
 
-    if validation_ok && final_probe.is_some() {
-        let output_probe = final_probe.unwrap();
-
-        let keyframe_safe_start_ms = probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
-
-        let mut warnings_list = Vec::new();
-        let mut mezzanine_ok = true;
-
-        let fps = output_probe.fps();
-        let expected_fps = profiles::TARGET_FPS_NUM as f64 / profiles::TARGET_FPS_DEN as f64;
-        if (fps - expected_fps).abs() > 0.01 {
-            warnings_list.push(format!("fps_mismatch: got {:.3} expected {:.3}", fps, expected_fps));
-            mezzanine_ok = false;
-        }
-
-        let source_fps = probe_data.fps();
-        if (source_fps - expected_fps).abs() > 0.01 {
-            warnings_list.push(format!("fps_converted: source {:.3} -> output {:.3}", source_fps, expected_fps));
-        }
-
-        let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
-        if duration_ms <= 0 {
-            warnings_list.push("zero_duration".to_string());
-            mezzanine_ok = false;
-        }
-
-        if output_probe.audio_sample_rate != 48000 {
-            warnings_list.push(format!("audio_sample_rate_not_48k: got {} Hz", output_probe.audio_sample_rate));
-            mezzanine_ok = false;
-        }
-
-        let total_frames = output_probe.frame_count;
-        let gop_frames = compute_gop_from_fps(fps);
-
-        let keyframe_offsets = extract_keyframe_offsets_ms(
-            tools.ffprobe.to_str().unwrap_or(""),
-            &result.output_path,
+        let result = runner.run_transcode(
+            tools, config, input_path, &probe_data, profile_id,
+            &staged_output_path, &metadata_uuid, ptx, Some(active_pids.clone()),
         );
-        let closed_gop_ok = verify_closed_gop(&keyframe_offsets, gop_frames, fps);
-        if !closed_gop_ok {
-            warnings_list.push("closed_gop_violation".to_string());
-            mezzanine_ok = false;
+
+        if result.success {
+            wait_for_file_flush(&result.output_path, 5000);
         }
 
-        let faststart_ok = verify_faststart(&result.output_path);
-        if !faststart_ok {
-            warnings_list.push("missing_faststart".to_string());
-            mezzanine_ok = false;
-        }
+        let mut validation_ok = false;
+        let mut validation_error = String::new();
+        let mut final_probe = None;
 
-        // Atomic publish: rename staged file to final path ONLY after validation passes
-        if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
-            tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
+        let stderr_tail: Vec<String> = if result.success {
+            Vec::new()
+        } else {
+            result.stderr_tail.clone()
+        };
+        if !stderr_tail.is_empty() {
             queue.update(&job.id, |j| {
-                j.state = jobs::JobState::Failed;
-                j.error = Some(format!("Atomic publish failed: {}", e));
-                j.current_stage = "Failed".into();
+                j.stderr_log = Some(stderr_tail.clone());
+            });
+        }
+
+        if result.success {
+            let file_ok = if result.output_path.exists() {
+                if let Ok(metadata) = std::fs::metadata(&result.output_path) {
+                    metadata.len() > 0
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !file_ok {
+                validation_error = "Output file missing or 0 bytes".to_string();
+            } else {
+                if !try_acquire_output_lock(&result.output_path, 5, 400) {
+                    tracing::warn!(
+                        "Could not acquire exclusive lock on {:?} — proceeding to ffprobe validation",
+                        result.output_path
+                    );
+                }
+                match probe_with_retry(tools, &result.output_path, 3, 500) {
+                    Ok(p) => match classify_probe_match(p, &probe_data) {
+                        Ok(p) => {
+                            validation_ok = true;
+                            final_probe = Some(p);
+                        }
+                        Err(e) => validation_error = e,
+                    },
+                    Err(e) => validation_error = e,
+                }
+            }
+        } else {
+            validation_error = result
+                .error
+                .clone()
+                .unwrap_or_else(|| "FFmpeg encoding failed".to_string());
+        }
+
+        if validation_ok && final_probe.is_some() {
+            let output_probe = final_probe.unwrap();
+
+            let keyframe_safe_start_ms = probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
+
+            let mut warnings_list = Vec::new();
+            let mut mezzanine_ok = true;
+
+            let fps = output_probe.fps();
+            let expected_fps = profiles::TARGET_FPS_NUM as f64 / profiles::TARGET_FPS_DEN as f64;
+            if (fps - expected_fps).abs() > 0.01 {
+                warnings_list.push(format!("fps_mismatch: got {:.3} expected {:.3}", fps, expected_fps));
+                mezzanine_ok = false;
+            }
+
+            let source_fps = probe_data.fps();
+            if (source_fps - expected_fps).abs() > 0.01 {
+                warnings_list.push(format!("fps_converted: source {:.3} -> output {:.3}", source_fps, expected_fps));
+            }
+
+            let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
+            if duration_ms <= 0 {
+                warnings_list.push("zero_duration".to_string());
+                mezzanine_ok = false;
+            }
+
+            if output_probe.audio_sample_rate != 48000 {
+                warnings_list.push(format!("audio_sample_rate_not_48k: got {} Hz", output_probe.audio_sample_rate));
+                mezzanine_ok = false;
+            }
+
+            let total_frames = output_probe.frame_count;
+            let gop_frames = compute_gop_from_fps(fps);
+
+            let keyframe_offsets = extract_keyframe_offsets_ms(
+                tools.ffprobe.to_str().unwrap_or(""),
+                &result.output_path,
+            );
+            let closed_gop_ok = verify_closed_gop(&keyframe_offsets, gop_frames, fps);
+            if !closed_gop_ok {
+                warnings_list.push("closed_gop_violation".to_string());
+                mezzanine_ok = false;
+            }
+
+            let faststart_ok = verify_faststart(&result.output_path);
+            if !faststart_ok {
+                warnings_list.push("missing_faststart".to_string());
+                mezzanine_ok = false;
+            }
+
+            if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
+                tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
+                queue.update(&job.id, |j| {
+                    j.state = jobs::JobState::Failed;
+                    j.error = Some(format!("Atomic publish failed: {}", e));
+                    j.current_stage = "Failed".into();
+                    j.finished_at = Some(Utc::now().to_rfc3339());
+                });
+                queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Atomic publish failed: {}", e)}).to_string());
+                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                publisher.cleanup_staging(&staged_output_path);
+                queue.prune_old(500);
+                return;
+            }
+
+            let _ = identity::write_sidecar_next_to_video(
+                &final_output_path,
+                &metadata_uuid,
+                &probe_data,
+                &output_probe,
+                &profile_name,
+                "h264",
+                &config.encoding.audio_codec,
+                duration_ms,
+                mezzanine_ok,
+                fps,
+                output_probe.fps_num,
+                output_probe.fps_den,
+                total_frames,
+                gop_frames,
+                keyframe_safe_start_ms,
+                &warnings_list,
+            );
+
+            let keyframe_offsets_json = serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
+
+            let _ = handle.block_on(db::mark_ready(
+                pool,
+                &metadata_uuid,
+                &final_output_path.to_string_lossy(),
+                duration_ms,
+                mezzanine_ok,
+                fps,
+                output_probe.fps_num,
+                output_probe.fps_den,
+                total_frames,
+                gop_frames,
+                keyframe_safe_start_ms,
+                &warnings_list,
+                &keyframe_offsets_json,
+            ));
+            queue.update(&job.id, |j| {
+                j.state = jobs::JobState::Completed;
+                j.uuid = Some(metadata_uuid.clone());
+                j.output_path = Some(final_output_path.to_string_lossy().into_owned());
+                j.progress = 100.0;
+                j.current_stage = "Completed".into();
                 j.finished_at = Some(Utc::now().to_rfc3339());
             });
-            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Atomic publish failed: {}", e)}).to_string());
-            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
-            publisher.cleanup_staging(&staged_output_path);
+            queue.broadcast("completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
+            tracing::info!("Completed and verified: {} -> {} (uuid={})", input_path.display(), final_output_path.display(), metadata_uuid);
+            if config.effective_storage_policy().clean_source_after_success {
+                let _ = std::fs::remove_file(input_path);
+            }
+            queue.prune_old(500);
             return;
         }
 
-        let _ = identity::write_sidecar_next_to_video(
-            &final_output_path,
-            &metadata_uuid,
-            &probe_data,
-            &output_probe,
-            &profile_name,
-            "h264",
-            &config.encoding.audio_codec,
-            duration_ms,
-            mezzanine_ok,
-            fps,
-            output_probe.fps_num,
-            output_probe.fps_den,
-            total_frames,
-            gop_frames,
-            keyframe_safe_start_ms,
-            &warnings_list,
-        );
+        last_error = validation_error.clone();
+        let is_val_fail = result.success && !validation_ok;
+        let retry_class = classify_error(&validation_error, is_val_fail);
 
-        let keyframe_offsets_json = serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
-
-        let _ = handle.block_on(db::mark_ready(
-            pool,
-            &metadata_uuid,
-            &final_output_path.to_string_lossy(),
-            duration_ms,
-            mezzanine_ok,
-            fps,
-            output_probe.fps_num,
-            output_probe.fps_den,
-            total_frames,
-            gop_frames,
-            keyframe_safe_start_ms,
-            &warnings_list,
-            &keyframe_offsets_json,
-        ));
-        queue.update(&job.id, |j| {
-            j.state = jobs::JobState::Completed;
-            j.uuid = Some(metadata_uuid.clone());
-            j.output_path = Some(final_output_path.to_string_lossy().into_owned());
-            j.progress = 100.0;
-            j.current_stage = "Completed".into();
-            j.finished_at = Some(Utc::now().to_rfc3339());
-        });
-        queue.broadcast("completed", &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string());
-        tracing::info!("Completed and verified: {} -> {} (uuid={})", input_path.display(), final_output_path.display(), metadata_uuid);
-        if config.effective_storage_policy().clean_source_after_success {
-            let _ = std::fs::remove_file(input_path);
-        }
-    } else {
-        queue.update(&job.id, |j| {
-            j.state = jobs::JobState::Failed;
-            j.error = Some(validation_error.clone());
-            j.current_stage = "Failed".into();
-            j.finished_at = Some(Utc::now().to_rfc3339());
-        });
-        queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": validation_error}).to_string());
-        let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
-        tracing::error!("Failed transcode validation: {} - {}", input_path.display(), validation_error);
         publisher.cleanup_staging(&staged_output_path);
-        if final_output_path.exists() {
-            let _ = std::fs::remove_file(&final_output_path);
+
+        if retry_class == RetryClass::Retryable && attempt < max_attempts {
+            tracing::warn!(
+                "Transcode attempt {}/{} failed for {} ({}). Retrying in {}ms...",
+                attempt, max_attempts, input_path.display(), validation_error, retry_delay_ms
+            );
+            queue.broadcast("progress", &serde_json::json!({
+                "id": job.id,
+                "stage": format!("Retrying attempt {}/{}", attempt + 1, max_attempts),
+            }).to_string());
+
+            if retry_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+            }
+            attempt += 1;
+        } else {
+            tracing::error!(
+                "Final transcode failure for {} (attempt {}/{}, class={:?}): {}",
+                input_path.display(), attempt, max_attempts, retry_class, last_error
+            );
+            queue.update(&job.id, |j| {
+                j.state = jobs::JobState::Failed;
+                j.error = Some(last_error.clone());
+                j.current_stage = "Failed".into();
+                j.finished_at = Some(Utc::now().to_rfc3339());
+            });
+            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": last_error}).to_string());
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            if final_output_path.exists() {
+                let _ = std::fs::remove_file(&final_output_path);
+            }
+            break;
         }
     }
+
     queue.prune_old(500);
 }
 
@@ -771,5 +922,158 @@ mod tests {
         let _ = std::fs::remove_file(&staged_path);
         let _ = std::fs::remove_file(&final_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_classify_error_categories() {
+        assert_eq!(
+            classify_error("Permission denied (os error 32) / file locked", false),
+            RetryClass::Retryable
+        );
+        assert_eq!(
+            classify_error("ffmpeg exited with code 1", false),
+            RetryClass::Retryable
+        );
+        assert_eq!(
+            classify_error("fps_mismatch: got 30.0 expected 25.0", true),
+            RetryClass::Permanent
+        );
+        assert_eq!(
+            classify_error("Probe: invalid media header", false),
+            RetryClass::Permanent
+        );
+        assert_eq!(
+            classify_error("Job cancelled by user", false),
+            RetryClass::Cancelled
+        );
+        assert_eq!(
+            classify_error("No such file or directory", false),
+            RetryClass::Permanent
+        );
+    }
+
+    struct MockTranscodeRunner {
+        responses: std::sync::Mutex<Vec<encoder::EncodeResult>>,
+        attempts_seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TranscodeRunner for MockTranscodeRunner {
+        fn run_transcode(
+            &self,
+            _tools: &bootstrap::ToolPaths,
+            _config: &config::AppConfig,
+            _input_path: &Path,
+            _source_probe: &probe::ProbeData,
+            _profile_id: profiles::ProfileId,
+            output_path: &Path,
+            _metadata_uuid: &str,
+            _progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
+            _active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+        ) -> encoder::EncodeResult {
+            self.attempts_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut list = self.responses.lock().unwrap();
+            if !list.is_empty() {
+                let res = list.remove(0);
+                if res.success {
+                    let _ = std::fs::File::create(output_path);
+                }
+                res
+            } else {
+                encoder::EncodeResult {
+                    output_path: output_path.to_path_buf(),
+                    success: false,
+                    error: Some("Mock empty response".into()),
+                    stderr_tail: Vec::new(),
+                    exit_pid: None,
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_max_attempts_boundary_semantics() {
+        let mut cfg = config::AppConfig::default();
+        cfg.retry_policy_v2 = Some(config::RetryPolicyV2 {
+            max_attempts: 1,
+            retry_delay_ms: 10,
+            auto_retry_on_start: false,
+        });
+
+        let policy = cfg.effective_retry_policy();
+        assert_eq!(policy.max_attempts, 1);
+        let max_att = (policy.max_attempts as usize).max(1);
+        assert_eq!(max_att, 1);
+    }
+
+    #[test]
+    fn test_mock_runner_retryable_until_exhausted() {
+        use std::path::PathBuf;
+
+        let runner = MockTranscodeRunner {
+            responses: std::sync::Mutex::new(vec![
+                encoder::EncodeResult {
+                    output_path: PathBuf::from("staged1.mp4"),
+                    success: false,
+                    error: Some("file locked by another process".into()),
+                    stderr_tail: Vec::new(),
+                    exit_pid: None,
+                },
+                encoder::EncodeResult {
+                    output_path: PathBuf::from("staged1.mp4"),
+                    success: false,
+                    error: Some("file locked by another process".into()),
+                    stderr_tail: Vec::new(),
+                    exit_pid: None,
+                },
+            ]),
+            attempts_seen: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let err_class1 = classify_error("file locked by another process", false);
+        assert_eq!(err_class1, RetryClass::Retryable);
+
+        let max_attempts = 2;
+        let mut attempt = 1;
+        let mut attempts_executed = 0;
+
+        let dummy_probe = probe::ProbeData {
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            fps_num: 25,
+            fps_den: 1,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "input.mp4".into(),
+        };
+
+        while attempt <= max_attempts {
+            attempts_executed += 1;
+            let res = runner.run_transcode(
+                &bootstrap::ToolPaths { ffmpeg: PathBuf::new(), ffprobe: PathBuf::new() },
+                &config::AppConfig::default(),
+                Path::new("input.mp4"),
+                &dummy_probe,
+                profiles::ProfileId::ProfileA,
+                Path::new("staged.mp4"),
+                "uuid",
+                std::sync::mpsc::channel().0,
+                None,
+            );
+            let cls = classify_error(res.error.as_deref().unwrap_or(""), false);
+            if cls == RetryClass::Retryable && attempt < max_attempts {
+                attempt += 1;
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(attempts_executed, 2);
+        assert_eq!(runner.attempts_seen.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 }
