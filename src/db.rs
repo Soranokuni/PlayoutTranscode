@@ -192,6 +192,65 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS transcode_jobs (
+            id TEXT PRIMARY KEY NOT NULL,
+            input_path TEXT NOT NULL,
+            output_path TEXT,
+            profile TEXT NOT NULL,
+            uuid TEXT,
+            state TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            progress REAL NOT NULL DEFAULT 0.0,
+            current_stage TEXT NOT NULL,
+            duration_secs REAL NOT NULL DEFAULT 0.0,
+            error TEXT,
+            error_category TEXT,
+            stderr_log_json TEXT,
+            attempt INTEGER NOT NULL DEFAULT 1,
+            max_attempts INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT,
+            fingerprint INTEGER,
+            request_hash TEXT,
+            worker_id TEXT,
+            leased_until TEXT,
+            heartbeat_at TEXT,
+            cancel_requested BOOLEAN NOT NULL DEFAULT 0,
+            source_frame_count INTEGER NOT NULL DEFAULT 0,
+            current_frame INTEGER NOT NULL DEFAULT 0,
+            encode_fps REAL NOT NULL DEFAULT 0.0,
+            encode_bitrate TEXT NOT NULL DEFAULT '',
+            encode_speed TEXT NOT NULL DEFAULT '',
+            current_time_ms INTEGER NOT NULL DEFAULT 0,
+            duration_ms INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_state_phase ON transcode_jobs(state, phase)",
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_request_hash ON transcode_jobs(request_hash)",
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_fingerprint ON transcode_jobs(fingerprint)",
+    )
+    .execute(&pool)
+    .await;
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_leased_until ON transcode_jobs(leased_until)",
+    )
+    .execute(&pool)
+    .await;
+
     for (col, default) in [
         ("display_name", "''"),
         ("rating", "'K'"),
@@ -683,6 +742,368 @@ pub async fn set_folder_color(
     Ok(())
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DurableJobRow {
+    pub id: String,
+    pub input_path: String,
+    pub output_path: Option<String>,
+    pub profile: String,
+    pub uuid: Option<String>,
+    pub state: String,
+    pub phase: String,
+    pub progress: f64,
+    pub current_stage: String,
+    pub duration_secs: f64,
+    pub error: Option<String>,
+    pub error_category: Option<String>,
+    pub stderr_log_json: Option<String>,
+    pub attempt: i64,
+    pub max_attempts: i64,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub fingerprint: Option<i64>,
+    pub request_hash: Option<String>,
+    pub worker_id: Option<String>,
+    pub leased_until: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub cancel_requested: bool,
+    pub source_frame_count: i64,
+    pub current_frame: i64,
+    pub encode_fps: f64,
+    pub encode_bitrate: String,
+    pub encode_speed: String,
+    pub current_time_ms: i64,
+    pub duration_ms: i64,
+}
+
+impl DurableJobRow {
+    pub fn into_job_record(self) -> crate::jobs::JobRecord {
+        let state = self.state.parse().unwrap_or(crate::jobs::JobState::Pending);
+        let phase = self.phase.parse().unwrap_or(crate::jobs::JobPhase::Queued);
+        let stderr_log = self
+            .stderr_log_json
+            .and_then(|j| serde_json::from_str(&j).ok());
+
+        crate::jobs::JobRecord {
+            id: self.id,
+            input_path: self.input_path,
+            output_path: self.output_path,
+            profile: self.profile,
+            uuid: self.uuid,
+            state,
+            phase,
+            progress: self.progress as f32,
+            current_stage: self.current_stage,
+            duration_secs: self.duration_secs,
+            error: self.error,
+            error_category: self.error_category,
+            stderr_log,
+            attempt: self.attempt as u32,
+            max_attempts: self.max_attempts as u32,
+            created_at: self.created_at,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            fingerprint: self.fingerprint,
+            request_hash: self.request_hash,
+            worker_id: self.worker_id,
+            leased_until: self.leased_until,
+            heartbeat_at: self.heartbeat_at,
+            cancel_requested: self.cancel_requested,
+            source_frame_count: self.source_frame_count,
+            current_frame: self.current_frame,
+            encode_fps: self.encode_fps,
+            encode_bitrate: self.encode_bitrate,
+            encode_speed: self.encode_speed,
+            current_time_ms: self.current_time_ms,
+            duration_ms: self.duration_ms,
+        }
+    }
+}
+
+pub async fn insert_durable_job(
+    pool: &SqlitePool,
+    job: &crate::jobs::JobRecord,
+) -> Result<(), sqlx::Error> {
+    let stderr_json = job
+        .stderr_log
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default());
+    sqlx::query(
+        "INSERT INTO transcode_jobs (
+            id, input_path, output_path, profile, uuid, state, phase, progress, current_stage,
+            duration_secs, error, error_category, stderr_log_json, attempt, max_attempts,
+            created_at, started_at, finished_at, fingerprint, request_hash, worker_id,
+            leased_until, heartbeat_at, cancel_requested, source_frame_count, current_frame,
+            encode_fps, encode_bitrate, encode_speed, current_time_ms, duration_ms
+        ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9,
+            ?10, ?11, ?12, ?13, ?14, ?15,
+            ?16, ?17, ?18, ?19, ?20, ?21,
+            ?22, ?23, ?24, ?25, ?26,
+            ?27, ?28, ?29, ?30, ?31
+        ) ON CONFLICT(id) DO UPDATE SET
+            input_path = excluded.input_path,
+            output_path = excluded.output_path,
+            profile = excluded.profile,
+            uuid = excluded.uuid,
+            state = excluded.state,
+            phase = excluded.phase,
+            progress = excluded.progress,
+            current_stage = excluded.current_stage,
+            duration_secs = excluded.duration_secs,
+            error = excluded.error,
+            error_category = excluded.error_category,
+            stderr_log_json = excluded.stderr_log_json,
+            attempt = excluded.attempt,
+            max_attempts = excluded.max_attempts,
+            started_at = excluded.started_at,
+            finished_at = excluded.finished_at,
+            fingerprint = excluded.fingerprint,
+            request_hash = excluded.request_hash,
+            worker_id = excluded.worker_id,
+            leased_until = excluded.leased_until,
+            heartbeat_at = excluded.heartbeat_at,
+            cancel_requested = excluded.cancel_requested,
+            source_frame_count = excluded.source_frame_count,
+            current_frame = excluded.current_frame,
+            encode_fps = excluded.encode_fps,
+            encode_bitrate = excluded.encode_bitrate,
+            encode_speed = excluded.encode_speed,
+            current_time_ms = excluded.current_time_ms,
+            duration_ms = excluded.duration_ms",
+    )
+    .bind(&job.id)
+    .bind(&job.input_path)
+    .bind(&job.output_path)
+    .bind(&job.profile)
+    .bind(&job.uuid)
+    .bind(job.state.as_str())
+    .bind(job.phase.as_str())
+    .bind(job.progress as f64)
+    .bind(&job.current_stage)
+    .bind(job.duration_secs)
+    .bind(&job.error)
+    .bind(&job.error_category)
+    .bind(&stderr_json)
+    .bind(job.attempt as i64)
+    .bind(job.max_attempts as i64)
+    .bind(&job.created_at)
+    .bind(&job.started_at)
+    .bind(&job.finished_at)
+    .bind(job.fingerprint)
+    .bind(&job.request_hash)
+    .bind(&job.worker_id)
+    .bind(&job.leased_until)
+    .bind(&job.heartbeat_at)
+    .bind(job.cancel_requested)
+    .bind(job.source_frame_count)
+    .bind(job.current_frame)
+    .bind(job.encode_fps)
+    .bind(&job.encode_bitrate)
+    .bind(&job.encode_speed)
+    .bind(job.current_time_ms)
+    .bind(job.duration_ms)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn claim_next_job(
+    pool: &SqlitePool,
+    worker_id: &str,
+    lease_secs: i64,
+) -> Result<Option<crate::jobs::JobRecord>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let row: Option<DurableJobRow> = sqlx::query_as(
+        "SELECT * FROM transcode_jobs 
+         WHERE (state = 'Pending' AND phase = 'queued') 
+            OR (state = 'Processing' AND leased_until IS NOT NULL AND leased_until < datetime('now'))
+         ORDER BY created_at ASC 
+         LIMIT 1",
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some(r) = row {
+        let now = chrono::Utc::now();
+        let leased_until = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
+        let heartbeat_at = now.to_rfc3339();
+        let started_at = r.started_at.clone().unwrap_or_else(|| now.to_rfc3339());
+
+        sqlx::query(
+            "UPDATE transcode_jobs SET
+                state = 'Processing',
+                phase = 'probing',
+                current_stage = 'Claimed by worker',
+                worker_id = ?1,
+                leased_until = ?2,
+                heartbeat_at = ?3,
+                started_at = ?4
+             WHERE id = ?5",
+        )
+        .bind(worker_id)
+        .bind(&leased_until)
+        .bind(&heartbeat_at)
+        .bind(&started_at)
+        .bind(&r.id)
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let mut job = r.into_job_record();
+        job.state = crate::jobs::JobState::Processing;
+        job.phase = crate::jobs::JobPhase::Probing;
+        job.current_stage = "Claimed by worker".to_string();
+        job.worker_id = Some(worker_id.to_string());
+        job.leased_until = Some(leased_until);
+        job.heartbeat_at = Some(heartbeat_at);
+        job.started_at = Some(started_at);
+
+        Ok(Some(job))
+    } else {
+        tx.rollback().await?;
+        Ok(None)
+    }
+}
+
+#[allow(dead_code)]
+pub async fn heartbeat_job(
+    pool: &SqlitePool,
+    job_id: &str,
+    worker_id: &str,
+    extend_secs: i64,
+) -> Result<bool, sqlx::Error> {
+    let now = chrono::Utc::now();
+    let leased_until = (now + chrono::Duration::seconds(extend_secs)).to_rfc3339();
+    let heartbeat_at = now.to_rfc3339();
+
+    let row: Option<(bool,)> = sqlx::query_as(
+        "SELECT cancel_requested FROM transcode_jobs WHERE id = ?1 AND worker_id = ?2",
+    )
+    .bind(job_id)
+    .bind(worker_id)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some((cancel_req,)) = row {
+        if !cancel_req {
+            let _ = sqlx::query(
+                "UPDATE transcode_jobs SET leased_until = ?1, heartbeat_at = ?2 WHERE id = ?3 AND worker_id = ?4",
+            )
+            .bind(&leased_until)
+            .bind(&heartbeat_at)
+            .bind(job_id)
+            .bind(worker_id)
+            .execute(pool)
+            .await;
+        }
+        Ok(cancel_req)
+    } else {
+        Ok(false)
+    }
+}
+
+#[allow(dead_code)]
+pub async fn request_job_cancellation(
+    pool: &SqlitePool,
+    job_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE transcode_jobs SET cancel_requested = 1, phase = CASE WHEN phase = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END, state = CASE WHEN phase = 'queued' THEN 'Cancelled' ELSE state END WHERE id = ?1 AND state IN ('Pending', 'Processing')",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+
+    Ok(res.rows_affected() > 0)
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct JobRecoveryReport {
+    pub requeued: usize,
+    pub failed_exhausted: usize,
+}
+
+pub async fn recover_stale_jobs(pool: &SqlitePool) -> Result<JobRecoveryReport, sqlx::Error> {
+    let mut report = JobRecoveryReport::default();
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Re-queue in-flight jobs that have attempts remaining
+    let requeue_res = sqlx::query(
+        "UPDATE transcode_jobs SET
+            state = 'Pending',
+            phase = 'queued',
+            current_stage = 'Re-queued (stale crash recovery)',
+            worker_id = NULL,
+            leased_until = NULL,
+            heartbeat_at = NULL,
+            attempt = attempt + 1
+         WHERE state = 'Processing' AND attempt < max_attempts",
+    )
+    .execute(pool)
+    .await?;
+    report.requeued = requeue_res.rows_affected() as usize;
+
+    // Fail in-flight jobs that have exhausted attempts
+    let fail_res = sqlx::query(
+        "UPDATE transcode_jobs SET
+            state = 'Failed',
+            phase = 'failed',
+            current_stage = 'Failed',
+            error = 'Worker crashed or lease expired (attempts exhausted)',
+            error_category = 'lease_expired',
+            worker_id = NULL,
+            leased_until = NULL,
+            finished_at = ?1
+         WHERE state = 'Processing' AND attempt >= max_attempts",
+    )
+    .bind(&now)
+    .execute(pool)
+    .await?;
+    report.failed_exhausted = fail_res.rows_affected() as usize;
+
+    if report.requeued > 0 || report.failed_exhausted > 0 {
+        tracing::warn!(
+            "Durable queue startup recovery: {} job(s) re-queued, {} job(s) marked failed (exhausted)",
+            report.requeued,
+            report.failed_exhausted
+        );
+    }
+
+    Ok(report)
+}
+
+pub async fn load_all_durable_jobs(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::jobs::JobRecord>, sqlx::Error> {
+    let rows: Vec<DurableJobRow> =
+        sqlx::query_as("SELECT * FROM transcode_jobs ORDER BY created_at ASC")
+            .fetch_all(pool)
+            .await?;
+
+    Ok(rows.into_iter().map(|r| r.into_job_record()).collect())
+}
+
+#[allow(dead_code)]
+pub async fn find_active_by_request_hash(
+    pool: &SqlitePool,
+    req_hash: &str,
+) -> Result<Option<crate::jobs::JobRecord>, sqlx::Error> {
+    let row: Option<DurableJobRow> = sqlx::query_as(
+        "SELECT * FROM transcode_jobs WHERE request_hash = ?1 AND state IN ('Pending', 'Processing') LIMIT 1",
+    )
+    .bind(req_hash)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| r.into_job_record()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -957,6 +1378,115 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&staging_path);
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_durable_job_insert_and_load() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let mut job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
+        job.request_hash = Some("reqhash12345".into());
+        job.fingerprint = Some(424242);
+        job.transition_to(crate::jobs::JobPhase::Probing, None)
+            .unwrap();
+
+        insert_durable_job(&pool, &job).await.unwrap();
+
+        let loaded = load_all_durable_jobs(&pool).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, job.id);
+        assert_eq!(loaded[0].phase, crate::jobs::JobPhase::Probing);
+        assert_eq!(loaded[0].state, crate::jobs::JobState::Processing);
+        assert_eq!(loaded[0].request_hash.as_deref(), Some("reqhash12345"));
+        assert_eq!(loaded[0].fingerprint, Some(424242));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_atomic_claim_and_lease() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
+        insert_durable_job(&pool, &job).await.unwrap();
+
+        // Worker 1 claims job
+        let claimed = claim_next_job(&pool, "worker-1", 60).await.unwrap();
+        assert!(claimed.is_some());
+        let claimed_job = claimed.unwrap();
+        assert_eq!(claimed_job.id, job.id);
+        assert_eq!(claimed_job.worker_id.as_deref(), Some("worker-1"));
+        assert_eq!(claimed_job.phase, crate::jobs::JobPhase::Probing);
+        assert_eq!(claimed_job.state, crate::jobs::JobState::Processing);
+
+        // Worker 2 attempts to claim while lease is active -> None
+        let second_claim = claim_next_job(&pool, "worker-2", 60).await.unwrap();
+        assert!(second_claim.is_none());
+
+        // Worker 1 heartbeats
+        let cancel_req = heartbeat_job(&pool, &job.id, "worker-1", 60).await.unwrap();
+        assert!(!cancel_req);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_stale_job_crash_recovery() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        // Job 1: In-flight with attempt 1 of 2 -> should re-queue
+        let mut job1 = crate::jobs::JobRecord::new("D:/media/in1.mp4", "ProfileA");
+        job1.state = crate::jobs::JobState::Processing;
+        job1.phase = crate::jobs::JobPhase::Encoding;
+        job1.attempt = 1;
+        job1.max_attempts = 2;
+        insert_durable_job(&pool, &job1).await.unwrap();
+
+        // Job 2: In-flight with attempt 2 of 2 -> should fail
+        let mut job2 = crate::jobs::JobRecord::new("D:/media/in2.mp4", "ProfileA");
+        job2.state = crate::jobs::JobState::Processing;
+        job2.phase = crate::jobs::JobPhase::Encoding;
+        job2.attempt = 2;
+        job2.max_attempts = 2;
+        insert_durable_job(&pool, &job2).await.unwrap();
+
+        let report = recover_stale_jobs(&pool).await.unwrap();
+        assert_eq!(report.requeued, 1);
+        assert_eq!(report.failed_exhausted, 1);
+
+        let all = load_all_durable_jobs(&pool).await.unwrap();
+        let j1 = all.iter().find(|j| j.id == job1.id).unwrap();
+        assert_eq!(j1.state, crate::jobs::JobState::Pending);
+        assert_eq!(j1.phase, crate::jobs::JobPhase::Queued);
+        assert_eq!(j1.attempt, 2);
+
+        let j2 = all.iter().find(|j| j.id == job2.id).unwrap();
+        assert_eq!(j2.state, crate::jobs::JobState::Failed);
+        assert_eq!(j2.phase, crate::jobs::JobPhase::Failed);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_job_cancellation_and_request_hash_dedup() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let mut job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
+        job.request_hash = Some("hash-abc-123".into());
+        insert_durable_job(&pool, &job).await.unwrap();
+
+        let found = find_active_by_request_hash(&pool, "hash-abc-123")
+            .await
+            .unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, job.id);
+
+        let cancel_res = request_job_cancellation(&pool, &job.id).await.unwrap();
+        assert!(cancel_res);
+
+        let all = load_all_durable_jobs(&pool).await.unwrap();
+        let j = all.iter().find(|j| j.id == job.id).unwrap();
+        assert_eq!(j.phase, crate::jobs::JobPhase::Cancelled);
+        assert_eq!(j.state, crate::jobs::JobState::Cancelled);
+
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

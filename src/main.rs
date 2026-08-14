@@ -121,7 +121,19 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
     tracing::info!("FFmpeg: {:?}", toolchain_status.ffmpeg_version);
 
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
-    let job_queue = jobs::JobQueue::new(event_tx);
+    let job_queue = jobs::JobQueue::new(event_tx, Some(pool.clone()));
+    if let Ok(report) = db::recover_stale_jobs(&pool).await {
+        if report.requeued > 0 || report.failed_exhausted > 0 {
+            tracing::info!(
+                "Startup crash recovery: {} job(s) re-queued, {} job(s) marked failed",
+                report.requeued,
+                report.failed_exhausted
+            );
+        }
+    }
+    if let Ok(existing_jobs) = db::load_all_durable_jobs(&pool).await {
+        job_queue.populate(existing_jobs);
+    }
     let service_handle = ServiceHandle::new();
 
     let watch_root = PathBuf::from(&app_config.paths.watch_folder);

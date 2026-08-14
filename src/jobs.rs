@@ -1,6 +1,7 @@
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -12,6 +13,32 @@ pub enum JobState {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl JobState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobState::Pending => "Pending",
+            JobState::Processing => "Processing",
+            JobState::Completed => "Completed",
+            JobState::Failed => "Failed",
+            JobState::Cancelled => "Cancelled",
+        }
+    }
+}
+
+impl std::str::FromStr for JobState {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Pending" => Ok(JobState::Pending),
+            "Processing" => Ok(JobState::Processing),
+            "Completed" => Ok(JobState::Completed),
+            "Failed" => Ok(JobState::Failed),
+            "Cancelled" => Ok(JobState::Cancelled),
+            other => Err(format!("Unknown JobState: {}", other)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +64,23 @@ impl JobPhase {
             self,
             JobPhase::Completed | JobPhase::Cancelled | JobPhase::Failed
         )
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            JobPhase::Queued => "queued",
+            JobPhase::Probing => "probing",
+            JobPhase::Planned => "planned",
+            JobPhase::Encoding => "encoding",
+            JobPhase::NormalizingAudio => "normalizing_audio",
+            JobPhase::Validating => "validating",
+            JobPhase::Publishing => "publishing",
+            JobPhase::Completed => "completed",
+            JobPhase::Failed => "failed",
+            JobPhase::CancelRequested => "cancel_requested",
+            JobPhase::Cancelled => "cancelled",
+            JobPhase::Recoverable => "recoverable",
+        }
     }
 
     pub fn as_v1_state(&self) -> JobState {
@@ -123,6 +167,27 @@ impl JobPhase {
     }
 }
 
+impl std::str::FromStr for JobPhase {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "queued" => Ok(JobPhase::Queued),
+            "probing" => Ok(JobPhase::Probing),
+            "planned" => Ok(JobPhase::Planned),
+            "encoding" => Ok(JobPhase::Encoding),
+            "normalizing_audio" => Ok(JobPhase::NormalizingAudio),
+            "validating" => Ok(JobPhase::Validating),
+            "publishing" => Ok(JobPhase::Publishing),
+            "completed" => Ok(JobPhase::Completed),
+            "failed" => Ok(JobPhase::Failed),
+            "cancel_requested" => Ok(JobPhase::CancelRequested),
+            "cancelled" => Ok(JobPhase::Cancelled),
+            "recoverable" => Ok(JobPhase::Recoverable),
+            other => Err(format!("Unknown JobPhase: {}", other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRecord {
     pub id: String,
@@ -137,17 +202,12 @@ pub struct JobRecord {
     pub progress: f32,
     pub current_stage: String,
     pub duration_secs: f64,
-    /// One-line, human-readable error summary shown in the UI tile.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Categorized error code/type (e.g. validation_error, io_lock, ffmpeg_error)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_category: Option<String>,
-    /// Verbose multi-line diagnostic log (e.g., last ffmpeg stderr lines). Rendered inside a
-    /// collapsible `<details>` element so it never floods the dashboard.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_log: Option<Vec<String>>,
-    /// How many times this job has been retried (incremented on each retry).
     #[serde(default)]
     pub attempt: u32,
     #[serde(default)]
@@ -161,6 +221,14 @@ pub struct JobRecord {
     pub fingerprint: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leased_until: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<String>,
+    #[serde(default)]
+    pub cancel_requested: bool,
     pub source_frame_count: i64,
     pub current_frame: i64,
     pub encode_fps: f64,
@@ -193,6 +261,10 @@ impl JobRecord {
             finished_at: None,
             fingerprint: None,
             request_hash: None,
+            worker_id: None,
+            leased_until: None,
+            heartbeat_at: None,
+            cancel_requested: false,
             source_frame_count: 0,
             current_frame: 0,
             encode_fps: 0.0,
@@ -232,17 +304,54 @@ impl JobRecord {
     }
 }
 
+fn persist_job(pool: &Option<Arc<SqlitePool>>, job: JobRecord) {
+    if let Some(pool) = pool.clone() {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                let _ = crate::db::insert_durable_job(&pool, &job).await;
+            });
+        } else {
+            std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async {
+                        let _ = crate::db::insert_durable_job(&pool, &job).await;
+                    });
+                }
+            });
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct JobQueue {
     jobs: Arc<RwLock<Vec<JobRecord>>>,
     event_tx: broadcast::Sender<String>,
+    pool: Option<Arc<SqlitePool>>,
 }
 
 impl JobQueue {
-    pub fn new(event_tx: broadcast::Sender<String>) -> Self {
+    pub fn new(event_tx: broadcast::Sender<String>, pool: Option<Arc<SqlitePool>>) -> Self {
         Self {
             jobs: Arc::new(RwLock::new(Vec::new())),
             event_tx,
+            pool,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn new_in_memory(event_tx: broadcast::Sender<String>) -> Self {
+        Self::new(event_tx, None)
+    }
+
+    pub fn populate(&self, records: Vec<JobRecord>) {
+        let mut jobs = self.jobs.write();
+        for r in records {
+            if !jobs.iter().any(|j| j.id == r.id) {
+                jobs.push(r);
+            }
         }
     }
 
@@ -251,13 +360,17 @@ impl JobQueue {
     }
 
     pub fn push(&self, job: JobRecord) {
-        self.jobs.write().push(job);
+        self.jobs.write().push(job.clone());
+        persist_job(&self.pool, job);
     }
 
     pub fn update(&self, id: &str, f: impl FnOnce(&mut JobRecord)) {
         let mut jobs = self.jobs.write();
         if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
             f(job);
+            let job_clone = job.clone();
+            drop(jobs);
+            persist_job(&self.pool, job_clone);
         }
     }
 
@@ -272,6 +385,45 @@ impl JobQueue {
         if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
             job.transition_to(next, stage_description)?;
             f(job);
+            let job_clone = job.clone();
+            drop(jobs);
+            persist_job(&self.pool, job_clone);
+            Ok(())
+        } else {
+            Err(format!("Job {} not found", id))
+        }
+    }
+
+    pub fn heartbeat(&self, id: &str, worker_id: &str, extend_secs: i64) -> Result<bool, String> {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+            let now = Utc::now();
+            job.worker_id = Some(worker_id.to_string());
+            job.heartbeat_at = Some(now.to_rfc3339());
+            job.leased_until = Some((now + chrono::Duration::seconds(extend_secs)).to_rfc3339());
+            let cancel_req = job.cancel_requested || job.phase == JobPhase::CancelRequested;
+            let job_clone = job.clone();
+            drop(jobs);
+            persist_job(&self.pool, job_clone);
+            Ok(cancel_req)
+        } else {
+            Err(format!("Job {} not found", id))
+        }
+    }
+
+    pub fn request_cancel(&self, id: &str) -> Result<(), String> {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+            job.cancel_requested = true;
+            if job.phase == JobPhase::Queued {
+                let _ = job.transition_to(JobPhase::Cancelled, Some("Cancelled".into()));
+            } else if !job.phase.is_terminal() && job.phase != JobPhase::CancelRequested {
+                let _ =
+                    job.transition_to(JobPhase::CancelRequested, Some("Cancel requested".into()));
+            }
+            let job_clone = job.clone();
+            drop(jobs);
+            persist_job(&self.pool, job_clone);
             Ok(())
         } else {
             Err(format!("Job {} not found", id))
