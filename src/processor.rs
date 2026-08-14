@@ -431,6 +431,28 @@ fn process_file_inner(
         },
     );
 
+    // Preflight disk space check on target directory (require at least 500MB)
+    let min_free_space_bytes: u64 = 500 * 1024 * 1024;
+    if let Err(e) = check_disk_space(Path::new(&config.paths.target_folder), min_free_space_bytes) {
+        tracing::error!("Disk preflight failed for {}: {}", input_path.display(), e);
+        let _ = queue.transition(
+            &job.id,
+            jobs::JobPhase::Failed,
+            Some("Failed".into()),
+            |j| {
+                j.error = Some(e.clone());
+                j.error_category = Some("io_disk_full".into());
+            },
+        );
+        queue.broadcast(
+            "failed",
+            &serde_json::json!({"id": job.id, "error": e}).to_string(),
+        );
+        let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+        queue.prune_old(500);
+        return;
+    }
+
     let mut attempt = 1;
     let mut last_error;
 
@@ -1167,6 +1189,37 @@ pub fn run_qc_evaluation(
         warnings_count,
         findings,
     }
+}
+
+pub fn check_disk_space(target_dir: &Path, min_bytes_required: u64) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        let mut wide: Vec<u16> = target_dir.as_os_str().encode_wide().collect();
+        wide.push(0);
+
+        let mut free_bytes_available: u64 = 0;
+        let mut total_number_of_bytes: u64 = 0;
+        let mut total_number_of_free_bytes: u64 = 0;
+
+        unsafe {
+            let res = windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_bytes_available,
+                &mut total_number_of_bytes,
+                &mut total_number_of_free_bytes,
+            );
+            if res != 0 && free_bytes_available < min_bytes_required {
+                return Err(format!(
+                    "Insufficient disk space on target volume: {} MB available, {} MB required",
+                    free_bytes_available / (1024 * 1024),
+                    min_bytes_required / (1024 * 1024)
+                ));
+            }
+        }
+    }
+    let _ = (target_dir, min_bytes_required);
+    Ok(())
 }
 
 pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
@@ -1967,5 +2020,18 @@ mod tests {
             .any(|f| f.code == "audio_sample_rate_not_48k"));
         assert!(qc.findings.iter().any(|f| f.code == "closed_gop_violation"));
         assert!(qc.findings.iter().any(|f| f.code == "missing_faststart"));
+    }
+
+    #[test]
+    fn test_check_disk_space_current_dir() {
+        let cwd = std::env::current_dir().unwrap();
+        // Request 1 byte (should succeed on any working volume)
+        let res = check_disk_space(&cwd, 1);
+        assert!(res.is_ok());
+
+        // Request 1000 TB (should fail due to insufficient space)
+        let huge_space = 1000 * 1024 * 1024 * 1024 * 1024;
+        let res_huge = check_disk_space(&cwd, huge_space);
+        assert!(res_huge.is_err());
     }
 }
