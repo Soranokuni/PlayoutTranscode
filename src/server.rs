@@ -1322,9 +1322,9 @@ async fn post_subclip(
                 .iter()
                 .any(|&kf| (kf - body.trim_in_ms).abs() as f64 <= tolerance);
             if aligned {
-                (true, Vec::new())
+                (parent.mezzanine_ok, Vec::new())
             } else {
-                (false, vec!["trim_in_not_keyframe_aligned".to_string()])
+                (parent.mezzanine_ok, vec!["trim_in_not_keyframe_aligned".to_string()])
             }
         } else {
             (parent.mezzanine_ok, Vec::new())
