@@ -162,6 +162,34 @@
           </div>
 
           <div class="panel config-section">
+            <div class="panel-header"><span class="panel-title" style="color:var(--accent-emerald)">AUDIO NORMALIZATION &amp; QC</span></div>
+            <div class="form-row">
+              <label>Loudness Mode</label>
+              <select v-model="editAudioMode">
+                <option value="legacy_v1_encode">Legacy (Preserve / Pass-through)</option>
+                <option value="ebu_r128">EBU R128 (-23 LUFS / -1 dBTP / 7 LRA)</option>
+                <option value="atsc_a85">ATSC A/85 (-24 LUFS / -2 dBTP / 7 LRA)</option>
+                <option value="passthrough_validate">Passthrough &amp; Validate Only</option>
+                <option value="analyze_only">Analyze &amp; Report Only</option>
+              </select>
+            </div>
+            <div class="form-row" v-if="editAudioMode === 'ebu_r128' || editAudioMode === 'atsc_a85'">
+              <label>Target LUFS</label>
+              <input type="number" step="0.5" v-model.number="editAudioTargetLufs" class="input" style="width:80px" :placeholder="editAudioMode === 'ebu_r128' ? '-23.0' : '-24.0'" />
+              <label style="margin-left:16px">True Peak (dBTP)</label>
+              <input type="number" step="0.5" v-model.number="editAudioTruePeak" class="input" style="width:80px" :placeholder="editAudioMode === 'ebu_r128' ? '-1.0' : '-2.0'" />
+              <label style="margin-left:16px">LRA Target</label>
+              <input type="number" step="0.5" v-model.number="editAudioLra" class="input" style="width:80px" placeholder="7.0" />
+            </div>
+            <div class="form-row">
+              <label class="checkbox-label">
+                <input type="checkbox" v-model="editAudioDualMono" />
+                Mono to Dual-Mono Channel Expansion (Stereo Track)
+              </label>
+            </div>
+          </div>
+
+          <div class="panel config-section">
             <div class="panel-header"><span class="panel-title" style="color:var(--text-secondary)">SERVICE</span></div>
             <div class="form-row">
               <label>Max concurrent</label>
@@ -272,6 +300,12 @@ const editAutoRetryOnStart = ref(true)
 const editMaxAttempts = ref(2)
 const editRetryDelayMs = ref(2000)
 
+const editAudioMode = ref<'legacy_v1_encode' | 'ebu_r128' | 'atsc_a85' | 'passthrough_validate' | 'analyze_only'>('legacy_v1_encode')
+const editAudioTargetLufs = ref<number | undefined>(undefined)
+const editAudioTruePeak = ref<number | undefined>(undefined)
+const editAudioLra = ref<number | undefined>(undefined)
+const editAudioDualMono = ref(false)
+
 const logViewerRef = ref<HTMLElement | null>(null)
 const ingestPanelRef = ref<InstanceType<typeof IngestQueuePanel> | null>(null)
 
@@ -354,6 +388,13 @@ function populateFromConfig(cfg: ConfigPayload) {
   editAutoRetryOnStart.value = cfg.ingestion.auto_retry_on_start ?? true
   editMaxAttempts.value = cfg.ingestion.max_attempts ?? 2
   editRetryDelayMs.value = cfg.ingestion.retry_delay_ms ?? 2000
+  if (cfg.audio_policy) {
+    editAudioMode.value = cfg.audio_policy.mode || 'legacy_v1_encode'
+    editAudioTargetLufs.value = cfg.audio_policy.target_lufs
+    editAudioTruePeak.value = cfg.audio_policy.true_peak_dbtp
+    editAudioLra.value = cfg.audio_policy.lra_target
+    editAudioDualMono.value = !!cfg.audio_policy.dual_mono
+  }
   availableCores.value = cfg.system?.available_logical_cores ?? 0
   recomputeThreads()
 }
@@ -382,6 +423,18 @@ async function saveConfig() {
         audio_codec: editAudioCodec.value,
         audio_bitrate: editAudioBitrate.value,
         tune: editTune.value,
+      },
+      audio_policy: {
+        mode: editAudioMode.value,
+        codec: editAudioCodec.value,
+        bitrate: editAudioBitrate.value,
+        sample_rate_hz: 48000,
+        channels: 2,
+        target_lufs: editAudioTargetLufs.value,
+        true_peak_dbtp: editAudioTruePeak.value,
+        lra_target: editAudioLra.value,
+        dual_mono: editAudioDualMono.value,
+        preserve_original: false,
       },
       profile_a: { enabled: true, crf: editCrfA.value, maxrate: editMaxrateAB.value, bufsize: editBufsizeAB.value },
       profile_b: { enabled: true, crf: editCrfB.value, maxrate: editMaxrateAB.value, bufsize: editBufsizeAB.value },

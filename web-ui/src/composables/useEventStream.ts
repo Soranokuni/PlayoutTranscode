@@ -82,6 +82,20 @@ export interface StatsPayload {
   total: number
 }
 
+export interface AudioPolicyPayload {
+  mode: 'legacy_v1_encode' | 'ebu_r128' | 'atsc_a85' | 'passthrough_validate' | 'analyze_only'
+  codec: string
+  bitrate: string
+  sample_rate_hz: number
+  channels: number
+  channel_layout?: string
+  target_lufs?: number
+  true_peak_dbtp?: number
+  lra_target?: number
+  dual_mono: boolean
+  preserve_original: boolean
+}
+
 export interface ConfigPayload {
   paths: { watch_folder: string; target_folder: string }
   encoding: {
@@ -96,6 +110,7 @@ export interface ConfigPayload {
     effective_threads_per_encode?: number
     effective_total_threads?: number
   }
+  audio_policy?: AudioPolicyPayload
   profiles: { a: { enabled: boolean; crf: number; maxrate: string; bufsize: string }; b: { enabled: boolean; crf: number; maxrate: string; bufsize: string }; c: { enabled: boolean; crf: number; maxrate: string; bufsize: string } }
   ingestion: {
     settle_secs: number
