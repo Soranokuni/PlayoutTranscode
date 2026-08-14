@@ -21,6 +21,196 @@ impl std::fmt::Display for ProfileId {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BroadcastVideoProfile {
+    pub name: String,
+    pub description: String,
+    pub container: String,
+    pub video_codec: String,
+    pub pix_fmt: String,
+    pub width: i32,
+    pub height: i32,
+    pub fps_num: i64,
+    pub fps_den: i64,
+    pub interlaced: bool,
+    pub field_order: String,
+    pub gop_size_secs: f64,
+    pub closed_gop: bool,
+    pub colorspace: String,
+    pub color_trc: String,
+    pub color_primaries: String,
+    pub video_profile: Option<String>,
+    pub video_level: Option<String>,
+    pub crf: Option<u32>,
+    pub maxrate: Option<String>,
+    pub bufsize: Option<String>,
+    pub faststart: bool,
+}
+
+#[allow(dead_code)]
+impl BroadcastVideoProfile {
+    pub fn playoutvue_h264_1080p25() -> Self {
+        Self {
+            name: "playoutvue-h264-1080p25".to_string(),
+            description: "Playout standard 1080p25 H.264 CFR closed GOP (Profile A)".to_string(),
+            container: "mp4".to_string(),
+            video_codec: "libx264".to_string(),
+            pix_fmt: "yuv420p".to_string(),
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            interlaced: false,
+            field_order: "progressive".to_string(),
+            gop_size_secs: 2.0,
+            closed_gop: true,
+            colorspace: "bt709".to_string(),
+            color_trc: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
+            video_profile: Some("high".to_string()),
+            video_level: Some("4.2".to_string()),
+            crf: Some(17),
+            maxrate: Some("15M".to_string()),
+            bufsize: Some("30M".to_string()),
+            faststart: true,
+        }
+    }
+
+    pub fn playoutvue_h264_1080i50() -> Self {
+        Self {
+            name: "playoutvue-h264-1080i50".to_string(),
+            description: "Playout broadcast 1080i50 (TFF) H.264 CFR closed GOP (Profile B)"
+                .to_string(),
+            container: "mp4".to_string(),
+            video_codec: "libx264".to_string(),
+            pix_fmt: "yuv420p".to_string(),
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            interlaced: true,
+            field_order: "tff".to_string(),
+            gop_size_secs: 2.0,
+            closed_gop: true,
+            colorspace: "bt709".to_string(),
+            color_trc: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
+            video_profile: Some("high".to_string()),
+            video_level: Some("4.2".to_string()),
+            crf: Some(18),
+            maxrate: Some("15M".to_string()),
+            bufsize: Some("30M".to_string()),
+            faststart: true,
+        }
+    }
+
+    pub fn playoutvue_h264_720p50() -> Self {
+        Self {
+            name: "playoutvue-h264-720p50".to_string(),
+            description: "Playout broadcast 720p50 H.264 CFR closed GOP".to_string(),
+            container: "mp4".to_string(),
+            video_codec: "libx264".to_string(),
+            pix_fmt: "yuv420p".to_string(),
+            width: 1280,
+            height: 720,
+            fps_num: 50,
+            fps_den: 1,
+            interlaced: false,
+            field_order: "progressive".to_string(),
+            gop_size_secs: 2.0,
+            closed_gop: true,
+            colorspace: "bt709".to_string(),
+            color_trc: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
+            video_profile: Some("high".to_string()),
+            video_level: Some("4.1".to_string()),
+            crf: Some(17),
+            maxrate: Some("12M".to_string()),
+            bufsize: Some("24M".to_string()),
+            faststart: true,
+        }
+    }
+
+    pub fn playoutvue_prores_1080i50() -> Self {
+        Self {
+            name: "playoutvue-prores-1080i50".to_string(),
+            description: "Playout mezzanine ProRes 422 HQ 1080i50".to_string(),
+            container: "mov".to_string(),
+            video_codec: "prores_ks".to_string(),
+            pix_fmt: "yuv422p10le".to_string(),
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            interlaced: true,
+            field_order: "tff".to_string(),
+            gop_size_secs: 0.0,
+            closed_gop: true,
+            colorspace: "bt709".to_string(),
+            color_trc: "bt709".to_string(),
+            color_primaries: "bt709".to_string(),
+            video_profile: Some("3".to_string()),
+            video_level: None,
+            crf: None,
+            maxrate: None,
+            bufsize: None,
+            faststart: true,
+        }
+    }
+
+    pub fn playoutvue_h264_1080p25_sd_pal() -> Self {
+        Self {
+            name: "playoutvue-h264-1080p25-sd-pal".to_string(),
+            description: "Playout standard SD PAL 4:3 pillarbox in 1080p25 SMPTE-170M (Profile C)"
+                .to_string(),
+            container: "mp4".to_string(),
+            video_codec: "libx264".to_string(),
+            pix_fmt: "yuv420p".to_string(),
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            interlaced: false,
+            field_order: "progressive".to_string(),
+            gop_size_secs: 2.0,
+            closed_gop: true,
+            colorspace: "smpte170m".to_string(),
+            color_trc: "smpte170m".to_string(),
+            color_primaries: "smpte170m".to_string(),
+            video_profile: Some("high".to_string()),
+            video_level: Some("4.2".to_string()),
+            crf: Some(20),
+            maxrate: Some("10M".to_string()),
+            bufsize: Some("20M".to_string()),
+            faststart: true,
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub fn get_standard_broadcast_profiles() -> Vec<BroadcastVideoProfile> {
+    vec![
+        BroadcastVideoProfile::playoutvue_h264_1080p25(),
+        BroadcastVideoProfile::playoutvue_h264_1080i50(),
+        BroadcastVideoProfile::playoutvue_h264_720p50(),
+        BroadcastVideoProfile::playoutvue_prores_1080i50(),
+        BroadcastVideoProfile::playoutvue_h264_1080p25_sd_pal(),
+    ]
+}
+
+#[allow(dead_code)]
+pub fn find_broadcast_profile(name: &str) -> Option<BroadcastVideoProfile> {
+    get_standard_broadcast_profiles().into_iter().find(|p| {
+        p.name.eq_ignore_ascii_case(name)
+            || match (name.to_lowercase().as_str(), p.name.as_str()) {
+                ("profilea" | "profile_a" | "a", "playoutvue-h264-1080p25") => true,
+                ("profileb" | "profile_b" | "b", "playoutvue-h264-1080i50") => true,
+                ("profilec" | "profile_c" | "c", "playoutvue-h264-1080p25-sd-pal") => true,
+                _ => false,
+            }
+    })
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct EncodingProfile {
@@ -782,5 +972,46 @@ mod tests {
             !args.contains(&"-af".to_string()),
             "Silent audio on stereo input must omit loudnorm filter (unity gain)"
         );
+    }
+
+    #[test]
+    fn test_broadcast_profiles_registry() {
+        let profiles = get_standard_broadcast_profiles();
+        assert_eq!(profiles.len(), 5);
+
+        let p1080p = find_broadcast_profile("playoutvue-h264-1080p25").unwrap();
+        assert_eq!(p1080p.width, 1920);
+        assert_eq!(p1080p.height, 1080);
+        assert_eq!(p1080p.fps_num, 25);
+        assert_eq!(p1080p.fps_den, 1);
+        assert!(!p1080p.interlaced);
+        assert_eq!(p1080p.colorspace, "bt709");
+
+        let p1080i = find_broadcast_profile("playoutvue-h264-1080i50").unwrap();
+        assert!(p1080i.interlaced);
+        assert_eq!(p1080i.field_order, "tff");
+
+        let p720p = find_broadcast_profile("playoutvue-h264-720p50").unwrap();
+        assert_eq!(p720p.width, 1280);
+        assert_eq!(p720p.height, 720);
+        assert_eq!(p720p.fps_num, 50);
+
+        let prores = find_broadcast_profile("playoutvue-prores-1080i50").unwrap();
+        assert_eq!(prores.container, "mov");
+        assert_eq!(prores.video_codec, "prores_ks");
+        assert_eq!(prores.pix_fmt, "yuv422p10le");
+    }
+
+    #[test]
+    fn test_broadcast_profile_alias_lookup() {
+        let a = find_broadcast_profile("ProfileA").unwrap();
+        assert_eq!(a.name, "playoutvue-h264-1080p25");
+
+        let b = find_broadcast_profile("ProfileB").unwrap();
+        assert_eq!(b.name, "playoutvue-h264-1080i50");
+
+        let c = find_broadcast_profile("ProfileC").unwrap();
+        assert_eq!(c.name, "playoutvue-h264-1080p25-sd-pal");
+        assert_eq!(c.colorspace, "smpte170m");
     }
 }
