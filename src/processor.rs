@@ -654,55 +654,11 @@ fn process_file_inner(
 
         if validation_ok {
             let output_probe = final_probe.unwrap();
-
             let keyframe_safe_start_ms =
                 probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
-
-            let mut warnings_list = Vec::new();
-            let mut mezzanine_ok = true;
-
-            if let Some(ref ml) = measured_loudness {
-                if ml.is_silent {
-                    warnings_list.push("silent_audio_loudness_skipped".to_string());
-                }
-                if ml.is_short {
-                    warnings_list.push("short_clip_loudnorm_dynamic".to_string());
-                }
-            }
-
-            let fps = output_probe.fps();
-            let expected_fps = profiles::TARGET_FPS_NUM as f64 / profiles::TARGET_FPS_DEN as f64;
-            if (fps - expected_fps).abs() > 0.01 {
-                warnings_list.push(format!(
-                    "fps_mismatch: got {:.3} expected {:.3}",
-                    fps, expected_fps
-                ));
-                mezzanine_ok = false;
-            }
-
-            let source_fps = probe_data.fps();
-            if (source_fps - expected_fps).abs() > 0.01 {
-                warnings_list.push(format!(
-                    "fps_converted: source {:.3} -> output {:.3}",
-                    source_fps, expected_fps
-                ));
-            }
-
-            let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
-            if duration_ms <= 0 {
-                warnings_list.push("zero_duration".to_string());
-                mezzanine_ok = false;
-            }
-
-            if output_probe.audio_sample_rate != 48000 {
-                warnings_list.push(format!(
-                    "audio_sample_rate_not_48k: got {} Hz",
-                    output_probe.audio_sample_rate
-                ));
-                mezzanine_ok = false;
-            }
-
             let total_frames = output_probe.frame_count;
+            let fps = output_probe.fps();
+            let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
             let gop_frames = compute_gop_from_fps(fps);
 
             let keyframe_offsets = extract_keyframe_offsets_ms(
@@ -710,16 +666,27 @@ fn process_file_inner(
                 &result.output_path,
             );
             let closed_gop_ok = verify_closed_gop(&keyframe_offsets, gop_frames, fps);
-            if !closed_gop_ok {
-                warnings_list.push("closed_gop_violation".to_string());
-                mezzanine_ok = false;
-            }
-
             let faststart_ok = verify_faststart(&result.output_path);
-            if !faststart_ok {
-                warnings_list.push("missing_faststart".to_string());
-                mezzanine_ok = false;
-            }
+
+            let qc_report = run_qc_evaluation(
+                &output_probe,
+                &probe_data,
+                closed_gop_ok,
+                faststart_ok,
+                measured_loudness.as_ref(),
+                &audio_policy,
+            );
+
+            let mezzanine_ok = qc_report.passed;
+            let warnings_list: Vec<String> = qc_report
+                .findings
+                .iter()
+                .filter(|f| {
+                    f.severity == identity::Severity::Warning
+                        || f.severity == identity::Severity::Error
+                })
+                .map(|f| f.code.clone())
+                .collect();
 
             let _ = queue.transition(
                 &job.id,
@@ -777,6 +744,8 @@ fn process_file_inner(
                 closed_gop: closed_gop_ok,
                 faststart: faststart_ok,
                 warnings: warnings_list.clone(),
+                findings: Some(qc_report.findings.clone()),
+                qc_report: Some(qc_report),
                 sha256: sha256.clone(),
                 file_size_bytes,
             };
@@ -1083,6 +1052,120 @@ fn probe_with_retry(
         Err(format!("ffprobe returned an error without message (output may be premature or unreadable); see logs"))
     } else {
         Err(last_err)
+    }
+}
+
+pub fn run_qc_evaluation(
+    output_probe: &probe::ProbeData,
+    source_probe: &probe::ProbeData,
+    closed_gop_ok: bool,
+    faststart_ok: bool,
+    measured_loudness: Option<&probe::MeasuredLoudness>,
+    _audio_policy: &config::AudioPolicy,
+) -> identity::QcReport {
+    let mut findings = Vec::new();
+    let mut blocking_errors = 0;
+    let mut warnings_count = 0;
+
+    // 1. Duration check
+    let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
+    if duration_ms <= 0 {
+        findings.push(identity::ValidationFinding::error(
+            "zero_duration",
+            "Output duration must be greater than zero",
+            Some(format!("{} ms", duration_ms)),
+            Some("> 0 ms".to_string()),
+        ));
+        blocking_errors += 1;
+    }
+
+    // 2. FPS check
+    let fps = output_probe.fps();
+    let expected_fps = profiles::TARGET_FPS_NUM as f64 / profiles::TARGET_FPS_DEN as f64;
+    if (fps - expected_fps).abs() > 0.01 {
+        findings.push(identity::ValidationFinding::error(
+            "fps_mismatch",
+            "Output FPS does not match target broadcast standard",
+            Some(format!(
+                "{:.3} fps ({}/{})",
+                fps, output_probe.fps_num, output_probe.fps_den
+            )),
+            Some(format!("{:.3} fps", expected_fps)),
+        ));
+        blocking_errors += 1;
+    }
+
+    let source_fps = source_probe.fps();
+    if (source_fps - expected_fps).abs() > 0.01 {
+        findings.push(identity::ValidationFinding::warning(
+            "fps_converted",
+            "Input frame rate was converted to match output profile standard",
+            Some(format!("{:.3} fps", source_fps)),
+            Some(format!("{:.3} fps", expected_fps)),
+        ));
+        warnings_count += 1;
+    }
+
+    // 3. Audio sample rate check
+    if output_probe.audio_sample_rate != 48000 {
+        findings.push(identity::ValidationFinding::error(
+            "audio_sample_rate_not_48k",
+            "Output audio sample rate must be exactly 48000 Hz",
+            Some(format!("{} Hz", output_probe.audio_sample_rate)),
+            Some("48000 Hz".to_string()),
+        ));
+        blocking_errors += 1;
+    }
+
+    // 4. Closed GOP check
+    if !closed_gop_ok {
+        findings.push(identity::ValidationFinding::error(
+            "closed_gop_violation",
+            "Keyframe structure does not satisfy closed GOP cadence requirements",
+            Some("irregular GOP detected".to_string()),
+            Some("strict closed GOP with 2s interval".to_string()),
+        ));
+        blocking_errors += 1;
+    }
+
+    // 5. Faststart check
+    if !faststart_ok {
+        findings.push(identity::ValidationFinding::error(
+            "missing_faststart",
+            "MP4 moov atom is not at the beginning of the file (faststart missing)",
+            Some("moov atom not in first 64KB".to_string()),
+            Some("+faststart enabled".to_string()),
+        ));
+        blocking_errors += 1;
+    }
+
+    // 6. Audio loudness checks
+    if let Some(ml) = measured_loudness {
+        if ml.is_silent {
+            findings.push(identity::ValidationFinding::warning(
+                "silent_audio_loudness_skipped",
+                "Input audio is silent or near-silence; loudness normalization skipped",
+                Some(format!("{:.1} LUFS", ml.input_i)),
+                None,
+            ));
+            warnings_count += 1;
+        } else if ml.is_short {
+            findings.push(identity::ValidationFinding::warning(
+                "short_clip_loudnorm_dynamic",
+                "Clip duration under 3 seconds; dynamic loudnorm mode applied",
+                Some(format!("{:.2} s", source_probe.duration_secs)),
+                Some(">= 3.0 s for linear mode".to_string()),
+            ));
+            warnings_count += 1;
+        }
+    }
+
+    let passed = blocking_errors == 0;
+    identity::QcReport {
+        passed,
+        blocking_errors,
+        warnings_count,
+        findings,
     }
 }
 
@@ -1794,6 +1877,8 @@ mod tests {
             closed_gop: true,
             faststart: true,
             warnings: vec![],
+            findings: None,
+            qc_report: None,
             sha256: Some("abcdef1234567890".into()),
             file_size_bytes: Some(1048576),
         };
@@ -1823,5 +1908,64 @@ mod tests {
         assert!(json.contains("\"validation_report\":{"));
         assert!(json.contains("\"sha256\":\"abcdef1234567890\""));
         assert!(json.contains("\"file_size_bytes\":1048576"));
+    }
+
+    #[test]
+    fn test_qc_evaluation_compliant_pass() {
+        let dummy_probe = probe::ProbeData {
+            input_path: "C:/src/clip.mp4".into(),
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+        };
+        let policy = config::AudioPolicy::default();
+
+        let qc = run_qc_evaluation(&dummy_probe, &dummy_probe, true, true, None, &policy);
+        assert!(qc.passed);
+        assert_eq!(qc.blocking_errors, 0);
+    }
+
+    #[test]
+    fn test_qc_evaluation_blocking_failures() {
+        let dummy_source = probe::ProbeData {
+            input_path: "C:/src/clip.mp4".into(),
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 44100, // Non-48k audio
+            audio_channels: 2,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+        };
+        let mut dummy_output = dummy_source.clone();
+        dummy_output.duration_secs = 0.0; // Zero duration error
+
+        let policy = config::AudioPolicy::default();
+
+        // 1. Zero duration + 44.1k audio + GOP violation + missing faststart -> 4 blocking errors
+        let qc = run_qc_evaluation(&dummy_output, &dummy_source, false, false, None, &policy);
+        assert!(!qc.passed);
+        assert!(qc.blocking_errors >= 4);
+        assert!(qc.findings.iter().any(|f| f.code == "zero_duration"));
+        assert!(qc
+            .findings
+            .iter()
+            .any(|f| f.code == "audio_sample_rate_not_48k"));
+        assert!(qc.findings.iter().any(|f| f.code == "closed_gop_violation"));
+        assert!(qc.findings.iter().any(|f| f.code == "missing_faststart"));
     }
 }
