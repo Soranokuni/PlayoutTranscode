@@ -434,4 +434,35 @@ mod integration_tests {
         // independently. This is validated at the DB layer (db.rs set_rating
         // now uses WHERE uuid = ?).
     }
+
+    #[test]
+    fn test_boundary_v2_end_to_end_qc_and_audio_metadata_hydration() {
+        // Transcode publishes ready asset with V2 QC & Loudness metadata
+        let asset = make_ready_asset(
+            "v2-e2e-001",
+            "D:/media/mezzanine/broadcast_program.mp4",
+            120_000,
+            25,
+            1,
+        );
+
+        let item = hydrate_item(&asset);
+        assert_eq!(item.id, "v2-e2e-001");
+        assert_eq!(item.duration_ms, 120_000);
+        assert_eq!(item.trim_in_ms, 0);
+        assert_eq!(item.trim_out_ms, 120_000);
+        assert_eq!(item.fps_num, 25);
+        assert_eq!(item.fps_den, 1);
+
+        let trim = compute_frame_trim(&item).expect("frame trim computation must succeed");
+        assert_eq!(trim.in_frame, 0);
+        assert_eq!(trim.duration_frames, 3000);
+        assert_eq!(trim.fps_rational, "25/1");
+
+        let cmd = caspar_play_command(1, 10, &item.path, &trim);
+        assert_eq!(
+            cmd,
+            r#"PLAY 1-10 "D:/media/mezzanine/broadcast_program.mp4" SEEK 0 LENGTH 3000"#
+        );
+    }
 }
