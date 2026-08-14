@@ -90,7 +90,22 @@ pub async fn run_server(
             get(get_folder_colors).put(put_folder_color),
         );
 
+    let api_v2 = Router::new()
+        .route("/health", get(health_v2))
+        .route("/toolchain", get(get_toolchain_status))
+        .route("/config", get(get_config).put(put_config))
+        .route("/profiles", get(get_profiles_v2))
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/{id}", get(get_job_v2))
+        .route("/jobs/{id}/cancel", post(post_cancel_job))
+        .route("/jobs/{id}/retry", post(post_retry_job))
+        .route("/assets", get(list_assets))
+        .route("/assets/{uuid}", get(get_asset))
+        .route("/events", get(sse_events))
+        .route("/metrics", get(get_metrics_v2));
+
     let app = Router::new()
+        .nest("/api/v2", api_v2)
         .nest("/api", api)
         .fallback(serve_spa)
         .layer(CorsLayer::permissive())
@@ -173,6 +188,65 @@ async fn health(State(state): State<ServerState>) -> Json<serde_json::Value> {
         "toolchain_ready": state.toolchain_status.ffmpeg_found && state.toolchain_status.ffprobe_found,
         "service_running": state.service_handle.is_running(),
         "uptime_ms": uptime_ms,
+    }))
+}
+
+async fn health_v2(State(state): State<ServerState>) -> impl IntoResponse {
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    Json(serde_json::json!({
+        "status": "ok",
+        "service": "PlayoutTranscode",
+        "api_version": "2.0.0",
+        "version": env!("CARGO_PKG_VERSION"),
+        "toolchain_ready": state.toolchain_status.ffmpeg_found && state.toolchain_status.ffprobe_found,
+        "service_running": state.service_handle.is_running(),
+        "uptime_secs": uptime_secs,
+    }))
+}
+
+async fn get_profiles_v2() -> impl IntoResponse {
+    Json(crate::profiles::get_standard_broadcast_profiles())
+}
+
+async fn get_job_v2(State(state): State<ServerState>, Path(id): Path<String>) -> impl IntoResponse {
+    if let Some(job) = state.jobs.get(&id) {
+        Json(job).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Job not found"})),
+        )
+            .into_response()
+    }
+}
+
+async fn get_metrics_v2(State(state): State<ServerState>) -> impl IntoResponse {
+    let all = state.jobs.all();
+    let pending = all.iter().filter(|j| j.state == JobState::Pending).count();
+    let active = all
+        .iter()
+        .filter(|j| j.state == JobState::Processing)
+        .count();
+    let completed = all
+        .iter()
+        .filter(|j| j.state == JobState::Completed)
+        .count();
+    let failed = all.iter().filter(|j| j.state == JobState::Failed).count();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+
+    Json(serde_json::json!({
+        "jobs": {
+            "pending": pending,
+            "active": active,
+            "completed": completed,
+            "failed": failed,
+            "total": all.len(),
+        },
+        "system": {
+            "uptime_secs": uptime_secs,
+            "active_pids": state.service_handle.active_pids_count(),
+            "service_running": state.service_handle.is_running(),
+        }
     }))
 }
 

@@ -241,3 +241,106 @@ async fn test_live_axum_wire_contract_endpoints() {
     let assets_res: Value = serde_json::from_str(&text).unwrap();
     assert!(assets_res.is_array());
 }
+
+#[tokio::test]
+async fn test_live_axum_v2_wire_contract_endpoints() {
+    use axum::{routing::get, Json, Router};
+
+    let api_v2 = Router::new()
+        .route(
+            "/health",
+            get(|| async {
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "service": "PlayoutTranscode",
+                    "api_version": "2.0.0",
+                    "uptime_secs": 42
+                }))
+            }),
+        )
+        .route(
+            "/profiles",
+            get(|| async {
+                Json(serde_json::json!([
+                    {
+                        "name": "playoutvue-h264-1080p25",
+                        "width": 1920,
+                        "height": 1080,
+                        "fps_num": 25,
+                        "fps_den": 1
+                    }
+                ]))
+            }),
+        )
+        .route(
+            "/metrics",
+            get(|| async {
+                Json(serde_json::json!({
+                    "jobs": {
+                        "pending": 2,
+                        "active": 1,
+                        "completed": 10,
+                        "failed": 0,
+                        "total": 13
+                    },
+                    "system": {
+                        "uptime_secs": 42,
+                        "active_pids": 1,
+                        "service_running": true
+                    }
+                }))
+            }),
+        );
+
+    let app = Router::new().nest("/api/v2", api_v2);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind ephemeral test port");
+    let addr = listener.local_addr().expect("Failed to get local addr");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{}/api/v2", addr.port());
+
+    // 1. GET /api/v2/health
+    let res = client
+        .get(format!("{}/health", base))
+        .send()
+        .await
+        .expect("GET /api/v2/health failed");
+    assert_eq!(res.status(), 200);
+    let text = res.text().await.unwrap();
+    let health: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["api_version"], "2.0.0");
+
+    // 2. GET /api/v2/profiles
+    let res = client
+        .get(format!("{}/profiles", base))
+        .send()
+        .await
+        .expect("GET /api/v2/profiles failed");
+    assert_eq!(res.status(), 200);
+    let text = res.text().await.unwrap();
+    let profiles: Value = serde_json::from_str(&text).unwrap();
+    assert!(profiles.is_array());
+    assert_eq!(profiles[0]["name"], "playoutvue-h264-1080p25");
+
+    // 3. GET /api/v2/metrics
+    let res = client
+        .get(format!("{}/metrics", base))
+        .send()
+        .await
+        .expect("GET /api/v2/metrics failed");
+    assert_eq!(res.status(), 200);
+    let text = res.text().await.unwrap();
+    let metrics: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(metrics["jobs"]["total"], 13);
+    assert_eq!(metrics["system"]["service_running"], true);
+}

@@ -70,6 +70,10 @@ impl ServiceHandle {
         *self.running.lock()
     }
 
+    pub fn active_pids_count(&self) -> usize {
+        self.active_pids.lock().map(|p| p.len()).unwrap_or(0)
+    }
+
     pub fn kill_active_ffmpeg(&self) {
         let pids: Vec<u32> = {
             match self.active_pids.lock() {
