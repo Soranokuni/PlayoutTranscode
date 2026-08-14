@@ -80,6 +80,7 @@
             ref="ingestPanelRef"
             :jobs="jobs"
             @retry="onRetryJob"
+            @cancel="onCancelJob"
             @retry-all="onRetryAll"
           />
           <AssetRegistryGrid :assets="assets" />
@@ -239,7 +240,7 @@ const {
   jobs, assets, watchfolder, stats, config, toolchain,
   serviceRunning, downloading, logs, uptimeMs,
   fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
-  installService, uninstallService, clearLogs, retryJob, retryAllFailed,
+  installService, uninstallService, clearLogs, retryJob, cancelJob, retryAllFailed,
 } = useEventStream()
 
 const configStatus = ref<'loading' | 'ready'>('loading')
@@ -301,6 +302,13 @@ async function onRetryJob(id: string) {
   const msg = ok ? 'Retrying job…' : (r?.error || 'Retry failed')
   ingestPanelRef.value?.showRetryMsg(msg, ok)
   if (ok) { /* SSE will refresh state via fetchAll */ }
+}
+
+async function onCancelJob(id: string) {
+  const r = await cancelJob(id)
+  const ok = !!r?.success
+  const msg = ok ? 'Cancelling job…' : (r?.error || 'Cancel failed')
+  ingestPanelRef.value?.showRetryMsg(msg, ok)
 }
 
 async function onRetryAll() {
