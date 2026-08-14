@@ -290,6 +290,20 @@ async fn test_live_axum_v2_wire_contract_endpoints() {
                     }
                 }))
             }),
+        )
+        .route(
+            "/diagnostics",
+            get(|| async {
+                Json(serde_json::json!({
+                    "service": {
+                        "name": "PlayoutTranscode",
+                        "api_version": "2.0.0"
+                    },
+                    "database": {
+                        "integrity": "ok"
+                    }
+                }))
+            }),
         );
 
     let app = Router::new().nest("/api/v2", api_v2);
@@ -343,4 +357,15 @@ async fn test_live_axum_v2_wire_contract_endpoints() {
     let metrics: Value = serde_json::from_str(&text).unwrap();
     assert_eq!(metrics["jobs"]["total"], 13);
     assert_eq!(metrics["system"]["service_running"], true);
+
+    // 4. GET /api/v2/diagnostics
+    let res = client
+        .get(format!("{}/diagnostics", base))
+        .send()
+        .await
+        .expect("GET /api/v2/diagnostics failed");
+    assert_eq!(res.status(), 200);
+    let text = res.text().await.unwrap();
+    let diag: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(diag["database"]["integrity"], "ok");
 }

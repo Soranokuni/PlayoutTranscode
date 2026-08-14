@@ -73,6 +73,7 @@ pub async fn run_server(
         .route("/download/start", post(post_download_ffmpeg))
         .route("/download/status", get(get_download_status))
         .route("/logs", get(get_logs))
+        .route("/diagnostics", get(get_diagnostics))
         .route("/service/install", post(post_install_service))
         .route("/service/uninstall", post(post_uninstall_service))
         .route("/assets", get(list_assets))
@@ -102,7 +103,8 @@ pub async fn run_server(
         .route("/assets", get(list_assets))
         .route("/assets/{uuid}", get(get_asset))
         .route("/events", get(sse_events))
-        .route("/metrics", get(get_metrics_v2));
+        .route("/metrics", get(get_metrics_v2))
+        .route("/diagnostics", get(get_diagnostics));
 
     let app = Router::new()
         .nest("/api/v2", api_v2)
@@ -246,6 +248,52 @@ async fn get_metrics_v2(State(state): State<ServerState>) -> impl IntoResponse {
             "uptime_secs": uptime_secs,
             "active_pids": state.service_handle.active_pids_count(),
             "service_running": state.service_handle.is_running(),
+        }
+    }))
+}
+
+async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse {
+    let (_, tool_status) = crate::bootstrap::audit_toolchain();
+    let config = state.config.lock().clone();
+    let uptime_secs = state.started_at.elapsed().as_secs();
+    let all_jobs = state.jobs.all();
+
+    let db_ok = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
+        .fetch_one(&*state.pool)
+        .await
+        .unwrap_or_else(|e| format!("error: {}", e));
+
+    Json(serde_json::json!({
+        "service": {
+            "name": "PlayoutTranscode",
+            "version": env!("CARGO_PKG_VERSION"),
+            "api_version": "2.0.0",
+            "running": state.service_handle.is_running(),
+            "uptime_secs": uptime_secs,
+            "active_pids": state.service_handle.active_pids_count(),
+        },
+        "toolchain": tool_status,
+        "database": {
+            "integrity": db_ok,
+        },
+        "system": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "logical_cores": crate::config::available_logical_cores(),
+        },
+        "metrics": {
+            "pending_jobs": all_jobs.iter().filter(|j| j.state == JobState::Pending).count(),
+            "active_jobs": all_jobs.iter().filter(|j| j.state == JobState::Processing).count(),
+            "completed_jobs": all_jobs.iter().filter(|j| j.state == JobState::Completed).count(),
+            "failed_jobs": all_jobs.iter().filter(|j| j.state == JobState::Failed).count(),
+            "total_jobs": all_jobs.len(),
+        },
+        "config_summary": {
+            "watch_folder": config.paths.watch_folder,
+            "target_folder": config.paths.target_folder,
+            "max_concurrency": config.ingestion.max_concurrency,
+            "preset": config.encoding.preset,
+            "audio_mode": config.audio_policy.map(|p| format!("{:?}", p.mode)).unwrap_or_else(|| "legacy".into()),
         }
     }))
 }
