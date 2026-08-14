@@ -220,18 +220,20 @@ pub fn start_processing_loop(
                 .await;
             });
 
+            let running_flag = handle_for_thread.running.clone();
+
             let mut cmd_rx = cmd_rx;
             loop {
                 tokio::select! {
                     Some(path) = file_rx.recv() => {
-                        process_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path).await;
+                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path, &running_flag);
                     }
                     Some(retry_path) = retry_rx.recv() => {
                         handle_for_thread.add_log(
                             "info",
                             &format!("Manual retry submitted for {}", retry_path.display()),
                         );
-                        process_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry_path).await;
+                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry_path, &running_flag);
                     }
                     cmd = cmd_rx.recv() => {
                         if let Some(ServiceCmd::Stop) = cmd {
@@ -252,9 +254,10 @@ pub fn start_processing_loop(
     Ok(())
 }
 
-/// Drains one input through the configured concurrency semaphore and into the processor. Used
-/// for both watcher-discovered files and manual retries.
-async fn process_one(
+/// Dispatches one input file through the concurrency semaphore into the processor.
+/// The semaphore permit is acquired asynchronously and held inside the blocking task
+/// until processing completes, strictly enforcing max_concurrency.
+fn dispatch_one(
     tools: &bootstrap::ToolPaths,
     cfg: &config::AppConfig,
     jobs: &JobQueue,
@@ -263,6 +266,7 @@ async fn process_one(
     pool: &SqlitePool,
     active_pids: &Arc<StdMutex<Vec<u32>>>,
     path: std::path::PathBuf,
+    running: &Arc<parking_lot::Mutex<bool>>,
 ) {
     let t = tools.clone();
     let c = cfg.clone();
@@ -271,13 +275,30 @@ async fn process_one(
     let s = sem.clone();
     let p = pool.clone();
     let apids = active_pids.clone();
-    let _permit = s.acquire_owned().await;
-    tokio::task::spawn_blocking(move || {
-        crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p, apids);
+    let r = running.clone();
+
+    tokio::spawn(async move {
+        // Wait for an available concurrency slot without blocking the main event loop
+        let Ok(permit) = s.acquire_owned().await else {
+            return;
+        };
+
+        // If the service has stopped while waiting for a permit, exit cleanly
+        if !*r.lock() {
+            return;
+        }
+
+        let _ = tokio::task::spawn_blocking(move || {
+            // Permit is moved here and kept alive for the full duration of processing
+            let _held_permit = permit;
+            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p, apids);
+        })
+        .await;
     });
 }
 
 pub fn stop_processing(handle: &ServiceHandle) {
+    *handle.running.lock() = false;
     if let Some(ref tx) = *handle.cmd_tx.lock() {
         let _ = tx.try_send(ServiceCmd::Stop);
     }

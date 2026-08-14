@@ -9,6 +9,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProbeData {
@@ -152,7 +154,7 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
     command.arg(input_path);
 
     #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
     let output = command
         .output()
@@ -346,7 +348,7 @@ pub fn get_keyframe_safe_start_ms(ffprobe_path: &Path, path: &Path) -> i64 {
     command.arg(path);
 
     #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
     let out = command.output();
 
@@ -527,7 +529,7 @@ impl LoudnessMeasurer for RealLoudnessMeasurer {
         ]);
 
         #[cfg(target_os = "windows")]
-        command.creation_flags(CREATE_NO_WINDOW);
+        command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
         let output = command
             .output()
