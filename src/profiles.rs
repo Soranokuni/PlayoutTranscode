@@ -409,8 +409,8 @@ impl EncodingProfile {
 
         if self.interlaced {
             args.extend_from_slice(&[
-                "-top".to_string(),
-                "1".to_string(),
+                "-flags".to_string(),
+                "+ilme+ildct".to_string(),
                 "-field_order".to_string(),
                 "tt".to_string(),
             ]);
@@ -755,6 +755,14 @@ mod tests {
         assert!(
             args[vf_idx + 1].starts_with("fps=25/1"),
             "interlaced vf must also normalize fps"
+        );
+        let flags_idx = args.iter().position(|a| a == "-flags").unwrap();
+        assert_eq!(args[flags_idx + 1], "+ilme+ildct");
+        let fo_idx = args.iter().position(|a| a == "-field_order").unwrap();
+        assert_eq!(args[fo_idx + 1], "tt");
+        assert!(
+            !args.contains(&"-top".to_string()),
+            "Obsolete -top option must never be passed to ffmpeg encoder"
         );
     }
 
