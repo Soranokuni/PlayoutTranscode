@@ -186,6 +186,14 @@ pub fn start_processing_loop(
                 }
             }
 
+            let orphan_cleaned = crate::processor::cleanup_orphan_staging_files(&target.join("videos"), 1800);
+            if orphan_cleaned > 0 {
+                handle_for_thread.add_log(
+                    "info",
+                    &format!("Startup sweep: removed {} orphaned staging temp file(s)", orphan_cleaned),
+                );
+            }
+
             let (file_tx, mut file_rx) = mpsc::channel::<PathBuf>(256);
             let (retry_tx, mut retry_rx) = mpsc::channel::<PathBuf>(256);
             if let Ok(mut slot) = handle_for_thread.retry_tx.lock() {
