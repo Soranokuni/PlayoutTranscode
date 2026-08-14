@@ -718,14 +718,18 @@ async fn post_retry_job(
     }
     match state.service_handle.submit_retry(path) {
         Ok(_) => {
-            state.jobs.update(&id, |j| {
-                j.state = JobState::Pending;
-                j.error = None;
-                j.stderr_log = None;
-                j.current_stage = "Re-queued (manual retry)".into();
-                j.finished_at = None;
-                j.attempt = j.attempt.saturating_add(1);
-            });
+            let _ = state.jobs.transition(
+                &id,
+                crate::jobs::JobPhase::Queued,
+                Some("Re-queued (manual retry)".into()),
+                |j| {
+                    j.error = None;
+                    j.error_category = None;
+                    j.stderr_log = None;
+                    j.finished_at = None;
+                    j.attempt = j.attempt.saturating_add(1);
+                },
+            );
             Json(serde_json::json!({"success": true})).into_response()
         }
         Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response(),
@@ -745,14 +749,18 @@ async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoRes
         }
         match state.service_handle.submit_retry(path) {
             Ok(_) => {
-                state.jobs.update(&job.id, |j| {
-                    j.state = JobState::Pending;
-                    j.error = None;
-                    j.stderr_log = None;
-                    j.current_stage = "Re-queued (bulk retry)".into();
-                    j.finished_at = None;
-                    j.attempt = j.attempt.saturating_add(1);
-                });
+                let _ = state.jobs.transition(
+                    &job.id,
+                    crate::jobs::JobPhase::Queued,
+                    Some("Re-queued (bulk retry)".into()),
+                    |j| {
+                        j.error = None;
+                        j.error_category = None;
+                        j.stderr_log = None;
+                        j.finished_at = None;
+                        j.attempt = j.attempt.saturating_add(1);
+                    },
+                );
                 submitted += 1;
             }
             Err(_) => {
