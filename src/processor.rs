@@ -730,6 +730,9 @@ fn process_file_inner(
                 },
             );
 
+            let sha256 = compute_file_sha256(&staged_output_path).ok();
+            let file_size_bytes = std::fs::metadata(&staged_output_path).ok().map(|m| m.len());
+
             if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
                 tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
                 let _ = queue.transition(
@@ -763,7 +766,22 @@ fn process_file_inner(
                 linear_applied: ml.is_linear,
             });
 
-            let _ = identity::write_sidecar_next_to_video(
+            let validation_report = identity::ValidationReport {
+                mezzanine_ok,
+                duration_ms,
+                fps,
+                fps_num: output_probe.fps_num,
+                fps_den: output_probe.fps_den,
+                audio_sample_rate: output_probe.audio_sample_rate,
+                audio_channels: output_probe.audio_channels,
+                closed_gop: closed_gop_ok,
+                faststart: faststart_ok,
+                warnings: warnings_list.clone(),
+                sha256: sha256.clone(),
+                file_size_bytes,
+            };
+
+            let _ = identity::write_sidecar_next_to_video_with_validation(
                 &final_output_path,
                 &metadata_uuid,
                 &probe_data,
@@ -781,6 +799,9 @@ fn process_file_inner(
                 keyframe_safe_start_ms,
                 &warnings_list,
                 sidecar_loudness,
+                Some(validation_report),
+                sha256,
+                file_size_bytes,
             );
 
             let keyframe_offsets_json =
@@ -1063,6 +1084,59 @@ fn probe_with_retry(
     } else {
         Err(last_err)
     }
+}
+
+pub fn compute_file_sha256(path: &Path) -> Result<String, std::io::Error> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn cleanup_orphan_staging_files(target_dir: &Path, max_age_secs: u64) -> usize {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(target_dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let filename = path.file_name().unwrap_or_default().to_string_lossy();
+            if crate::watcher::is_temp_file_name(&path)
+                || filename.starts_with(".tmp_")
+                || filename.ends_with(".tmp_json")
+            {
+                if let Ok(metadata) = entry.metadata() {
+                    if let Ok(modified) = metadata.modified() {
+                        if let Ok(age) = now.duration_since(modified) {
+                            if age.as_secs() >= max_age_secs {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    tracing::info!(
+                                        "Cleaned up orphaned staging file: {}",
+                                        path.display()
+                                    );
+                                    removed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    removed
 }
 
 /// Validate that the probed mezzanine matches the source expectation: video + audio streams
@@ -1633,5 +1707,121 @@ mod tests {
             RetryClass::Permanent,
             "Unsupported channel layout must be classified as Permanent"
         );
+    }
+
+    #[test]
+    fn test_compute_file_sha256() {
+        let temp_dir = std::env::temp_dir().join(format!("pt_sha256_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let test_file = temp_dir.join("test.txt");
+        std::fs::write(&test_file, b"hello playout transcode").unwrap();
+
+        let hash = compute_file_sha256(&test_file).unwrap();
+        // SHA-256 of "hello playout transcode"
+        assert_eq!(
+            hash,
+            "4860d772576a6cdb7a774627c607d95e1cd1ff62cd69ef045093eaaf67ae76cb"
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cleanup_orphan_staging_files() {
+        let temp_dir = std::env::temp_dir().join(format!("pt_orphan_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let orphan1 = temp_dir.join(".tmp_12345_video.mp4");
+        let orphan2 = temp_dir.join("clip.tmp_json");
+        let normal_file = temp_dir.join("clip.mp4");
+
+        std::fs::write(&orphan1, b"temp content 1").unwrap();
+        std::fs::write(&orphan2, b"temp content 2").unwrap();
+        std::fs::write(&normal_file, b"normal video content").unwrap();
+
+        // Staging cleanup with max_age_secs = 0 (delete everything matching temp prefix/extension immediately)
+        let removed = cleanup_orphan_staging_files(&temp_dir, 0);
+        assert_eq!(removed, 2);
+        assert!(!orphan1.exists());
+        assert!(!orphan2.exists());
+        assert!(normal_file.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_build_unique_output_path_collision() {
+        let temp_dir = std::env::temp_dir().join(format!("pt_collision_{}", uuid::Uuid::new_v4()));
+        let _ = std::fs::create_dir_all(&temp_dir);
+
+        let uuid1 = "fixed-uuid-1234";
+        let initial_path = temp_dir.join("clip_fixed-uuid-1234.mp4");
+        std::fs::write(&initial_path, b"already exists").unwrap();
+
+        let unique = build_unique_output_path(&temp_dir, "clip", uuid1);
+        assert_ne!(unique, initial_path);
+        assert!(!unique.exists());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sidecar_with_validation_and_sha256() {
+        let dummy_probe = probe::ProbeData {
+            input_path: "C:/src/clip.mp4".into(),
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            fps_num: 25,
+            fps_den: 1,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+        };
+
+        let val_report = identity::ValidationReport {
+            mezzanine_ok: true,
+            duration_ms: 10000,
+            fps: 25.0,
+            fps_num: 25,
+            fps_den: 1,
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            closed_gop: true,
+            faststart: true,
+            warnings: vec![],
+            sha256: Some("abcdef1234567890".into()),
+            file_size_bytes: Some(1048576),
+        };
+
+        let sidecar = identity::SidecarPayload::new(
+            "test-uuid",
+            "C:/target/videos/clip.mp4",
+            &dummy_probe,
+            &dummy_probe,
+            "profile_a",
+            "h264",
+            "aac",
+            10000,
+            true,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &[],
+            None,
+        )
+        .with_validation(val_report, Some("abcdef1234567890".into()), Some(1048576));
+
+        let json = serde_json::to_string(&sidecar).unwrap();
+        assert!(json.contains("\"validation_report\":{"));
+        assert!(json.contains("\"sha256\":\"abcdef1234567890\""));
+        assert!(json.contains("\"file_size_bytes\":1048576"));
     }
 }

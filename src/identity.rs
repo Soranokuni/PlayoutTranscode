@@ -16,6 +16,24 @@ pub struct LoudnessInfo {
     pub linear_applied: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ValidationReport {
+    pub mezzanine_ok: bool,
+    pub duration_ms: i64,
+    pub fps: f64,
+    pub fps_num: i64,
+    pub fps_den: i64,
+    pub audio_sample_rate: i64,
+    pub audio_channels: i64,
+    pub closed_gop: bool,
+    pub faststart: bool,
+    pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarPayload {
     pub playoutvue_id: String,
@@ -40,6 +58,12 @@ pub struct SidecarPayload {
     pub warnings: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub loudness: Option<LoudnessInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation_report: Option<ValidationReport>,
 }
 
 impl SidecarPayload {
@@ -112,7 +136,22 @@ impl SidecarPayload {
             keyframe_safe_start_ms,
             warnings: warnings.to_vec(),
             loudness,
+            sha256: None,
+            file_size_bytes: None,
+            validation_report: None,
         }
+    }
+
+    pub fn with_validation(
+        mut self,
+        validation: ValidationReport,
+        sha256: Option<String>,
+        file_size_bytes: Option<u64>,
+    ) -> Self {
+        self.validation_report = Some(validation);
+        self.sha256 = sha256;
+        self.file_size_bytes = file_size_bytes;
+        self
     }
 }
 
@@ -148,6 +187,7 @@ pub fn sidecar_path_for(media_path: &Path) -> PathBuf {
     media_path.with_extension("uuid.json")
 }
 
+#[allow(dead_code)]
 pub fn write_sidecar_next_to_video(
     output_path: &Path,
     uuid: &str,
@@ -167,8 +207,54 @@ pub fn write_sidecar_next_to_video(
     warnings: &[String],
     loudness: Option<LoudnessInfo>,
 ) -> Result<PathBuf, String> {
+    write_sidecar_next_to_video_with_validation(
+        output_path,
+        uuid,
+        source_probe,
+        output_probe,
+        profile_name,
+        target_codec,
+        target_audio_codec,
+        duration_ms,
+        mezzanine_ok,
+        fps,
+        fps_num,
+        fps_den,
+        total_frames,
+        gop_frames,
+        keyframe_safe_start_ms,
+        warnings,
+        loudness,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn write_sidecar_next_to_video_with_validation(
+    output_path: &Path,
+    uuid: &str,
+    source_probe: &ProbeData,
+    output_probe: &ProbeData,
+    profile_name: &str,
+    target_codec: &str,
+    target_audio_codec: &str,
+    duration_ms: i64,
+    mezzanine_ok: bool,
+    fps: f64,
+    fps_num: i64,
+    fps_den: i64,
+    total_frames: i64,
+    gop_frames: i64,
+    keyframe_safe_start_ms: i64,
+    warnings: &[String],
+    loudness: Option<LoudnessInfo>,
+    validation: Option<ValidationReport>,
+    sha256: Option<String>,
+    file_size_bytes: Option<u64>,
+) -> Result<PathBuf, String> {
     let sidecar_path = sidecar_path_for(output_path);
-    let payload = SidecarPayload::new(
+    let mut payload = SidecarPayload::new(
         uuid,
         &output_path.to_string_lossy(),
         source_probe,
@@ -187,6 +273,13 @@ pub fn write_sidecar_next_to_video(
         warnings,
         loudness,
     );
+
+    if let Some(val) = validation {
+        payload = payload.with_validation(val, sha256, file_size_bytes);
+    } else {
+        payload.sha256 = sha256;
+        payload.file_size_bytes = file_size_bytes;
+    }
 
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|e| format!("Failed to serialize sidecar: {}", e))?;
