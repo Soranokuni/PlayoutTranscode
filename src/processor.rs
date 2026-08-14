@@ -503,6 +503,49 @@ fn process_file_inner(
             }
         });
 
+        let worker_id = format!("worker-{}", &metadata_uuid[..8.min(metadata_uuid.len())]);
+        let (hb_stop_tx, hb_stop_rx) = std::sync::mpsc::channel::<()>();
+        let hb_jid = job.id.clone();
+        let hb_wid = worker_id.clone();
+        let hb_queue = queue.clone();
+        let hb_pids = active_pids.clone();
+
+        let hb_thread = std::thread::spawn(move || {
+            while hb_stop_rx
+                .recv_timeout(std::time::Duration::from_millis(2000))
+                .is_err()
+            {
+                if let Ok(cancel_req) = hb_queue.heartbeat(&hb_jid, &hb_wid, 10) {
+                    if cancel_req {
+                        tracing::warn!(
+                            "Heartbeat detected cancel request for job {} — terminating FFmpeg",
+                            hb_jid
+                        );
+                        if let Ok(pids) = hb_pids.lock() {
+                            for pid in pids.iter() {
+                                #[cfg(target_os = "windows")]
+                                {
+                                    use std::os::windows::process::CommandExt;
+                                    const CREATE_NO_WINDOW: u32 = 0x08000000;
+                                    let _ = std::process::Command::new("taskkill")
+                                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                                        .creation_flags(CREATE_NO_WINDOW)
+                                        .output();
+                                }
+                                #[cfg(not(target_os = "windows"))]
+                                {
+                                    let _ = std::process::Command::new("kill")
+                                        .args(["-9", &pid.to_string()])
+                                        .output();
+                                }
+                            }
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
         let result = runner.run_transcode(
             tools,
             config,
@@ -516,6 +559,34 @@ fn process_file_inner(
             &audio_policy,
             measured_loudness.as_ref(),
         );
+
+        let _ = hb_stop_tx.send(());
+        let _ = hb_thread.join();
+
+        let is_cancelled = queue
+            .get(&job.id)
+            .map(|j| {
+                j.cancel_requested
+                    || j.phase == jobs::JobPhase::CancelRequested
+                    || j.phase == jobs::JobPhase::Cancelled
+            })
+            .unwrap_or(false);
+
+        if is_cancelled {
+            tracing::info!("Job {} was cancelled by user request", job.id);
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Cancelled,
+                Some("Cancelled".into()),
+                |j| {
+                    j.error = Some("Cancelled by user".into());
+                    j.error_category = Some("cancelled".into());
+                },
+            );
+            publisher.cleanup_staging(&staged_output_path);
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            return;
+        }
 
         if result.success {
             wait_for_file_flush(&result.output_path, 5000);

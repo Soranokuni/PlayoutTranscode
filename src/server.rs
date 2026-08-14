@@ -60,6 +60,7 @@ pub async fn run_server(
         .route("/jobs/failed", get(list_failed_jobs))
         .route("/jobs/pending", get(list_pending_jobs))
         .route("/jobs/{id}/retry", post(post_retry_job))
+        .route("/jobs/{id}/cancel", post(post_cancel_job))
         .route("/jobs/retry-failed", post(post_retry_all_failed))
         .route("/config", get(get_config).put(put_config))
         .route("/toolchain", get(get_toolchain_status))
@@ -733,6 +734,20 @@ async fn post_retry_job(
             Json(serde_json::json!({"success": true})).into_response()
         }
         Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+async fn post_cancel_job(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.jobs.request_cancel(&id) {
+        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
     }
 }
 
