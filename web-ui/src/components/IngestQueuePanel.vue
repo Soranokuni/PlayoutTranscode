@@ -23,9 +23,10 @@
       <div v-for="job in processing" :key="job.id" class="queue-row">
         <div class="queue-main">
           <span v-if="job.attempt && job.attempt > 0" class="retry-chip" title="Retry attempt">
-            ⟳ #{{ job.attempt }}
+            ⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span>
           </span>
           <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
+          <span v-if="job.phase" class="queue-phase">{{ job.phase }}</span>
           <span class="queue-profile">{{ job.profile }}</span>
           <ProgressBar
             :percent="job.progress"
@@ -36,6 +37,15 @@
           />
           <span v-if="job.encode_fps" class="queue-fps">{{ Math.round(job.encode_fps) }} fps</span>
           <span v-if="job.encode_bitrate" class="queue-bitrate">{{ job.encode_bitrate }}</span>
+          <button
+            class="btn btn-mini btn-cancel"
+            :disabled="cancellingId === job.id"
+            title="Cancel transcode job"
+            @click="onCancel(job.id)"
+          >
+            <span v-if="cancellingId === job.id">…</span>
+            <span v-else>✕</span>
+          </button>
         </div>
         <div v-if="job.source_frame_count" class="queue-meta">
           Frame {{ job.current_frame }}/{{ job.source_frame_count }}
@@ -47,8 +57,9 @@
       <div v-for="job in failed" :key="job.id" class="error-alert">
         <div class="error-header">
           <span class="queue-status failed">Failed</span>
-          <span v-if="job.attempt && job.attempt > 0" class="retry-chip">⟳ #{{ job.attempt }}</span>
+          <span v-if="job.attempt && job.attempt > 0" class="retry-chip">⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span></span>
           <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
+          <span v-if="job.error_category" class="error-category">{{ job.error_category }}</span>
           <span class="queue-profile">{{ job.profile }}</span>
           <div class="error-actions">
             <button class="btn btn-mini" :disabled="retryingId === job.id" @click="onRetry(job.id)">
@@ -78,6 +89,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (e: 'retry', id: string): void
+  (e: 'cancel', id: string): void
   (e: 'retry-all'): void
 }>()
 
@@ -99,6 +111,7 @@ const failed = computed(() =>
 )
 
 const retryingId = ref<string | null>(null)
+const cancellingId = ref<string | null>(null)
 const retryingAll = ref(false)
 const retryMsg = ref('')
 const retryOk = ref(false)
@@ -111,6 +124,16 @@ async function onRetry(id: string) {
     setTimeout(() => { retryingId.value = null }, 400)
   }
 }
+
+async function onCancel(id: string) {
+  cancellingId.value = id
+  try {
+    emit('cancel', id)
+  } finally {
+    setTimeout(() => { cancellingId.value = null }, 400)
+  }
+}
+
 async function onRetryAll() {
   retryingAll.value = true
   retryMsg.value = ''
@@ -219,6 +242,33 @@ defineExpose({ showRetryMsg: (msg: string, ok: boolean) => { retryMsg.value = ms
   background: rgba(51,190,204,0.08);
   padding: 1px 6px;
   border-radius: 4px;
+}
+.queue-phase {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-emerald);
+  background: rgba(46,204,113,0.1);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.error-category {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent-amber);
+  background: rgba(255,170,40,0.1);
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+.btn-cancel {
+  border-color: rgba(229,57,53,0.4);
+  color: var(--accent-crimson);
+  background: rgba(229,57,53,0.08);
+  padding: 2px 6px;
+}
+.btn-cancel:hover:not(:disabled) {
+  background: rgba(229,57,53,0.2);
 }
 .retry-chip {
   font-size: 10px;

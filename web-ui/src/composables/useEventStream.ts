@@ -6,15 +6,20 @@ export interface JobRecord {
   output_path?: string
   profile: string
   uuid?: string
-  state: 'Pending' | 'Processing' | 'Completed' | 'Failed'
+  state: 'Pending' | 'Processing' | 'Completed' | 'Failed' | 'Cancelled'
+  phase?: string
   progress: number
   current_stage: string
   duration_secs: number
   error?: string
+  error_category?: string
   /** Verbose diagnostic tail (ffmpeg stderr). Rendered inside a collapsible widget in the UI. */
   stderr_log?: string[]
   /** Retry attempt counter (0 = first try, 1 = first retry, ...). */
   attempt?: number
+  max_attempts?: number
+  worker_id?: string
+  cancel_requested?: boolean
   created_at: string
   finished_at?: string
   source_frame_count: number
@@ -369,6 +374,26 @@ export function useEventStream() {
     return apiPost<{ success?: boolean; message?: string; error?: string }>('/service/uninstall')
   }
 
+  async function cancelJob(id: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const r = await fetch('/api/jobs/' + encodeURIComponent(id) + '/cancel', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      })
+      const text = await r.text()
+      if (!text) return { success: r.ok }
+      const parsed = JSON.parse(text) as { success?: boolean; error?: string }
+      if (parsed.success) {
+        await fetchAll()
+      }
+      return { success: !!parsed.success, error: parsed.error }
+    } catch (e) {
+      console.error('[useEventStream] cancelJob failed:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
   function clearLogs() {
     logs.value = []
   }
@@ -414,6 +439,7 @@ export function useEventStream() {
     uninstallService,
     clearLogs,
     retryJob,
+    cancelJob,
     retryAllFailed,
     shortFileName,
   }
