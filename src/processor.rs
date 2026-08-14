@@ -1,5 +1,4 @@
 use crate::{bootstrap, config, db, encoder, fingerprint, identity, jobs, probe, profiles};
-use chrono::Utc;
 use sqlx::SqlitePool;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -325,24 +324,27 @@ fn process_file_inner(
     }
 
     let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
-    job.state = jobs::JobState::Processing;
-    job.current_stage = "Probing".to_string();
     job.uuid = Some(metadata_uuid.clone());
+    job.fingerprint = Some(fingerprint);
+    let _ = job.transition_to(jobs::JobPhase::Probing, Some("Probing".to_string()));
     queue.push(job.clone());
     queue.broadcast(
         "job_update",
-        &serde_json::json!({"id": job.id, "stage": "Probing"}).to_string(),
+        &serde_json::json!({"id": job.id, "stage": "Probing", "phase": "probing"}).to_string(),
     );
 
     let probe_data = match probe::probe_media(tools, input_path) {
         Ok(p) => p,
         Err(e) => {
-            queue.update(&job.id, |j| {
-                j.state = jobs::JobState::Failed;
-                j.error = Some(format!("Probe: {}", e));
-                j.current_stage = "Failed".into();
-                j.finished_at = Some(Utc::now().to_rfc3339());
-            });
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Failed,
+                Some("Failed".into()),
+                |j| {
+                    j.error = Some(format!("Probe: {}", e));
+                    j.error_category = Some("probe_failure".into());
+                },
+            );
             tracing::error!("Probe failed for {}: {}", input_path.display(), e);
             queue.broadcast(
                 "failed",
@@ -358,10 +360,15 @@ fn process_file_inner(
     let profile_name = profile_id.to_string();
     let profile = profiles::EncodingProfile::by_id(profile_id);
     if !profile.config_for(config).enabled {
-        queue.update(&job.id, |j| {
-            j.state = jobs::JobState::Failed;
-            j.error = Some("Profile disabled".into());
-        });
+        let _ = queue.transition(
+            &job.id,
+            jobs::JobPhase::Failed,
+            Some("Failed".into()),
+            |j| {
+                j.error = Some("Profile disabled".into());
+                j.error_category = Some("profile_disabled".into());
+            },
+        );
         queue.broadcast(
             "failed",
             &serde_json::json!({"id": job.id, "error": "Profile disabled"}).to_string(),
@@ -381,12 +388,15 @@ fn process_file_inner(
     ) {
         Ok(m) => m,
         Err(e) => {
-            queue.update(&job.id, |j| {
-                j.state = jobs::JobState::Failed;
-                j.error = Some(format!("Audio measurement failed: {}", e));
-                j.current_stage = "Failed".into();
-                j.finished_at = Some(Utc::now().to_rfc3339());
-            });
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Failed,
+                Some("Failed".into()),
+                |j| {
+                    j.error = Some(format!("Audio measurement failed: {}", e));
+                    j.error_category = Some("audio_measurement_failure".into());
+                },
+            );
             tracing::error!(
                 "Audio measurement failed for {}: {}",
                 input_path.display(),
@@ -403,6 +413,24 @@ fn process_file_inner(
     let max_attempts = (retry_policy.max_attempts as usize).max(1);
     let retry_delay_ms = retry_policy.retry_delay_ms;
 
+    let req_hash = format!(
+        "{:016x}",
+        (fingerprint as u64) ^ (probe_data.frame_count as u64).rotate_left(13)
+    );
+    let _ = queue.transition(
+        &job.id,
+        jobs::JobPhase::Planned,
+        Some(format!("Planned ({})", profile_name)),
+        |j| {
+            j.profile = profile_name.clone();
+            j.source_frame_count = probe_data.frame_count;
+            j.duration_secs = probe_data.duration_secs;
+            j.duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
+            j.max_attempts = max_attempts as u32;
+            j.request_hash = Some(req_hash);
+        },
+    );
+
     let mut attempt = 1;
     let mut last_error;
 
@@ -418,13 +446,15 @@ fn process_file_inner(
             format!("Encoding {}", profile_name)
         };
 
-        queue.update(&job.id, |j| {
-            j.profile = profile_name.clone();
-            j.current_stage = stage_label.clone();
-            j.source_frame_count = probe_data.frame_count;
-            j.duration_secs = probe_data.duration_secs;
-            j.duration_ms = (probe_data.duration_secs * 1000.0).round() as i64;
-        });
+        let _ = queue.transition(
+            &job.id,
+            jobs::JobPhase::Encoding,
+            Some(stage_label.clone()),
+            |j| {
+                j.attempt = attempt as u32;
+                j.current_stage = stage_label.clone();
+            },
+        );
 
         let (ptx, prx) = std::sync::mpsc::channel::<encoder::EncodeProgress>();
         let jid = job.id.clone();
@@ -490,6 +520,13 @@ fn process_file_inner(
         if result.success {
             wait_for_file_flush(&result.output_path, 5000);
         }
+
+        let _ = queue.transition(
+            &job.id,
+            jobs::JobPhase::Validating,
+            Some("Validating".into()),
+            |_| {},
+        );
 
         let mut validation_ok = false;
         let mut validation_error = String::new();
@@ -613,14 +650,26 @@ fn process_file_inner(
                 mezzanine_ok = false;
             }
 
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Publishing,
+                Some("Publishing".into()),
+                |j| {
+                    j.output_path = Some(final_output_path.to_string_lossy().into_owned());
+                },
+            );
+
             if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
                 tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
-                queue.update(&job.id, |j| {
-                    j.state = jobs::JobState::Failed;
-                    j.error = Some(format!("Atomic publish failed: {}", e));
-                    j.current_stage = "Failed".into();
-                    j.finished_at = Some(Utc::now().to_rfc3339());
-                });
+                let _ = queue.transition(
+                    &job.id,
+                    jobs::JobPhase::Failed,
+                    Some("Failed".into()),
+                    |j| {
+                        j.error = Some(format!("Atomic publish failed: {}", e));
+                        j.error_category = Some("publish_failure".into());
+                    },
+                );
                 queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Atomic publish failed: {}", e)}).to_string());
                 let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
                 publisher.cleanup_staging(&staged_output_path);
@@ -681,14 +730,16 @@ fn process_file_inner(
                 &warnings_list,
                 &keyframe_offsets_json,
             ));
-            queue.update(&job.id, |j| {
-                j.state = jobs::JobState::Completed;
-                j.uuid = Some(metadata_uuid.clone());
-                j.output_path = Some(final_output_path.to_string_lossy().into_owned());
-                j.progress = 100.0;
-                j.current_stage = "Completed".into();
-                j.finished_at = Some(Utc::now().to_rfc3339());
-            });
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Completed,
+                Some("Completed".into()),
+                |j| {
+                    j.uuid = Some(metadata_uuid.clone());
+                    j.output_path = Some(final_output_path.to_string_lossy().into_owned());
+                    j.progress = 100.0;
+                },
+            );
             queue.broadcast(
                 "completed",
                 &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string(),
@@ -721,6 +772,15 @@ fn process_file_inner(
                 validation_error,
                 retry_delay_ms
             );
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Recoverable,
+                Some(format!("Retrying attempt {}/{}", attempt + 1, max_attempts)),
+                |j| {
+                    j.error = Some(validation_error.clone());
+                    j.error_category = Some("retryable_error".into());
+                },
+            );
             queue.broadcast(
                 "progress",
                 &serde_json::json!({
@@ -743,12 +803,20 @@ fn process_file_inner(
                 retry_class,
                 last_error
             );
-            queue.update(&job.id, |j| {
-                j.state = jobs::JobState::Failed;
-                j.error = Some(last_error.clone());
-                j.current_stage = "Failed".into();
-                j.finished_at = Some(Utc::now().to_rfc3339());
-            });
+            let err_cat = if is_val_fail {
+                "validation_failure"
+            } else {
+                "transcode_failure"
+            };
+            let _ = queue.transition(
+                &job.id,
+                jobs::JobPhase::Failed,
+                Some("Failed".into()),
+                |j| {
+                    j.error = Some(last_error.clone());
+                    j.error_category = Some(err_cat.into());
+                },
+            );
             queue.broadcast(
                 "failed",
                 &serde_json::json!({"id": job.id, "error": last_error}).to_string(),
