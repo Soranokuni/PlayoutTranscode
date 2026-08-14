@@ -1350,6 +1350,8 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
     use std::os::windows::process::CommandExt;
     #[cfg(target_os = "windows")]
     const CREATE_NO_WINDOW: u32 = 0x08000000;
+    #[cfg(target_os = "windows")]
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
     let mut cmd = std::process::Command::new(ffprobe);
     cmd.args(&[
@@ -1367,7 +1369,7 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
     cmd.arg(path);
 
     #[cfg(target_os = "windows")]
-    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
     let output = match cmd.output() {
         Ok(out) => out,

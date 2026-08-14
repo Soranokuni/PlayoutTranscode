@@ -197,3 +197,62 @@ fn cleanup_files(target_dir: &PathBuf, max_age_secs: u64) -> usize {
     }
     removed
 }
+
+#[tokio::test]
+async fn test_chaos_strict_concurrency_bounding() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Semaphore;
+
+    let max_concurrency = 4;
+    let sem = Arc::new(Semaphore::new(max_concurrency));
+    let current_active = Arc::new(AtomicUsize::new(0));
+    let peak_active = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..20 {
+        let s = sem.clone();
+        let cur = current_active.clone();
+        let peak = peak_active.clone();
+
+        let handle = tokio::spawn(async move {
+            let permit = s.acquire_owned().await.unwrap();
+            let _held_permit = permit;
+
+            let count = cur.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+
+            // Simulate work
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+            cur.fetch_sub(1, Ordering::SeqCst);
+        });
+        handles.push(handle);
+    }
+
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let final_peak = peak_active.load(Ordering::SeqCst);
+    assert!(
+        final_peak <= max_concurrency,
+        "Peak concurrent tasks ({}) exceeded max_concurrency ({})",
+        final_peak,
+        max_concurrency
+    );
+    assert_eq!(final_peak, max_concurrency);
+    assert_eq!(sem.available_permits(), max_concurrency);
+}
+
+#[test]
+fn test_chaos_windows_priority_flags() {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
+    let combined = CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS;
+
+    assert_eq!(combined, 0x08004000);
+    assert_eq!(combined & CREATE_NO_WINDOW, CREATE_NO_WINDOW);
+    assert_eq!(combined & BELOW_NORMAL_PRIORITY_CLASS, BELOW_NORMAL_PRIORITY_CLASS);
+}
+

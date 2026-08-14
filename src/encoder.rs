@@ -22,6 +22,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+#[cfg(target_os = "windows")]
+const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
 #[derive(Debug, Clone)]
 pub struct EncodeProgress {
@@ -133,7 +135,7 @@ pub fn transcode_file(
     command.stdin(Stdio::null());
 
     #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW);
+    command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
     let mut child = match command.spawn() {
         Ok(c) => c,
