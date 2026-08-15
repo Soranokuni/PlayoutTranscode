@@ -1564,6 +1564,637 @@ pub async fn find_active_by_request_hash(
     Ok(row.map(|r| r.into_job_record()))
 }
 
+// ── Database Viewer Read-Only Query Models & Handlers ─────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbOverview {
+    pub total_assets: i64,
+    pub master_clips: i64,
+    pub subclips: i64,
+    pub trashed_assets: i64,
+    pub ready_assets: i64,
+    pub processing_assets: i64,
+    pub error_assets: i64,
+    pub total_jobs: i64,
+    pub pending_jobs: i64,
+    pub processing_jobs: i64,
+    pub completed_jobs: i64,
+    pub failed_jobs: i64,
+    pub cancelled_jobs: i64,
+    pub db_size_bytes: i64,
+    pub wal_mode: bool,
+}
+
+pub async fn get_db_overview(pool: &SqlitePool) -> Result<DbOverview, sqlx::Error> {
+    let (total_assets,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_assets WHERE deleted_at IS NULL")
+            .fetch_one(pool)
+            .await?;
+    let (trashed_assets,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_assets WHERE deleted_at IS NOT NULL")
+            .fetch_one(pool)
+            .await?;
+    let (subclips,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM media_assets WHERE (trim_in_ms > 0 OR (trim_out_ms > 0 AND trim_out_ms < duration_ms)) AND deleted_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    let master_clips = (total_assets - subclips).max(0);
+
+    let (ready_assets,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_assets WHERE status = 'ready' AND deleted_at IS NULL")
+            .fetch_one(pool)
+            .await?;
+    let (processing_assets,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM media_assets WHERE status = 'processing' AND deleted_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    let (error_assets,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM media_assets WHERE status = 'error' AND deleted_at IS NULL")
+            .fetch_one(pool)
+            .await?;
+
+    let (total_jobs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM transcode_jobs").fetch_one(pool).await?;
+    let (pending_jobs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM transcode_jobs WHERE state = 'Pending'")
+            .fetch_one(pool)
+            .await?;
+    let (processing_jobs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM transcode_jobs WHERE state = 'Processing'")
+            .fetch_one(pool)
+            .await?;
+    let (completed_jobs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM transcode_jobs WHERE state = 'Completed'")
+            .fetch_one(pool)
+            .await?;
+    let (failed_jobs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM transcode_jobs WHERE state = 'Failed'")
+            .fetch_one(pool)
+            .await?;
+    let (cancelled_jobs,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM transcode_jobs WHERE state = 'Cancelled'")
+            .fetch_one(pool)
+            .await?;
+
+    let page_count: (i64,) = sqlx::query_as("PRAGMA page_count")
+        .fetch_one(pool)
+        .await
+        .unwrap_or((0,));
+    let page_size: (i64,) = sqlx::query_as("PRAGMA page_size")
+        .fetch_one(pool)
+        .await
+        .unwrap_or((4096,));
+    let db_size_bytes = page_count.0 * page_size.0;
+
+    let journal_mode: (String,) = sqlx::query_as("PRAGMA journal_mode")
+        .fetch_one(pool)
+        .await
+        .unwrap_or(("".into(),));
+    let wal_mode = journal_mode.0.to_ascii_lowercase() == "wal";
+
+    Ok(DbOverview {
+        total_assets,
+        master_clips,
+        subclips,
+        trashed_assets,
+        ready_assets,
+        processing_assets,
+        error_assets,
+        total_jobs,
+        pending_jobs,
+        processing_jobs,
+        completed_jobs,
+        failed_jobs,
+        cancelled_jobs,
+        db_size_bytes,
+        wal_mode,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAssetSummary {
+    pub uuid: String,
+    pub fingerprint: i64,
+    pub current_path: String,
+    pub display_path: String,
+    pub duration_ms: i64,
+    pub trim_in_ms: i64,
+    pub trim_out_ms: i64,
+    pub rating: String,
+    pub tp: String,
+    pub status: String,
+    pub display_name: String,
+    pub virtual_folder: String,
+    pub original_virtual_folder: Option<String>,
+    pub mezzanine_ok: bool,
+    pub fps: f64,
+    pub fps_num: i64,
+    pub fps_den: i64,
+    pub total_frames: i64,
+    pub gop_frames: i64,
+    pub keyframe_safe_start_ms: i64,
+    pub keyframe_count: usize,
+    pub warnings: Vec<String>,
+    pub is_subclip: bool,
+    pub parent_uuid: Option<String>,
+    pub deleted_at: Option<String>,
+    pub sidecar_exists: bool,
+}
+
+impl DbAssetSummary {
+    pub fn from_asset(a: MediaAsset) -> Self {
+        let is_subclip = a.trim_in_ms > 0
+            || (a.trim_out_ms > 0 && a.trim_out_ms < a.duration_ms)
+            || a.display_name.to_ascii_lowercase().contains("subclip")
+            || a.display_name.to_ascii_lowercase().contains("sub-clip");
+
+        let display_path = a
+            .current_path
+            .split('\\')
+            .last()
+            .unwrap_or(&a.current_path)
+            .split('/')
+            .last()
+            .unwrap_or(&a.current_path)
+            .to_string();
+
+        let keyframe_count = serde_json::from_str::<Vec<i64>>(&a.keyframe_offsets_json)
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        let warnings = serde_json::from_str::<Vec<String>>(&a.warnings).unwrap_or_default();
+
+        let sidecar_exists = if !a.current_path.is_empty() {
+            let p = std::path::Path::new(&a.current_path);
+            crate::identity::sidecar_path_for(p).exists()
+        } else {
+            false
+        };
+
+        Self {
+            uuid: a.uuid,
+            fingerprint: a.fingerprint,
+            current_path: a.current_path,
+            display_path,
+            duration_ms: a.duration_ms,
+            trim_in_ms: a.trim_in_ms,
+            trim_out_ms: a.trim_out_ms,
+            rating: a.rating,
+            tp: a.tp,
+            status: a.status,
+            display_name: a.display_name,
+            virtual_folder: a.virtual_folder,
+            original_virtual_folder: a.original_virtual_folder,
+            mezzanine_ok: a.mezzanine_ok,
+            fps: a.fps,
+            fps_num: a.fps_num,
+            fps_den: a.fps_den,
+            total_frames: a.total_frames,
+            gop_frames: a.gop_frames,
+            keyframe_safe_start_ms: a.keyframe_safe_start_ms,
+            keyframe_count,
+            warnings,
+            is_subclip,
+            parent_uuid: None,
+            deleted_at: a.deleted_at,
+            sidecar_exists,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAssetsPage {
+    pub items: Vec<DbAssetSummary>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+pub async fn query_db_assets(
+    pool: &SqlitePool,
+    filter: Option<&str>,
+    search: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<DbAssetsPage, sqlx::Error> {
+    let lim = limit.unwrap_or(25).clamp(1, 100);
+    let off = offset.unwrap_or(0).max(0);
+
+    let all_assets: Vec<MediaAsset> = sqlx::query_as(&format!(
+        "SELECT {} FROM media_assets ORDER BY COALESCE(deleted_at, '9999') ASC, display_name ASC, uuid ASC",
+        SELECT_COLS
+    ))
+    .fetch_all(pool)
+    .await?;
+
+    let filter_mode = filter.unwrap_or("all").to_ascii_lowercase();
+    let search_term = search.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+
+    let mut filtered: Vec<DbAssetSummary> = all_assets
+        .into_iter()
+        .map(DbAssetSummary::from_asset)
+        .filter(|a| {
+            // Apply filter
+            let matches_filter = match filter_mode.as_str() {
+                "master" => !a.is_subclip && a.deleted_at.is_none(),
+                "subclip" => a.is_subclip && a.deleted_at.is_none(),
+                "ready" => a.status == "ready" && a.deleted_at.is_none(),
+                "processing" => a.status == "processing" && a.deleted_at.is_none(),
+                "error" => a.status == "error" && a.deleted_at.is_none(),
+                "trashed" => a.deleted_at.is_some(),
+                _ => true,
+            };
+            if !matches_filter {
+                return false;
+            }
+
+            // Apply search
+            if search_term.is_empty() {
+                return true;
+            }
+            a.display_name.to_ascii_lowercase().contains(&search_term)
+                || a.uuid.to_ascii_lowercase().contains(&search_term)
+                || a.virtual_folder.to_ascii_lowercase().contains(&search_term)
+                || a.current_path.to_ascii_lowercase().contains(&search_term)
+        })
+        .collect();
+
+    let total = filtered.len() as i64;
+    let start = (off as usize).min(filtered.len());
+    let end = (start + lim as usize).min(filtered.len());
+    let items = filtered.drain(start..end).collect();
+
+    Ok(DbAssetsPage {
+        items,
+        total,
+        limit: lim,
+        offset: off,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbAssetDetail {
+    pub summary: DbAssetSummary,
+    pub keyframe_sample: Vec<i64>,
+    pub warnings_json: String,
+    pub keyframe_offsets_json: String,
+}
+
+pub async fn get_db_asset_detail(
+    pool: &SqlitePool,
+    uuid: &str,
+) -> Result<Option<DbAssetDetail>, sqlx::Error> {
+    let raw = find_by_uuid_raw(pool, uuid).await?;
+    let Some(a) = raw else {
+        return Ok(None);
+    };
+
+    let sample: Vec<i64> = serde_json::from_str::<Vec<i64>>(&a.keyframe_offsets_json)
+        .map(|v| v.into_iter().take(100).collect())
+        .unwrap_or_default();
+
+    let warnings_json = a.warnings.clone();
+    let keyframe_offsets_json = a.keyframe_offsets_json.clone();
+    let summary = DbAssetSummary::from_asset(a);
+
+    Ok(Some(DbAssetDetail {
+        summary,
+        keyframe_sample: sample,
+        warnings_json,
+        keyframe_offsets_json,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbJobSummary {
+    pub id: String,
+    pub input_path: String,
+    pub input_path_display: String,
+    pub output_path: Option<String>,
+    pub output_path_display: Option<String>,
+    pub profile: String,
+    pub uuid: Option<String>,
+    pub state: String,
+    pub phase: String,
+    pub progress: f64,
+    pub current_stage: String,
+    pub duration_secs: f64,
+    pub error: Option<String>,
+    pub error_category: Option<String>,
+    pub attempt: i64,
+    pub max_attempts: i64,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub worker_id: Option<String>,
+    pub encode_fps: f64,
+    pub encode_bitrate: String,
+    pub encode_speed: String,
+    pub stderr_lines_count: usize,
+}
+
+impl DbJobSummary {
+    pub fn from_row(r: DurableJobRow) -> Self {
+        let input_path_display = r
+            .input_path
+            .split('\\')
+            .last()
+            .unwrap_or(&r.input_path)
+            .split('/')
+            .last()
+            .unwrap_or(&r.input_path)
+            .to_string();
+
+        let output_path_display = r.output_path.as_ref().map(|p| {
+            p.split('\\')
+                .last()
+                .unwrap_or(p)
+                .split('/')
+                .last()
+                .unwrap_or(p)
+                .to_string()
+        });
+
+        let stderr_lines_count = r
+            .stderr_log_json
+            .as_ref()
+            .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+            .map(|v| v.len())
+            .unwrap_or(0);
+
+        Self {
+            id: r.id,
+            input_path: r.input_path,
+            input_path_display,
+            output_path: r.output_path,
+            output_path_display,
+            profile: r.profile,
+            uuid: r.uuid,
+            state: r.state,
+            phase: r.phase,
+            progress: r.progress,
+            current_stage: r.current_stage,
+            duration_secs: r.duration_secs,
+            error: r.error,
+            error_category: r.error_category,
+            attempt: r.attempt,
+            max_attempts: r.max_attempts,
+            created_at: r.created_at,
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            worker_id: r.worker_id,
+            encode_fps: r.encode_fps,
+            encode_bitrate: r.encode_bitrate,
+            encode_speed: r.encode_speed,
+            stderr_lines_count,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbJobsPage {
+    pub items: Vec<DbJobSummary>,
+    pub total: i64,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+pub async fn query_db_jobs(
+    pool: &SqlitePool,
+    state: Option<&str>,
+    search: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<DbJobsPage, sqlx::Error> {
+    let lim = limit.unwrap_or(25).clamp(1, 100);
+    let off = offset.unwrap_or(0).max(0);
+
+    let rows: Vec<DurableJobRow> =
+        sqlx::query_as("SELECT * FROM transcode_jobs ORDER BY created_at DESC")
+            .fetch_all(pool)
+            .await?;
+
+    let state_term = state.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let search_term = search.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+
+    let mut filtered: Vec<DbJobSummary> = rows
+        .into_iter()
+        .map(DbJobSummary::from_row)
+        .filter(|j| {
+            if !state_term.is_empty() && state_term != "all" {
+                if j.state.to_ascii_lowercase() != state_term
+                    && j.phase.to_ascii_lowercase() != state_term
+                {
+                    return false;
+                }
+            }
+            if search_term.is_empty() {
+                return true;
+            }
+            j.id.to_ascii_lowercase().contains(&search_term)
+                || j.uuid
+                    .as_ref()
+                    .map(|u| u.to_ascii_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+                || j.input_path.to_ascii_lowercase().contains(&search_term)
+                || j.output_path
+                    .as_ref()
+                    .map(|o| o.to_ascii_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+                || j.error
+                    .as_ref()
+                    .map(|e| e.to_ascii_lowercase().contains(&search_term))
+                    .unwrap_or(false)
+        })
+        .collect();
+
+    let total = filtered.len() as i64;
+    let start = (off as usize).min(filtered.len());
+    let end = (start + lim as usize).min(filtered.len());
+    let items = filtered.drain(start..end).collect();
+
+    Ok(DbJobsPage {
+        items,
+        total,
+        limit: lim,
+        offset: off,
+    })
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbJobDetail {
+    pub summary: DbJobSummary,
+    pub stderr_log_tail: Vec<String>,
+    pub fingerprint: Option<i64>,
+    pub request_hash: Option<String>,
+    pub leased_until: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub cancel_requested: bool,
+}
+
+pub async fn get_db_job_detail(
+    pool: &SqlitePool,
+    id: &str,
+) -> Result<Option<DbJobDetail>, sqlx::Error> {
+    let row: Option<DurableJobRow> =
+        sqlx::query_as("SELECT * FROM transcode_jobs WHERE id = ?1 LIMIT 1")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+
+    let Some(r) = row else {
+        return Ok(None);
+    };
+
+    let stderr_tail: Vec<String> = r
+        .stderr_log_json
+        .as_ref()
+        .and_then(|j| serde_json::from_str::<Vec<String>>(j).ok())
+        .map(|v| {
+            let total = v.len();
+            if total > 100 {
+                v.into_iter().skip(total - 100).collect()
+            } else {
+                v
+            }
+        })
+        .unwrap_or_default();
+
+    let fingerprint = r.fingerprint;
+    let request_hash = r.request_hash.clone();
+    let leased_until = r.leased_until.clone();
+    let heartbeat_at = r.heartbeat_at.clone();
+    let cancel_requested = r.cancel_requested;
+    let summary = DbJobSummary::from_row(r);
+
+    Ok(Some(DbJobDetail {
+        summary,
+        stderr_log_tail: stderr_tail,
+        fingerprint,
+        request_hash,
+        leased_until,
+        heartbeat_at,
+        cancel_requested,
+    }))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbFolderItem {
+    pub virtual_folder: String,
+    pub color: Option<String>,
+    pub asset_count: i64,
+    pub ready_count: i64,
+    pub trashed_count: i64,
+}
+
+pub async fn get_db_folders(pool: &SqlitePool) -> Result<Vec<DbFolderItem>, sqlx::Error> {
+    let colors = get_all_folder_colors(pool).await?;
+    let color_map: std::collections::HashMap<String, String> =
+        colors.into_iter().map(|c| (c.virtual_folder, c.color)).collect();
+
+    let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT virtual_folder,
+                COUNT(*) as asset_count,
+                SUM(CASE WHEN status = 'ready' AND deleted_at IS NULL THEN 1 ELSE 0 END) as ready_count,
+                SUM(CASE WHEN deleted_at IS NOT NULL THEN 1 ELSE 0 END) as trashed_count
+         FROM media_assets
+         GROUP BY virtual_folder
+         ORDER BY virtual_folder ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut result = Vec::new();
+    let mut seen_folders = std::collections::HashSet::new();
+
+    for (vf, asset_count, ready_count, trashed_count) in rows {
+        seen_folders.insert(vf.clone());
+        let color = color_map.get(&vf).cloned();
+        result.push(DbFolderItem {
+            virtual_folder: vf,
+            color,
+            asset_count,
+            ready_count,
+            trashed_count,
+        });
+    }
+
+    // Add any configured color folders that currently have 0 assets
+    for (vf, col) in color_map {
+        if !seen_folders.contains(&vf) {
+            result.push(DbFolderItem {
+                virtual_folder: vf,
+                color: Some(col),
+                asset_count: 0,
+                ready_count: 0,
+                trashed_count: 0,
+            });
+        }
+    }
+
+    result.sort_by(|a, b| a.virtual_folder.cmp(&b.virtual_folder));
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbTableColumnInfo {
+    pub cid: i64,
+    pub name: String,
+    pub col_type: String,
+    pub not_null: bool,
+    pub is_pk: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbTableSchema {
+    pub table_name: String,
+    pub row_count: i64,
+    pub columns: Vec<DbTableColumnInfo>,
+}
+
+pub async fn get_db_schema(pool: &SqlitePool) -> Result<Vec<DbTableSchema>, sqlx::Error> {
+    let table_names = vec![
+        "media_assets",
+        "transcode_jobs",
+        "virtual_folder_colors",
+    ];
+
+    let mut schemas = Vec::new();
+    for t_name in table_names {
+        let (row_count,): (i64,) = sqlx::query_as(&format!("SELECT COUNT(*) FROM {}", t_name))
+            .fetch_one(pool)
+            .await
+            .unwrap_or((0,));
+
+        let col_rows: Vec<(i64, String, String, i64, Option<String>, i64)> =
+            sqlx::query_as(&format!("PRAGMA table_info({})", t_name))
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+
+        let columns = col_rows
+            .into_iter()
+            .map(|(cid, name, col_type, not_null, _, pk)| DbTableColumnInfo {
+                cid,
+                name,
+                col_type,
+                not_null: not_null != 0,
+                is_pk: pk != 0,
+            })
+            .collect();
+
+        schemas.push(DbTableSchema {
+            table_name: t_name.to_string(),
+            row_count,
+            columns,
+        });
+    }
+
+    Ok(schemas)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2184,4 +2815,86 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+
+    #[tokio::test]
+    async fn test_db_viewer_overview_and_assets() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        // 1. Insert master clip
+        insert_processing(&pool, "asset-master", 1001, "D:/target/master.mp4", "Master 1").await.unwrap();
+        mark_ready(&pool, "asset-master", "D:/target/master.mp4", 10000, true, 25.0, 25, 1, 250, 50, 0, &["warning1".into()], "[]").await.unwrap();
+
+        // 2. Insert subclip
+        create_subclip(&pool, "asset-sub", "asset-master", "Subclip 1", 1000, 5000, true, "[]").await.unwrap();
+
+        // 3. Insert trashed asset
+        insert_processing(&pool, "asset-trashed", 1002, "D:/target/trashed.mp4", "Trashed 1").await.unwrap();
+        trash_asset(&pool, "asset-trashed").await.unwrap();
+
+        // 4. Test Overview
+        let overview = get_db_overview(&pool).await.unwrap();
+        assert_eq!(overview.total_assets, 2, "Active assets count should be 2");
+        assert_eq!(overview.master_clips, 1, "Master clips count should be 1");
+        assert_eq!(overview.subclips, 1, "Subclips count should be 1");
+        assert_eq!(overview.trashed_assets, 1, "Trashed assets count should be 1");
+        assert_eq!(overview.ready_assets, 2, "Ready assets count should be 2");
+        assert!(overview.wal_mode, "WAL mode should be true");
+
+        // 5. Test query_db_assets with filters
+        let all_page = query_db_assets(&pool, Some("all"), None, Some(10), Some(0)).await.unwrap();
+        assert_eq!(all_page.total, 3, "Total records including trashed should be 3");
+
+        let master_page = query_db_assets(&pool, Some("master"), None, Some(10), Some(0)).await.unwrap();
+        assert_eq!(master_page.items.len(), 1);
+        assert_eq!(master_page.items[0].uuid, "asset-master");
+        assert!(!master_page.items[0].is_subclip);
+
+        let subclip_page = query_db_assets(&pool, Some("subclip"), None, Some(10), Some(0)).await.unwrap();
+        assert_eq!(subclip_page.items.len(), 1);
+        assert_eq!(subclip_page.items[0].uuid, "asset-sub");
+        assert!(subclip_page.items[0].is_subclip);
+
+        let trashed_page = query_db_assets(&pool, Some("trashed"), None, Some(10), Some(0)).await.unwrap();
+        assert_eq!(trashed_page.items.len(), 1);
+        assert_eq!(trashed_page.items[0].uuid, "asset-trashed");
+
+        // 6. Test search
+        let search_page = query_db_assets(&pool, None, Some("Master 1"), Some(10), Some(0)).await.unwrap();
+        assert_eq!(search_page.items.len(), 1);
+        assert_eq!(search_page.items[0].uuid, "asset-master");
+
+        // 7. Test asset detail
+        let detail = get_db_asset_detail(&pool, "asset-master").await.unwrap().unwrap();
+        assert_eq!(detail.summary.uuid, "asset-master");
+        assert_eq!(detail.summary.warnings.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_db_viewer_jobs_and_schema() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        let job = crate::jobs::JobRecord::new("D:/watch/video.mp4", "A");
+        insert_durable_job(&pool, &job).await.unwrap();
+
+        // 1. Query jobs
+        let jobs_page = query_db_jobs(&pool, None, None, Some(10), Some(0)).await.unwrap();
+        assert_eq!(jobs_page.total, 1);
+        assert_eq!(jobs_page.items[0].id, job.id);
+        assert_eq!(jobs_page.items[0].state, "Pending");
+
+        // 2. Job detail
+        let job_detail = get_db_job_detail(&pool, &job.id).await.unwrap().unwrap();
+        assert_eq!(job_detail.summary.id, job.id);
+
+        // 3. Schema
+        let schema = get_db_schema(&pool).await.unwrap();
+        assert!(schema.iter().any(|s| s.table_name == "media_assets"));
+        assert!(schema.iter().any(|s| s.table_name == "transcode_jobs"));
+        assert!(schema.iter().any(|s| s.table_name == "virtual_folder_colors"));
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
+

@@ -97,7 +97,14 @@ pub async fn run_server(
         .route(
             "/folders/colors",
             get(get_folder_colors).put(put_folder_color),
-        );
+        )
+        .route("/db/overview", get(get_db_overview_handler))
+        .route("/db/assets", get(get_db_assets_handler))
+        .route("/db/assets/{uuid}", get(get_db_asset_detail_handler))
+        .route("/db/jobs", get(get_db_jobs_handler))
+        .route("/db/jobs/{id}", get(get_db_job_detail_handler))
+        .route("/db/folders", get(get_db_folders_handler))
+        .route("/db/schema", get(get_db_schema_handler));
 
     let api_v2 = Router::new()
         .route("/health", get(health_v2))
@@ -121,7 +128,14 @@ pub async fn run_server(
         .route("/recycle-bin/auto-purge", post(post_auto_purge))
         .route("/events", get(sse_events))
         .route("/metrics", get(get_metrics_v2))
-        .route("/diagnostics", get(get_diagnostics));
+        .route("/diagnostics", get(get_diagnostics))
+        .route("/db/overview", get(get_db_overview_handler))
+        .route("/db/assets", get(get_db_assets_handler))
+        .route("/db/assets/{uuid}", get(get_db_asset_detail_handler))
+        .route("/db/jobs", get(get_db_jobs_handler))
+        .route("/db/jobs/{id}", get(get_db_job_detail_handler))
+        .route("/db/folders", get(get_db_folders_handler))
+        .route("/db/schema", get(get_db_schema_handler));
 
     let app = Router::new()
         .nest("/api/v2", api_v2)
@@ -1928,6 +1942,138 @@ async fn put_folder_color(
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => {
             tracing::error!("DB error on put_folder_color: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ── DB Viewer API Handlers ───────────────────────────────────────────────────
+
+async fn get_db_overview_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    match db::get_db_overview(&state.pool).await {
+        Ok(overview) => (StatusCode::OK, Json(overview)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_overview: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_db_assets_handler(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let filter = params.get("filter").map(|s| s.as_str());
+    let search = params.get("search").map(|s| s.as_str());
+    let limit = params.get("limit").and_then(|s| s.parse::<i64>().ok());
+    let offset = params.get("offset").and_then(|s| s.parse::<i64>().ok());
+
+    match db::query_db_assets(&state.pool, filter, search, limit, offset).await {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_assets: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_db_asset_detail_handler(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    match db::get_db_asset_detail(&state.pool, &uuid).await {
+        Ok(Some(detail)) => (StatusCode::OK, Json(detail)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_asset_detail: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_db_jobs_handler(
+    State(state): State<ServerState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let state_filter = params.get("state").map(|s| s.as_str());
+    let search = params.get("search").map(|s| s.as_str());
+    let limit = params.get("limit").and_then(|s| s.parse::<i64>().ok());
+    let offset = params.get("offset").and_then(|s| s.parse::<i64>().ok());
+
+    match db::query_db_jobs(&state.pool, state_filter, search, limit, offset).await {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_jobs: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_db_job_detail_handler(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match db::get_db_job_detail(&state.pool, &id).await {
+        Ok(Some(detail)) => (StatusCode::OK, Json(detail)).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_job_detail: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_db_folders_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    match db::get_db_folders(&state.pool).await {
+        Ok(folders) => (StatusCode::OK, Json(folders)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_folders: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_db_schema_handler(State(state): State<ServerState>) -> impl IntoResponse {
+    match db::get_db_schema(&state.pool).await {
+        Ok(schema) => (StatusCode::OK, Json(schema)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error on get_db_schema: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "database error"})),

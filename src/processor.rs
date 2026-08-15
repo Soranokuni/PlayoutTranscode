@@ -1,4 +1,5 @@
 use crate::{bootstrap, config, db, encoder, fingerprint, identity, jobs, probe, profiles};
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
@@ -95,6 +96,294 @@ pub fn classify_error(err_msg: &str, is_validation_failure: bool) -> RetryClass 
         return RetryClass::Retryable;
     }
     RetryClass::Retryable
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SourceCleanupResult {
+    pub enabled: bool,
+    pub attempted: bool,
+    pub deleted: bool,
+    pub skipped: bool,
+    pub reason: Option<String>,
+    pub warning: Option<String>,
+}
+
+/// Validates and cleans up the original input file after transcode and mark_ready succeed.
+/// Fail closed: if any check fails, the source is retained and a structured result is returned.
+pub fn validate_and_cleanup_source(
+    source_path: &Path,
+    watch_folder: &Path,
+    target_folder: &Path,
+    final_output_path: &Path,
+    initial_size: Option<u64>,
+    initial_mtime: Option<u64>,
+    queue: Option<&jobs::JobQueue>,
+    current_job_id: Option<&str>,
+    enabled: bool,
+) -> SourceCleanupResult {
+    if !enabled {
+        return SourceCleanupResult {
+            enabled: false,
+            attempted: false,
+            deleted: false,
+            skipped: true,
+            reason: Some("disabled".to_string()),
+            warning: None,
+        };
+    }
+
+    let source_str = source_path.to_string_lossy();
+    let trimmed = source_str.trim();
+    if trimmed.is_empty() {
+        return SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("unsafe_path".to_string()),
+            warning: Some("Source path is empty".to_string()),
+        };
+    }
+
+    if source_path.components().any(|c| c == std::path::Component::ParentDir) {
+        return SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("unsafe_path".to_string()),
+            warning: Some("Source path contains parent directory traversal (..)".to_string()),
+        };
+    }
+
+    if trimmed == "/" || trimmed == "\\" || (trimmed.len() <= 3 && trimmed.ends_with(":\\")) {
+        return SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("unsafe_path".to_string()),
+            warning: Some("Cannot delete root directory".to_string()),
+        };
+    }
+
+    if source_path.is_dir() {
+        return SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("source_is_directory".to_string()),
+            warning: Some("Refusing to delete directory as source file".to_string()),
+        };
+    }
+
+    // Canonicalize paths where possible
+    let can_source = match source_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("already_removed".to_string()),
+                warning: None,
+            };
+        }
+        Err(e) => {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("unsafe_path".to_string()),
+                warning: Some(format!("Failed to canonicalize source path: {}", e)),
+            };
+        }
+    };
+
+    if let Ok(can_watch) = watch_folder.canonicalize() {
+        if !can_source.starts_with(&can_watch) {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("outside_source_root".to_string()),
+                warning: Some("Source path is outside configured watch directory root".to_string()),
+            };
+        }
+        if can_source == can_watch {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("source_is_directory".to_string()),
+                warning: Some("Refusing to delete watch folder root".to_string()),
+            };
+        }
+    } else {
+        return SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("outside_source_root".to_string()),
+            warning: Some("Failed to resolve watch directory root".to_string()),
+        };
+    }
+
+    // Check target / mezzanine isolation
+    if let Ok(can_target) = target_folder.canonicalize() {
+        if can_source.starts_with(&can_target) {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("source_matches_target".to_string()),
+                warning: Some("Source path is inside target mezzanine directory".to_string()),
+            };
+        }
+    }
+    if let Ok(can_final) = final_output_path.canonicalize() {
+        if can_source == can_final {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("source_matches_target".to_string()),
+                warning: Some("Source path matches final output mezzanine path".to_string()),
+            };
+        }
+    }
+
+    // Recheck source file identity
+    let current_meta = match std::fs::metadata(source_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("already_removed".to_string()),
+                warning: None,
+            };
+        }
+        Err(e) => {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("delete_failed".to_string()),
+                warning: Some(format!("Failed to read source metadata before deletion: {}", e)),
+            };
+        }
+    };
+
+    let current_size = current_meta.len();
+    let current_mtime = current_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    if let Some(init_size) = initial_size {
+        if current_size != init_size {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("source_changed".to_string()),
+                warning: Some(format!(
+                    "Source file size changed during processing (was {}, now {})",
+                    init_size, current_size
+                )),
+            };
+        }
+    }
+
+    if let (Some(init_mtime), Some(curr_mtime)) = (initial_mtime, current_mtime) {
+        if curr_mtime != init_mtime {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("source_changed".to_string()),
+                warning: Some(format!(
+                    "Source file modification time changed during processing (was {}, now {})",
+                    init_mtime, curr_mtime
+                )),
+            };
+        }
+    }
+
+    // Check if another active or pending job references this same input path
+    if let Some(q) = queue {
+        let active_jobs = q.all_recent();
+        let other_job_active = active_jobs.iter().any(|j| {
+            if let Some(cur_id) = current_job_id {
+                if j.id == cur_id {
+                    return false;
+                }
+            }
+            if j.state == jobs::JobState::Pending || j.state == jobs::JobState::Processing {
+                if let (Ok(j_path), Ok(s_path)) = (
+                    std::path::Path::new(&j.input_path).canonicalize(),
+                    source_path.canonicalize(),
+                ) {
+                    return j_path == s_path;
+                }
+            }
+            false
+        });
+
+        if other_job_active {
+            return SourceCleanupResult {
+                enabled: true,
+                attempted: true,
+                deleted: false,
+                skipped: true,
+                reason: Some("source_referenced".to_string()),
+                warning: Some("Source file is currently referenced by another pending or active transcode job".to_string()),
+            };
+        }
+    }
+
+    // Perform removal
+    match std::fs::remove_file(source_path) {
+        Ok(_) => SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: true,
+            skipped: false,
+            reason: Some("deleted".to_string()),
+            warning: None,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("already_removed".to_string()),
+            warning: None,
+        },
+        Err(e) => SourceCleanupResult {
+            enabled: true,
+            attempted: true,
+            deleted: false,
+            skipped: true,
+            reason: Some("delete_failed".to_string()),
+            warning: Some(format!("Source cleanup deletion failed: {}", e)),
+        },
+    }
 }
 
 pub trait TranscodeRunner {
@@ -262,6 +551,14 @@ fn process_file_inner(
         tracing::warn!("Rejected path traversal attempt: {}", input_path.display());
         return;
     }
+
+    let initial_source_meta = std::fs::metadata(input_path).ok();
+    let initial_source_size = initial_source_meta.as_ref().map(|m| m.len());
+    let initial_source_mtime = initial_source_meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
 
     let handle = tokio::runtime::Handle::current();
 
@@ -823,19 +1120,40 @@ fn process_file_inner(
                     j.progress = 100.0;
                 },
             );
+
+            let storage_policy = config.effective_storage_policy();
+            let cleanup_result = validate_and_cleanup_source(
+                input_path,
+                Path::new(&config.paths.watch_folder),
+                Path::new(&config.paths.target_folder),
+                &final_output_path,
+                initial_source_size,
+                initial_source_mtime,
+                Some(queue),
+                Some(&job.id),
+                storage_policy.clean_source_after_success,
+            );
+
+            if let Some(ref warn) = cleanup_result.warning {
+                tracing::warn!("Source cleanup note for {}: {}", input_path.display(), warn);
+            }
+
             queue.broadcast(
                 "completed",
-                &serde_json::json!({"id":job.id,"uuid":metadata_uuid}).to_string(),
+                &serde_json::json!({
+                    "id": job.id,
+                    "uuid": metadata_uuid,
+                    "source_cleanup": cleanup_result,
+                })
+                .to_string(),
             );
             tracing::info!(
-                "Completed and verified: {} -> {} (uuid={})",
+                "Completed and verified: {} -> {} (uuid={}, source_cleanup={:?})",
                 input_path.display(),
                 final_output_path.display(),
-                metadata_uuid
+                metadata_uuid,
+                cleanup_result
             );
-            if config.effective_storage_policy().clean_source_after_success {
-                let _ = std::fs::remove_file(input_path);
-            }
             queue.prune_old(500);
             return;
         }
@@ -2036,4 +2354,271 @@ mod tests {
         let res_huge = check_disk_space(&cwd, huge_space);
         assert!(res_huge.is_err());
     }
+
+    #[test]
+    fn test_source_cleanup_disabled() {
+        let watch = std::env::temp_dir().join("test_cleanup_dis_watch");
+        let target = std::env::temp_dir().join("test_cleanup_dis_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&target);
+        let source_file = watch.join("clip.mp4");
+        let _ = std::fs::write(&source_file, b"content");
+        let final_out = target.join("out.mp4");
+
+        let res = validate_and_cleanup_source(
+            &source_file,
+            &watch,
+            &target,
+            &final_out,
+            Some(7),
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(!res.enabled);
+        assert!(!res.attempted);
+        assert!(!res.deleted);
+        assert!(res.skipped);
+        assert_eq!(res.reason.as_deref(), Some("disabled"));
+        assert!(source_file.exists(), "Source file must not be deleted when cleanup is disabled");
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_source_cleanup_outside_watch_rejected() {
+        let watch = std::env::temp_dir().join("test_cleanup_out_watch");
+        let other = std::env::temp_dir().join("test_cleanup_out_other");
+        let target = std::env::temp_dir().join("test_cleanup_out_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&other);
+        let _ = std::fs::create_dir_all(&target);
+        let source_file = other.join("outside.mp4");
+        let _ = std::fs::write(&source_file, b"outside content");
+        let final_out = target.join("out.mp4");
+
+        let res = validate_and_cleanup_source(
+            &source_file,
+            &watch,
+            &target,
+            &final_out,
+            Some(15),
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(res.enabled);
+        assert!(res.attempted);
+        assert!(!res.deleted);
+        assert_eq!(res.reason.as_deref(), Some("outside_source_root"));
+        assert!(source_file.exists(), "Source file outside watch root must be retained");
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&other);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_source_cleanup_traversal_and_directory_rejected() {
+        let watch = std::env::temp_dir().join("test_cleanup_trav_watch");
+        let target = std::env::temp_dir().join("test_cleanup_trav_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&target);
+        let final_out = target.join("out.mp4");
+
+        // 1. Directory rejected
+        let res_dir = validate_and_cleanup_source(
+            &watch,
+            &watch,
+            &target,
+            &final_out,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(!res_dir.deleted);
+        assert_eq!(res_dir.reason.as_deref(), Some("source_is_directory"));
+
+        // 2. Traversal path rejected
+        let trav_path = watch.join("sub").join("..").join("clip.mp4");
+        let res_trav = validate_and_cleanup_source(
+            &trav_path,
+            &watch,
+            &target,
+            &final_out,
+            None,
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(!res_trav.deleted);
+        assert_eq!(res_trav.reason.as_deref(), Some("unsafe_path"));
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_source_cleanup_target_and_final_collision_rejected() {
+        let watch = std::env::temp_dir().join("test_cleanup_col_watch");
+        let target = std::env::temp_dir().join("test_cleanup_col_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&target);
+        let target_file = target.join("target_mezzanine.mp4");
+        let _ = std::fs::write(&target_file, b"mezzanine");
+
+        // Source path inside target folder
+        let res = validate_and_cleanup_source(
+            &target_file,
+            &target, // even if watch were mistakenly target
+            &target,
+            &target_file,
+            Some(9),
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(!res.deleted);
+        assert_eq!(res.reason.as_deref(), Some("source_matches_target"));
+        assert!(target_file.exists());
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_source_cleanup_content_changed_during_processing_rejected() {
+        let watch = std::env::temp_dir().join("test_cleanup_chg_watch");
+        let target = std::env::temp_dir().join("test_cleanup_chg_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&target);
+        let source_file = watch.join("clip.mp4");
+        let _ = std::fs::write(&source_file, b"original content");
+        let final_out = target.join("out.mp4");
+
+        // Simulate file size change: initial was 100 bytes, current is 16 bytes
+        let res = validate_and_cleanup_source(
+            &source_file,
+            &watch,
+            &target,
+            &final_out,
+            Some(100), // initial size was 100
+            None,
+            None,
+            None,
+            true,
+        );
+        assert!(!res.deleted);
+        assert_eq!(res.reason.as_deref(), Some("source_changed"));
+        assert!(source_file.exists(), "Source must be retained if size changed");
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_source_cleanup_referenced_by_other_job_rejected() {
+        let watch = std::env::temp_dir().join("test_cleanup_ref_watch");
+        let target = std::env::temp_dir().join("test_cleanup_ref_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&target);
+        let source_file = watch.join("shared_clip.mp4");
+        let _ = std::fs::write(&source_file, b"shared media data");
+        let final_out = target.join("out.mp4");
+
+        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let queue = jobs::JobQueue::new(tx, None);
+        // Add current job
+        let job1 = jobs::JobRecord::new(source_file.to_str().unwrap(), "A");
+        queue.push(job1.clone());
+        // Add second pending job for the exact same input file
+        let job2 = jobs::JobRecord::new(source_file.to_str().unwrap(), "B");
+        queue.push(job2);
+
+        let res = validate_and_cleanup_source(
+            &source_file,
+            &watch,
+            &target,
+            &final_out,
+            Some(17),
+            None,
+            Some(&queue),
+            Some(&job1.id),
+            true,
+        );
+        assert!(!res.deleted);
+        assert_eq!(res.reason.as_deref(), Some("source_referenced"));
+        assert!(source_file.exists(), "Source must be retained if another job references it");
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_source_cleanup_success_verified_deletion() {
+        let watch = std::env::temp_dir().join("test_cleanup_ok_watch");
+        let target = std::env::temp_dir().join("test_cleanup_ok_target");
+        let _ = std::fs::create_dir_all(&watch);
+        let _ = std::fs::create_dir_all(&target);
+        let source_file = watch.join("clean_clip.mp4");
+        let _ = std::fs::write(&source_file, b"verified content data");
+        let final_out = target.join("out.mp4");
+        let _ = std::fs::write(&final_out, b"mezzanine video data");
+
+        let meta = std::fs::metadata(&source_file).unwrap();
+        let size = meta.len();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let res = validate_and_cleanup_source(
+            &source_file,
+            &watch,
+            &target,
+            &final_out,
+            Some(size),
+            Some(mtime),
+            None,
+            None,
+            true,
+        );
+        assert!(res.enabled);
+        assert!(res.attempted);
+        assert!(res.deleted);
+        assert!(!res.skipped);
+        assert_eq!(res.reason.as_deref(), Some("deleted"));
+        assert!(!source_file.exists(), "Source file must be safely deleted");
+        assert!(final_out.exists(), "Target file must be completely untouched");
+
+        // Second call (idempotent: already removed)
+        let res2 = validate_and_cleanup_source(
+            &source_file,
+            &watch,
+            &target,
+            &final_out,
+            Some(size),
+            Some(mtime),
+            None,
+            None,
+            true,
+        );
+        assert!(res2.enabled);
+        assert!(!res2.deleted);
+        assert!(res2.skipped);
+        assert_eq!(res2.reason.as_deref(), Some("already_removed"));
+
+        let _ = std::fs::remove_dir_all(&watch);
+        let _ = std::fs::remove_dir_all(&target);
+    }
 }
+
