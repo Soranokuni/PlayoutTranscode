@@ -85,7 +85,15 @@ pub async fn run_server(
         .route("/assets/{uuid}/move", put(put_move))
         .route("/assets/{uuid}/subclip", post(post_subclip))
         .route("/assets/{uuid}/purge", delete(delete_purge_asset))
+        .route("/assets/{uuid}/trash", post(post_trash_asset).put(post_trash_asset))
+        .route("/assets/{uuid}/restore", post(post_restore_asset).put(post_restore_asset))
         .route("/assets/batch", post(post_batch))
+        .route("/folders/trash", post(post_trash_folder).put(post_trash_folder))
+        .route("/folders/restore", post(post_restore_folder).put(post_restore_folder))
+        .route("/folders/purge", delete(delete_purge_folder))
+        .route("/recycle-bin", get(get_recycle_bin))
+        .route("/recycle-bin/purge", delete(delete_empty_recycle_bin))
+        .route("/recycle-bin/auto-purge", post(post_auto_purge))
         .route(
             "/folders/colors",
             get(get_folder_colors).put(put_folder_color),
@@ -102,6 +110,15 @@ pub async fn run_server(
         .route("/jobs/{id}/retry", post(post_retry_job))
         .route("/assets", get(list_assets))
         .route("/assets/{uuid}", get(get_asset))
+        .route("/assets/{uuid}/trash", post(post_trash_asset))
+        .route("/assets/{uuid}/restore", post(post_restore_asset))
+        .route("/assets/{uuid}/purge", delete(delete_purge_asset))
+        .route("/folders/trash", post(post_trash_folder))
+        .route("/folders/restore", post(post_restore_folder))
+        .route("/folders/purge", delete(delete_purge_folder))
+        .route("/recycle-bin", get(get_recycle_bin))
+        .route("/recycle-bin/purge", delete(delete_empty_recycle_bin))
+        .route("/recycle-bin/auto-purge", post(post_auto_purge))
         .route("/events", get(sse_events))
         .route("/metrics", get(get_metrics_v2))
         .route("/diagnostics", get(get_diagnostics));
@@ -1362,6 +1379,177 @@ async fn post_subclip(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct TrashFolderRequest {
+    pub folder_path: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct RestoreAssetRequest {
+    #[serde(default)]
+    pub target_folder: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RestoreFolderRequest {
+    pub folder_path: String,
+    #[serde(default)]
+    pub fallback_to_root: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PurgeFolderRequest {
+    pub folder_path: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct AutoPurgeRequest {
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+}
+
+async fn get_recycle_bin(State(state): State<ServerState>) -> impl IntoResponse {
+    match db::list_recycle_bin(&state.pool).await {
+        Ok(assets) => {
+            let responses: Vec<AssetResponse> = assets.into_iter().map(AssetResponse::from).collect();
+            (StatusCode::OK, Json(responses)).into_response()
+        }
+        Err(e) => {
+            tracing::error!("DB error on get_recycle_bin: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_trash_asset(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    match db::trash_asset(&state.pool, &uuid).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"success": true, "uuid": uuid, "trashed": true})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found or already trashed"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on post_trash_asset: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_trash_folder(
+    State(state): State<ServerState>,
+    Json(body): Json<TrashFolderRequest>,
+) -> impl IntoResponse {
+    if !db::is_valid_virtual_folder(&body.folder_path) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid folder_path"})),
+        )
+            .into_response();
+    }
+    match db::trash_folder(&state.pool, &body.folder_path).await {
+        Ok(count) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "folder_path": body.folder_path,
+                "trashed_count": count
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on post_trash_folder: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_restore_asset(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+    body: Option<Json<RestoreAssetRequest>>,
+) -> impl IntoResponse {
+    let target = body.and_then(|b| b.target_folder.clone());
+    match db::restore_asset(&state.pool, &uuid, target.as_deref()).await {
+        Ok(Some(asset)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "asset": AssetResponse::from(asset)
+            })),
+        )
+            .into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "asset not found in recycle bin"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on post_restore_asset: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_restore_folder(
+    State(state): State<ServerState>,
+    Json(body): Json<RestoreFolderRequest>,
+) -> impl IntoResponse {
+    if !db::is_valid_virtual_folder(&body.folder_path) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid folder_path"})),
+        )
+            .into_response();
+    }
+    let fallback = body.fallback_to_root.unwrap_or(false);
+    match db::restore_folder(&state.pool, &body.folder_path, fallback).await {
+        Ok(count) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "folder_path": body.folder_path,
+                "restored_count": count,
+                "fallback_to_root": fallback
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error on post_restore_folder: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn delete_purge_asset(
     State(state): State<ServerState>,
     Path(uuid): Path<String>,
@@ -1376,29 +1564,181 @@ async fn delete_purge_asset(
     } else {
         db::PurgeMode::DeleteUnreferencedMezzanine
     };
-    match db::purge_asset_with_mode(&state.pool, &uuid, mode).await {
-        Ok(outcome) => {
-            if outcome.rows_deleted == 0 {
+    let cfg = state.config.lock().clone();
+    let target_dir = if !cfg.paths.target_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.target_folder))
+    } else {
+        None
+    };
+    let watch_dir = if !cfg.paths.watch_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.watch_folder))
+    } else {
+        None
+    };
+
+    match db::purge_single_asset_with_context(&state.pool, &uuid, mode, target_dir, watch_dir).await {
+        Ok(result) => {
+            if result.rows_deleted == 0 {
                 (
                     StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({"error": "asset not found"})),
+                    Json(serde_json::json!({"error": "asset not found", "result": result})),
                 )
                     .into_response()
             } else {
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "success": true,
-                        "purged_records": outcome.rows_deleted,
-                        "file_removed": outcome.file_removed,
-                        "sidecar_removed": outcome.sidecar_removed,
-                    })),
-                )
-                    .into_response()
+                (StatusCode::OK, Json(result)).into_response()
             }
         }
         Err(e) => {
             tracing::error!("DB error during asset purge: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_purge_folder(
+    State(state): State<ServerState>,
+    Json(body): Json<PurgeFolderRequest>,
+) -> impl IntoResponse {
+    if !db::is_valid_virtual_folder(&body.folder_path) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid folder_path"})),
+        )
+            .into_response();
+    }
+    let mode = if state
+        .config
+        .lock()
+        .effective_storage_policy()
+        .preserve_subclips_on_purge
+    {
+        db::PurgeMode::PreserveReferencedMezzanine
+    } else {
+        db::PurgeMode::DeleteUnreferencedMezzanine
+    };
+    let cfg = state.config.lock().clone();
+    let target_dir = if !cfg.paths.target_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.target_folder))
+    } else {
+        None
+    };
+    let watch_dir = if !cfg.paths.watch_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.watch_folder))
+    } else {
+        None
+    };
+
+    match db::purge_folder_with_context(&state.pool, &body.folder_path, mode, target_dir, watch_dir).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error during folder purge: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_empty_recycle_bin(State(state): State<ServerState>) -> impl IntoResponse {
+    let mode = if state
+        .config
+        .lock()
+        .effective_storage_policy()
+        .preserve_subclips_on_purge
+    {
+        db::PurgeMode::PreserveReferencedMezzanine
+    } else {
+        db::PurgeMode::DeleteUnreferencedMezzanine
+    };
+    let cfg = state.config.lock().clone();
+    let target_dir = if !cfg.paths.target_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.target_folder))
+    } else {
+        None
+    };
+    let watch_dir = if !cfg.paths.watch_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.watch_folder))
+    } else {
+        None
+    };
+
+    match db::purge_recycle_bin_with_context(&state.pool, mode, target_dir, watch_dir).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error during empty recycle bin: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_auto_purge(
+    State(state): State<ServerState>,
+    Json(body): Json<AutoPurgeRequest>,
+) -> impl IntoResponse {
+    let days = if let Some(ref pol) = body.policy {
+        match pol.to_ascii_lowercase().as_str() {
+            "disabled" | "none" => 0,
+            "1week" | "7days" | "7d" => 7,
+            "2weeks" | "14days" | "14d" => 14,
+            "3weeks" | "21days" | "21d" => 21,
+            "1month" | "30days" | "30d" => 30,
+            _ => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": "invalid policy, must be one of: disabled, 1week, 2weeks, 3weeks, 1month"})),
+                )
+                    .into_response();
+            }
+        }
+    } else if let Some(d) = body.max_age_days {
+        if d != 0 && d != 7 && d != 14 && d != 21 && d != 30 {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "max_age_days must be 0, 7, 14, 21, or 30"})),
+            )
+                .into_response();
+        }
+        d
+    } else {
+        0
+    };
+
+    let mode = if state
+        .config
+        .lock()
+        .effective_storage_policy()
+        .preserve_subclips_on_purge
+    {
+        db::PurgeMode::PreserveReferencedMezzanine
+    } else {
+        db::PurgeMode::DeleteUnreferencedMezzanine
+    };
+    let cfg = state.config.lock().clone();
+    let target_dir = if !cfg.paths.target_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.target_folder))
+    } else {
+        None
+    };
+    let watch_dir = if !cfg.paths.watch_folder.is_empty() {
+        Some(std::path::Path::new(&cfg.paths.watch_folder))
+    } else {
+        None
+    };
+
+    match db::auto_purge_expired_with_context(&state.pool, days, mode, target_dir, watch_dir).await {
+        Ok(result) => (StatusCode::OK, Json(result)).into_response(),
+        Err(e) => {
+            tracing::error!("DB error during auto purge: {}", e);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "database error"})),

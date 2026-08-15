@@ -1,6 +1,17 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StructuredPurgeResult {
+    pub operation: String,
+    pub rows_deleted: u64,
+    pub media_removed: bool,
+    pub sidecar_removed: bool,
+    pub skipped_referenced_files: Vec<String>,
+    pub cleanup_failures: Vec<String>,
+    pub warnings: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MediaAsset {
@@ -24,6 +35,8 @@ pub struct MediaAsset {
     pub keyframe_safe_start_ms: i64,
     pub warnings: String,
     pub keyframe_offsets_json: String,
+    pub deleted_at: Option<String>,
+    pub original_virtual_folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +61,10 @@ pub struct AssetResponse {
     pub keyframe_safe_start_ms: i64,
     pub warnings: Vec<String>,
     pub keyframe_offsets: Vec<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_virtual_folder: Option<String>,
 }
 
 impl From<MediaAsset> for AssetResponse {
@@ -76,11 +93,13 @@ impl From<MediaAsset> for AssetResponse {
             keyframe_safe_start_ms: a.keyframe_safe_start_ms,
             warnings,
             keyframe_offsets,
+            deleted_at: a.deleted_at,
+            original_virtual_folder: a.original_virtual_folder,
         }
     }
 }
 
-const SELECT_COLS: &str = "uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json";
+const SELECT_COLS: &str = "uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder";
 
 /// Find all assets with a given status. Used for startup recovery scans.
 pub async fn find_all_with_status(
@@ -177,7 +196,9 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
             gop_frames INTEGER NOT NULL DEFAULT 0,
             keyframe_safe_start_ms INTEGER NOT NULL DEFAULT 0,
             warnings TEXT NOT NULL DEFAULT '[]',
-            keyframe_offsets_json TEXT NOT NULL DEFAULT '[]'
+            keyframe_offsets_json TEXT NOT NULL DEFAULT '[]',
+            deleted_at TEXT DEFAULT NULL,
+            original_virtual_folder TEXT DEFAULT NULL
         )",
     )
     .execute(&pool)
@@ -251,33 +272,34 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await;
 
-    for (col, default) in [
-        ("display_name", "''"),
-        ("rating", "'K'"),
-        ("tp", "'None'"),
-        ("virtual_folder", "'/'"),
-        ("mezzanine_ok", "0"),
-        ("fps", "0.0"),
-        ("total_frames", "0"),
-        ("gop_frames", "0"),
-        ("keyframe_safe_start_ms", "0"),
-        ("warnings", "'[]'"),
-        ("keyframe_offsets_json", "'[]'"),
-        ("fps_num", "0"),
-        ("fps_den", "0"),
+    for (col, col_type, default) in [
+        ("display_name", "TEXT", "''"),
+        ("rating", "TEXT", "'K'"),
+        ("tp", "TEXT", "'None'"),
+        ("virtual_folder", "TEXT", "'/'"),
+        ("mezzanine_ok", "BOOLEAN", "0"),
+        ("fps", "REAL", "0.0"),
+        ("total_frames", "INTEGER", "0"),
+        ("gop_frames", "INTEGER", "0"),
+        ("keyframe_safe_start_ms", "INTEGER", "0"),
+        ("warnings", "TEXT", "'[]'"),
+        ("keyframe_offsets_json", "TEXT", "'[]'"),
+        ("fps_num", "INTEGER", "0"),
+        ("fps_den", "INTEGER", "0"),
+        ("deleted_at", "TEXT", "NULL"),
+        ("original_virtual_folder", "TEXT", "NULL"),
     ] {
-        let sql = format!(
-            "ALTER TABLE media_assets ADD COLUMN {} {} NOT NULL DEFAULT {}",
-            col,
-            if col == "fps" {
-                "REAL"
-            } else if col == "mezzanine_ok" {
-                "BOOLEAN"
-            } else {
-                "INTEGER"
-            },
-            default
-        );
+        let sql = if default == "NULL" {
+            format!(
+                "ALTER TABLE media_assets ADD COLUMN {} {} DEFAULT NULL",
+                col, col_type
+            )
+        } else {
+            format!(
+                "ALTER TABLE media_assets ADD COLUMN {} {} NOT NULL DEFAULT {}",
+                col, col_type, default
+            )
+        };
         if let Err(e) = sqlx::query(&sql).execute(&pool).await {
             tracing::debug!("{} column may already exist: {}", col, e);
         }
@@ -325,6 +347,12 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     )
     .execute(&pool)
     .await?;
+
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_deleted_at ON media_assets(deleted_at)",
+    )
+    .execute(&pool)
+    .await;
 
     tracing::info!(
         "Database initialized at {} (WAL mode, media_assets ready)",
@@ -412,7 +440,23 @@ pub async fn mark_error(pool: &SqlitePool, uuid: &str) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// Find active asset by uuid (excludes soft-deleted / trashed assets).
 pub async fn find_by_uuid(
+    pool: &SqlitePool,
+    uuid: &str,
+) -> Result<Option<MediaAsset>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE uuid = ?1 AND deleted_at IS NULL",
+        SELECT_COLS
+    );
+    sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Find asset by uuid unconditionally (including soft-deleted / trashed assets).
+pub async fn find_by_uuid_raw(
     pool: &SqlitePool,
     uuid: &str,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
@@ -423,12 +467,28 @@ pub async fn find_by_uuid(
         .await
 }
 
+/// Find trashed asset by uuid.
+pub async fn find_trashed_by_uuid(
+    pool: &SqlitePool,
+    uuid: &str,
+) -> Result<Option<MediaAsset>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE uuid = ?1 AND deleted_at IS NOT NULL",
+        SELECT_COLS
+    );
+    sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(uuid)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Find active asset by fingerprint.
 pub async fn find_by_fingerprint(
     pool: &SqlitePool,
     fingerprint: i64,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
     let sql = format!(
-        "SELECT {} FROM media_assets WHERE fingerprint = ?1",
+        "SELECT {} FROM media_assets WHERE fingerprint = ?1 AND deleted_at IS NULL",
         SELECT_COLS
     );
     sqlx::query_as::<_, MediaAsset>(&sql)
@@ -437,6 +497,7 @@ pub async fn find_by_fingerprint(
         .await
 }
 
+/// Count total rows matching path (active + trashed) to protect physical media from premature deletion.
 pub async fn count_rows_by_path(pool: &SqlitePool, current_path: &str) -> Result<i64, sqlx::Error> {
     let (count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM media_assets WHERE current_path = ?1")
@@ -453,7 +514,7 @@ pub async fn set_trim(
     trim_out_ms: i64,
 ) -> Result<bool, sqlx::Error> {
     let result =
-        sqlx::query("UPDATE media_assets SET trim_in_ms = ?1, trim_out_ms = ?2 WHERE uuid = ?3")
+        sqlx::query("UPDATE media_assets SET trim_in_ms = ?1, trim_out_ms = ?2 WHERE uuid = ?3 AND deleted_at IS NULL")
             .bind(trim_in_ms)
             .bind(trim_out_ms)
             .bind(uuid)
@@ -463,7 +524,7 @@ pub async fn set_trim(
 }
 
 pub async fn set_rating(pool: &SqlitePool, uuid: &str, rating: &str) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE uuid = ?2")
+    let result = sqlx::query("UPDATE media_assets SET rating = ?1 WHERE uuid = ?2 AND deleted_at IS NULL")
         .bind(rating)
         .bind(uuid)
         .execute(pool)
@@ -472,7 +533,7 @@ pub async fn set_rating(pool: &SqlitePool, uuid: &str, rating: &str) -> Result<b
 }
 
 pub async fn set_tp(pool: &SqlitePool, uuid: &str, tp: &str) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE media_assets SET tp = ?1 WHERE uuid = ?2")
+    let result = sqlx::query("UPDATE media_assets SET tp = ?1 WHERE uuid = ?2 AND deleted_at IS NULL")
         .bind(tp)
         .bind(uuid)
         .execute(pool)
@@ -558,17 +619,205 @@ pub struct PurgeOutcome {
     pub sidecar_removed: bool,
 }
 
-pub async fn purge_asset_with_mode(
+/// Soft delete a single active asset (moves to Recycle Bin).
+pub async fn trash_asset(pool: &SqlitePool, uuid: &str) -> Result<bool, sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = sqlx::query(
+        "UPDATE media_assets 
+         SET deleted_at = ?1, 
+             original_virtual_folder = COALESCE(original_virtual_folder, virtual_folder)
+         WHERE uuid = ?2 AND deleted_at IS NULL"
+    )
+    .bind(now)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Soft delete all active assets under a virtual folder path (and descendants).
+pub async fn trash_folder(pool: &SqlitePool, folder_path: &str) -> Result<u64, sqlx::Error> {
+    let norm = if folder_path == "/" { "/" } else { folder_path.trim_end_matches('/') };
+    let now = chrono::Utc::now().to_rfc3339();
+    let result = if norm == "/" {
+        sqlx::query(
+            "UPDATE media_assets 
+             SET deleted_at = ?1, 
+                 original_virtual_folder = COALESCE(original_virtual_folder, virtual_folder)
+             WHERE deleted_at IS NULL"
+        )
+        .bind(now)
+        .execute(pool)
+        .await?
+    } else {
+        let prefix = format!("{}/%", norm);
+        sqlx::query(
+            "UPDATE media_assets 
+             SET deleted_at = ?1, 
+                 original_virtual_folder = COALESCE(original_virtual_folder, virtual_folder)
+             WHERE (virtual_folder = ?2 OR virtual_folder LIKE ?3) AND deleted_at IS NULL"
+        )
+        .bind(now)
+        .bind(norm)
+        .bind(prefix)
+        .execute(pool)
+        .await?
+    };
+    Ok(result.rows_affected())
+}
+
+/// Restore a trashed asset from Recycle Bin.
+pub async fn restore_asset(
+    pool: &SqlitePool,
+    uuid: &str,
+    target_folder: Option<&str>,
+) -> Result<Option<MediaAsset>, sqlx::Error> {
+    let asset = find_by_uuid_raw(pool, uuid).await?;
+    let Some(a) = asset else {
+        return Ok(None);
+    };
+    if a.deleted_at.is_none() {
+        return Ok(Some(a));
+    }
+
+    let effective_folder = if let Some(target) = target_folder {
+        if is_valid_virtual_folder(target) {
+            target.to_string()
+        } else {
+            "/".to_string()
+        }
+    } else {
+        a.original_virtual_folder
+            .clone()
+            .unwrap_or_else(|| "/".to_string())
+    };
+
+    sqlx::query(
+        "UPDATE media_assets 
+         SET deleted_at = NULL, 
+             virtual_folder = ?1,
+             original_virtual_folder = NULL
+         WHERE uuid = ?2"
+    )
+    .bind(&effective_folder)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+
+    find_by_uuid(pool, uuid).await
+}
+
+/// Restore all trashed assets that originated from a folder path.
+pub async fn restore_folder(
+    pool: &SqlitePool,
+    folder_path: &str,
+    fallback_to_root: bool,
+) -> Result<u64, sqlx::Error> {
+    let norm = if folder_path == "/" { "/" } else { folder_path.trim_end_matches('/') };
+    let result = if norm == "/" {
+        sqlx::query(
+            "UPDATE media_assets 
+             SET deleted_at = NULL, 
+                 virtual_folder = COALESCE(original_virtual_folder, '/'),
+                 original_virtual_folder = NULL
+             WHERE deleted_at IS NOT NULL"
+        )
+        .execute(pool)
+        .await?
+    } else if fallback_to_root {
+        let prefix = format!("{}/%", norm);
+        sqlx::query(
+            "UPDATE media_assets 
+             SET deleted_at = NULL, 
+                 virtual_folder = '/',
+                 original_virtual_folder = NULL
+             WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2) AND deleted_at IS NOT NULL"
+        )
+        .bind(norm)
+        .bind(prefix)
+        .execute(pool)
+        .await?
+    } else {
+        let prefix = format!("{}/%", norm);
+        sqlx::query(
+            "UPDATE media_assets 
+             SET deleted_at = NULL, 
+                 virtual_folder = COALESCE(original_virtual_folder, '/'),
+                 original_virtual_folder = NULL
+             WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2) AND deleted_at IS NOT NULL"
+        )
+        .bind(norm)
+        .bind(prefix)
+        .execute(pool)
+        .await?
+    };
+    Ok(result.rows_affected())
+}
+
+/// List all assets in Recycle Bin (deleted_at IS NOT NULL).
+pub async fn list_recycle_bin(pool: &SqlitePool) -> Result<Vec<MediaAsset>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC, uuid",
+        SELECT_COLS
+    );
+    sqlx::query_as::<_, MediaAsset>(&sql).fetch_all(pool).await
+}
+
+/// Validate path for safe physical deletion.
+pub fn validate_purge_path(
+    path_str: &str,
+    managed_target_dir: Option<&Path>,
+    watch_dir: Option<&Path>,
+) -> Result<std::path::PathBuf, String> {
+    let trimmed = path_str.trim();
+    if trimmed.is_empty() {
+        return Err("Path is empty".to_string());
+    }
+    let path = std::path::Path::new(trimmed);
+    if path.components().any(|c| c == std::path::Component::ParentDir) {
+        return Err("Path contains parent directory traversal (..)".to_string());
+    }
+    if trimmed == "/" || trimmed == "\\" || (trimmed.len() <= 3 && trimmed.ends_with(":\\")) {
+        return Err("Cannot purge root directory".to_string());
+    }
+
+    if let Some(watch) = watch_dir {
+        if let (Ok(can_path), Ok(can_watch)) = (path.canonicalize(), watch.canonicalize()) {
+            if can_path.starts_with(&can_watch) {
+                return Err("Refusing to purge source media in watch folder".to_string());
+            }
+        }
+    }
+
+    if let Some(target) = managed_target_dir {
+        if let (Ok(can_path), Ok(can_target)) = (path.canonicalize(), target.canonicalize()) {
+            if !can_path.starts_with(&can_target) {
+                return Err("Path is outside managed target directory root".to_string());
+            }
+        }
+    }
+
+    Ok(path.to_path_buf())
+}
+
+/// Purge a single asset with full path validation, reference counting, and physical cleanup.
+pub async fn purge_single_asset_with_context(
     pool: &SqlitePool,
     uuid: &str,
     mode: PurgeMode,
-) -> Result<PurgeOutcome, sqlx::Error> {
-    let asset = find_by_uuid(pool, uuid).await?;
+    managed_target_dir: Option<&Path>,
+    watch_dir: Option<&Path>,
+) -> Result<StructuredPurgeResult, sqlx::Error> {
+    let asset = find_by_uuid_raw(pool, uuid).await?;
     let Some(a) = asset else {
-        return Ok(PurgeOutcome {
+        return Ok(StructuredPurgeResult {
+            operation: "purge_asset".to_string(),
             rows_deleted: 0,
-            file_removed: false,
+            media_removed: false,
             sidecar_removed: false,
+            skipped_referenced_files: Vec::new(),
+            cleanup_failures: Vec::new(),
+            warnings: vec!["asset_not_found".to_string()],
         });
     };
 
@@ -576,44 +825,251 @@ pub async fn purge_asset_with_mode(
     purge_row_by_uuid(pool, uuid).await?;
 
     let remaining_refs = count_rows_by_path(pool, &path).await?;
+    let mut media_removed = false;
+    let mut sidecar_removed = false;
+    let mut skipped_referenced_files = Vec::new();
+    let mut cleanup_failures = Vec::new();
+    let mut warnings = Vec::new();
+
     let should_remove_file = match mode {
         PurgeMode::PreserveReferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
         PurgeMode::DeleteUnreferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
     };
 
-    let mut file_removed = false;
-    let mut sidecar_removed = false;
+    if remaining_refs > 0 {
+        skipped_referenced_files.push(path.clone());
+        warnings.push(format!(
+            "Physical media retained because {} other reference(s) still point to it",
+            remaining_refs
+        ));
+    } else if should_remove_file {
+        match validate_purge_path(&path, managed_target_dir, watch_dir) {
+            Ok(media_path) => {
+                if !crate::watcher::is_temp_file_name(&media_path) {
+                    match tokio::fs::remove_file(&media_path).await {
+                        Ok(_) => media_removed = true,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => media_removed = false,
+                        Err(e) => {
+                            let msg = format!("Failed to delete media file '{}': {}", path, e);
+                            tracing::warn!("{}", msg);
+                            cleanup_failures.push(msg);
+                        }
+                    }
 
-    if should_remove_file {
-        let media_path = Path::new(&path);
-        if !crate::watcher::is_temp_file_name(media_path) {
-            match tokio::fs::remove_file(media_path).await {
-                Ok(_) => file_removed = true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => file_removed = false,
-                Err(e) => {
-                    tracing::warn!("Failed to remove physical file at {}: {}", path, e);
+                    let sidecar_path = crate::identity::sidecar_path_for(&media_path);
+                    match tokio::fs::remove_file(&sidecar_path).await {
+                        Ok(_) => sidecar_removed = true,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => sidecar_removed = false,
+                        Err(e) => {
+                            let msg = format!(
+                                "Failed to delete sidecar file '{}': {}",
+                                sidecar_path.display(),
+                                e
+                            );
+                            tracing::warn!("{}", msg);
+                            cleanup_failures.push(msg);
+                        }
+                    }
                 }
             }
-
-            let sidecar_path = crate::identity::sidecar_path_for(media_path);
-            match tokio::fs::remove_file(&sidecar_path).await {
-                Ok(_) => sidecar_removed = true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => sidecar_removed = false,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to remove sidecar file at {}: {}",
-                        sidecar_path.display(),
-                        e
-                    );
-                }
+            Err(e) => {
+                warnings.push(format!("Physical file cleanup skipped: {}", e));
             }
         }
     }
 
-    Ok(PurgeOutcome {
+    Ok(StructuredPurgeResult {
+        operation: "purge_asset".to_string(),
         rows_deleted: 1,
-        file_removed,
+        media_removed,
         sidecar_removed,
+        skipped_referenced_files,
+        cleanup_failures,
+        warnings,
+    })
+}
+
+/// Purge all trashed assets under a virtual folder path.
+pub async fn purge_folder_with_context(
+    pool: &SqlitePool,
+    folder_path: &str,
+    mode: PurgeMode,
+    managed_target_dir: Option<&Path>,
+    watch_dir: Option<&Path>,
+) -> Result<StructuredPurgeResult, sqlx::Error> {
+    let norm = if folder_path == "/" { "/" } else { folder_path.trim_end_matches('/') };
+    let assets: Vec<MediaAsset> = if norm == "/" {
+        let sql = format!(
+            "SELECT {} FROM media_assets WHERE deleted_at IS NOT NULL",
+            SELECT_COLS
+        );
+        sqlx::query_as::<_, MediaAsset>(&sql).fetch_all(pool).await?
+    } else {
+        let prefix = format!("{}/%", norm);
+        let sql = format!(
+            "SELECT {} FROM media_assets WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2 OR virtual_folder = ?1 OR virtual_folder LIKE ?2) AND deleted_at IS NOT NULL",
+            SELECT_COLS
+        );
+        sqlx::query_as::<_, MediaAsset>(&sql)
+            .bind(norm)
+            .bind(prefix)
+            .fetch_all(pool)
+            .await?
+    };
+
+    let mut total_rows = 0;
+    let mut any_media = false;
+    let mut any_sidecar = false;
+    let mut all_skipped = Vec::new();
+    let mut all_failures = Vec::new();
+    let mut all_warnings = Vec::new();
+
+    for a in assets {
+        let res = purge_single_asset_with_context(
+            pool,
+            &a.uuid,
+            mode,
+            managed_target_dir,
+            watch_dir,
+        )
+        .await?;
+        total_rows += res.rows_deleted;
+        any_media = any_media || res.media_removed;
+        any_sidecar = any_sidecar || res.sidecar_removed;
+        all_skipped.extend(res.skipped_referenced_files);
+        all_failures.extend(res.cleanup_failures);
+        all_warnings.extend(res.warnings);
+    }
+
+    Ok(StructuredPurgeResult {
+        operation: "purge_folder".to_string(),
+        rows_deleted: total_rows,
+        media_removed: any_media,
+        sidecar_removed: any_sidecar,
+        skipped_referenced_files: all_skipped,
+        cleanup_failures: all_failures,
+        warnings: all_warnings,
+    })
+}
+
+/// Purge all items in the Recycle Bin.
+pub async fn purge_recycle_bin_with_context(
+    pool: &SqlitePool,
+    mode: PurgeMode,
+    managed_target_dir: Option<&Path>,
+    watch_dir: Option<&Path>,
+) -> Result<StructuredPurgeResult, sqlx::Error> {
+    let trashed = list_recycle_bin(pool).await?;
+    let mut total_rows = 0;
+    let mut any_media = false;
+    let mut any_sidecar = false;
+    let mut all_skipped = Vec::new();
+    let mut all_failures = Vec::new();
+    let mut all_warnings = Vec::new();
+
+    for a in trashed {
+        let res = purge_single_asset_with_context(
+            pool,
+            &a.uuid,
+            mode,
+            managed_target_dir,
+            watch_dir,
+        )
+        .await?;
+        total_rows += res.rows_deleted;
+        any_media = any_media || res.media_removed;
+        any_sidecar = any_sidecar || res.sidecar_removed;
+        all_skipped.extend(res.skipped_referenced_files);
+        all_failures.extend(res.cleanup_failures);
+        all_warnings.extend(res.warnings);
+    }
+
+    Ok(StructuredPurgeResult {
+        operation: "purge_recycle_bin".to_string(),
+        rows_deleted: total_rows,
+        media_removed: any_media,
+        sidecar_removed: any_sidecar,
+        skipped_referenced_files: all_skipped,
+        cleanup_failures: all_failures,
+        warnings: all_warnings,
+    })
+}
+
+/// Purge all trashed items older than max_age_days.
+pub async fn auto_purge_expired_with_context(
+    pool: &SqlitePool,
+    max_age_days: u32,
+    mode: PurgeMode,
+    managed_target_dir: Option<&Path>,
+    watch_dir: Option<&Path>,
+) -> Result<StructuredPurgeResult, sqlx::Error> {
+    if max_age_days == 0 {
+        return Ok(StructuredPurgeResult {
+            operation: "auto_purge".to_string(),
+            rows_deleted: 0,
+            media_removed: false,
+            sidecar_removed: false,
+            skipped_referenced_files: Vec::new(),
+            cleanup_failures: Vec::new(),
+            warnings: vec!["auto_purge_disabled".to_string()],
+        });
+    }
+
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(max_age_days as i64)).to_rfc3339();
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE deleted_at IS NOT NULL AND deleted_at <= ?1 ORDER BY deleted_at ASC",
+        SELECT_COLS
+    );
+    let expired: Vec<MediaAsset> = sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(&cutoff)
+        .fetch_all(pool)
+        .await?;
+
+    let mut total_rows = 0;
+    let mut any_media = false;
+    let mut any_sidecar = false;
+    let mut all_skipped = Vec::new();
+    let mut all_failures = Vec::new();
+    let mut all_warnings = Vec::new();
+
+    for a in expired {
+        let res = purge_single_asset_with_context(
+            pool,
+            &a.uuid,
+            mode,
+            managed_target_dir,
+            watch_dir,
+        )
+        .await?;
+        total_rows += res.rows_deleted;
+        any_media = any_media || res.media_removed;
+        any_sidecar = any_sidecar || res.sidecar_removed;
+        all_skipped.extend(res.skipped_referenced_files);
+        all_failures.extend(res.cleanup_failures);
+        all_warnings.extend(res.warnings);
+    }
+
+    Ok(StructuredPurgeResult {
+        operation: "auto_purge".to_string(),
+        rows_deleted: total_rows,
+        media_removed: any_media,
+        sidecar_removed: any_sidecar,
+        skipped_referenced_files: all_skipped,
+        cleanup_failures: all_failures,
+        warnings: all_warnings,
+    })
+}
+
+pub async fn purge_asset_with_mode(
+    pool: &SqlitePool,
+    uuid: &str,
+    mode: PurgeMode,
+) -> Result<PurgeOutcome, sqlx::Error> {
+    let res = purge_single_asset_with_context(pool, uuid, mode, None, None).await?;
+    Ok(PurgeOutcome {
+        rows_deleted: res.rows_deleted,
+        file_removed: res.media_removed,
+        sidecar_removed: res.sidecar_removed,
     })
 }
 
@@ -639,7 +1095,7 @@ pub async fn set_display_name(
     uuid: &str,
     display_name: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE media_assets SET display_name = ?1 WHERE uuid = ?2")
+    let result = sqlx::query("UPDATE media_assets SET display_name = ?1 WHERE uuid = ?2 AND deleted_at IS NULL")
         .bind(display_name)
         .bind(uuid)
         .execute(pool)
@@ -652,7 +1108,7 @@ pub async fn set_virtual_folder(
     uuid: &str,
     virtual_folder: &str,
 ) -> Result<bool, sqlx::Error> {
-    let result = sqlx::query("UPDATE media_assets SET virtual_folder = ?1 WHERE uuid = ?2")
+    let result = sqlx::query("UPDATE media_assets SET virtual_folder = ?1 WHERE uuid = ?2 AND deleted_at IS NULL")
         .bind(virtual_folder)
         .bind(uuid)
         .execute(pool)
@@ -680,10 +1136,9 @@ pub async fn find_all(
     pool: &SqlitePool,
     status_filter: Option<&str>,
 ) -> Result<Vec<MediaAsset>, sqlx::Error> {
-    let sql = format!("SELECT {} FROM media_assets ORDER BY uuid", SELECT_COLS);
     if let Some(status) = status_filter {
         let filtered = format!(
-            "SELECT {} FROM media_assets WHERE status = ?1 ORDER BY uuid",
+            "SELECT {} FROM media_assets WHERE status = ?1 AND deleted_at IS NULL ORDER BY uuid",
             SELECT_COLS
         );
         sqlx::query_as::<_, MediaAsset>(&filtered)
@@ -691,6 +1146,10 @@ pub async fn find_all(
             .fetch_all(pool)
             .await
     } else {
+        let sql = format!(
+            "SELECT {} FROM media_assets WHERE deleted_at IS NULL ORDER BY uuid",
+            SELECT_COLS
+        );
         sqlx::query_as::<_, MediaAsset>(&sql).fetch_all(pool).await
     }
 }
@@ -704,7 +1163,7 @@ pub async fn find_batch(
     }
     let placeholders = uuids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
     let sql = format!(
-        "SELECT {} FROM media_assets WHERE uuid IN ({})",
+        "SELECT {} FROM media_assets WHERE uuid IN ({}) AND deleted_at IS NULL",
         SELECT_COLS, placeholders
     );
     let mut query = sqlx::query_as::<_, MediaAsset>(&sql);
@@ -1486,6 +1945,241 @@ mod tests {
         let j = all.iter().find(|j| j.id == job.id).unwrap();
         assert_eq!(j.phase, crate::jobs::JobPhase::Cancelled);
         assert_eq!(j.state, crate::jobs::JobState::Cancelled);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_soft_delete_single_asset_and_restore() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let uuid = "test-soft-del-1";
+        insert_processing(&pool, uuid, 12345, "D:/target/clip1.mp4", "Clip 1")
+            .await
+            .unwrap();
+        mark_ready(&pool, uuid, "D:/target/clip1.mp4", 5000, true, 25.0, 25, 1, 125, 50, 0, &[], "[]")
+            .await
+            .unwrap();
+        set_virtual_folder(&pool, uuid, "/Shows/Drama").await.unwrap();
+
+        // 1. Asset is active
+        let active = find_by_uuid(&pool, uuid).await.unwrap();
+        assert!(active.is_some());
+        assert_eq!(active.unwrap().virtual_folder, "/Shows/Drama");
+
+        // 2. Soft delete / trash asset
+        let trashed = trash_asset(&pool, uuid).await.unwrap();
+        assert!(trashed);
+
+        // 3. Active queries must exclude trashed asset
+        let active_after = find_by_uuid(&pool, uuid).await.unwrap();
+        assert!(active_after.is_none(), "Active query must exclude trashed asset");
+
+        let all_active = find_all(&pool, None).await.unwrap();
+        assert!(all_active.is_empty(), "find_all must exclude trashed asset");
+
+        // 4. Recycle bin query contains trashed asset
+        let bin = list_recycle_bin(&pool).await.unwrap();
+        assert_eq!(bin.len(), 1);
+        assert_eq!(bin[0].uuid, uuid);
+        assert!(bin[0].deleted_at.is_some());
+        assert_eq!(bin[0].original_virtual_folder.as_deref(), Some("/Shows/Drama"));
+
+        // 5. Restore asset to original folder
+        let restored = restore_asset(&pool, uuid, None).await.unwrap();
+        assert!(restored.is_some());
+        let r = restored.unwrap();
+        assert_eq!(r.virtual_folder, "/Shows/Drama");
+        assert!(r.deleted_at.is_none());
+        assert!(r.original_virtual_folder.is_none());
+
+        // 6. Active query finds it again
+        let active_restored = find_by_uuid(&pool, uuid).await.unwrap();
+        assert!(active_restored.is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_soft_delete_folder_and_prefix_boundary_isolation() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        // Create 3 assets:
+        // 1: /Shows/Drama
+        // 2: /Shows/Drama/Season1
+        // 3: /Shows/Dramatic (MUST NOT BE TRASHED BY /Shows/Drama!)
+        insert_processing(&pool, "u1", 1, "D:/target/c1.mp4", "C1").await.unwrap();
+        set_virtual_folder(&pool, "u1", "/Shows/Drama").await.unwrap();
+
+        insert_processing(&pool, "u2", 2, "D:/target/c2.mp4", "C2").await.unwrap();
+        set_virtual_folder(&pool, "u2", "/Shows/Drama/Season1").await.unwrap();
+
+        insert_processing(&pool, "u3", 3, "D:/target/c3.mp4", "C3").await.unwrap();
+        set_virtual_folder(&pool, "u3", "/Shows/Dramatic").await.unwrap();
+
+        // Trash /Shows/Drama
+        let affected = trash_folder(&pool, "/Shows/Drama").await.unwrap();
+        assert_eq!(affected, 2);
+
+        // /Shows/Dramatic must remain active
+        let active3 = find_by_uuid(&pool, "u3").await.unwrap();
+        assert!(active3.is_some(), "/Shows/Dramatic must not be affected by /Shows/Drama delete");
+
+        // Active list should have only 1 asset
+        let active_list = find_all(&pool, None).await.unwrap();
+        assert_eq!(active_list.len(), 1);
+        assert_eq!(active_list[0].uuid, "u3");
+
+        // Recycle bin has 2 items
+        let bin = list_recycle_bin(&pool).await.unwrap();
+        assert_eq!(bin.len(), 2);
+
+        // Restore folder /Shows/Drama
+        let restored_count = restore_folder(&pool, "/Shows/Drama", false).await.unwrap();
+        assert_eq!(restored_count, 2);
+
+        let active_list_after = find_all(&pool, None).await.unwrap();
+        assert_eq!(active_list_after.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_restore_folder_fallback_to_root() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        insert_processing(&pool, "u10", 10, "D:/target/c10.mp4", "C10").await.unwrap();
+        set_virtual_folder(&pool, "u10", "/OldShows/SeriesA").await.unwrap();
+
+        trash_folder(&pool, "/OldShows").await.unwrap();
+
+        // Restore with fallback_to_root = true
+        let restored = restore_folder(&pool, "/OldShows", true).await.unwrap();
+        assert_eq!(restored, 1);
+
+        let a = find_by_uuid(&pool, "u10").await.unwrap().unwrap();
+        assert_eq!(a.virtual_folder, "/", "Should fallback to root '/'");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_path_safety_validation() {
+        let temp_target = std::env::temp_dir().join("transcode_target_safe");
+        let temp_watch = std::env::temp_dir().join("transcode_watch_safe");
+        let _ = std::fs::create_dir_all(&temp_target);
+        let _ = std::fs::create_dir_all(&temp_watch);
+
+        let safe_file = temp_target.join("output.mp4");
+        let _ = std::fs::File::create(&safe_file);
+
+        let watch_file = temp_watch.join("source.mp4");
+        let _ = std::fs::File::create(&watch_file);
+
+        // 1. Safe target file succeeds
+        let valid = validate_purge_path(
+            &safe_file.to_string_lossy(),
+            Some(&temp_target),
+            Some(&temp_watch),
+        );
+        assert!(valid.is_ok());
+
+        // 2. Source file in watch folder is rejected!
+        let in_watch = validate_purge_path(
+            &watch_file.to_string_lossy(),
+            Some(&temp_target),
+            Some(&temp_watch),
+        );
+        assert!(in_watch.is_err(), "Must reject source file in watch folder");
+
+        // 3. Path traversal is rejected!
+        let traversal = validate_purge_path(
+            &format!("{}/../etc/passwd", temp_target.to_string_lossy()),
+            Some(&temp_target),
+            Some(&temp_watch),
+        );
+        assert!(traversal.is_err(), "Must reject path traversal");
+
+        // 4. Root is rejected!
+        assert!(validate_purge_path("/", Some(&temp_target), Some(&temp_watch)).is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_target);
+        let _ = std::fs::remove_dir_all(&temp_watch);
+    }
+
+    #[tokio::test]
+    async fn test_purge_single_asset_with_real_files_and_sidecar() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let media_file = temp_dir.join("mezzanine_video.mp4");
+        let sidecar_file = crate::identity::sidecar_path_for(&media_file);
+        std::fs::File::create(&media_file).unwrap();
+        std::fs::File::create(&sidecar_file).unwrap();
+
+        let uuid = "purge-test-uuid";
+        insert_processing(&pool, uuid, 8888, &media_file.to_string_lossy(), "Mezzanine")
+            .await
+            .unwrap();
+
+        // Purge asset
+        let result = purge_single_asset_with_context(
+            &pool,
+            uuid,
+            PurgeMode::PreserveReferencedMezzanine,
+            Some(&temp_dir),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.rows_deleted, 1);
+        assert!(result.media_removed);
+        assert!(result.sidecar_removed);
+        assert!(!media_file.exists(), "Media file must be deleted");
+        assert!(!sidecar_file.exists(), "Sidecar file must be deleted");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_auto_purge_retention_cutoff() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        // Old asset deleted 15 days ago
+        let old_time = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
+        insert_processing(&pool, "old-asset", 111, "D:/target/old.mp4", "Old").await.unwrap();
+        sqlx::query("UPDATE media_assets SET deleted_at = ?1 WHERE uuid = 'old-asset'")
+            .bind(&old_time)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Recent asset deleted 2 days ago
+        let recent_time = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
+        insert_processing(&pool, "recent-asset", 222, "D:/target/recent.mp4", "Recent").await.unwrap();
+        sqlx::query("UPDATE media_assets SET deleted_at = ?1 WHERE uuid = 'recent-asset'")
+            .bind(&recent_time)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Run auto-purge with 14-day policy
+        let result = auto_purge_expired_with_context(
+            &pool,
+            14,
+            PurgeMode::PreserveReferencedMezzanine,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.rows_deleted, 1, "Only 15-day-old asset should be purged");
+
+        // Old asset is gone from DB
+        let old_check = find_by_uuid_raw(&pool, "old-asset").await.unwrap();
+        assert!(old_check.is_none());
+
+        // Recent asset is still in recycle bin
+        let recent_check = find_by_uuid_raw(&pool, "recent-asset").await.unwrap();
+        assert!(recent_check.is_some());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
