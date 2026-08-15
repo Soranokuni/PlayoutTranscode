@@ -220,12 +220,23 @@
               <label style="margin-left:16px">Retry delay (ms)</label>
               <input type="number" min="0" max="60000" v-model.number="editRetryDelayMs" class="input" style="width:90px" />
             </div>
+            <div class="form-row" style="margin-top:8px">
+              <label class="checkbox-label">
+                <input type="checkbox" v-model="editCleanSourceAfterSuccess" />
+                Delete source file after verified transcode &amp; publication
+              </label>
+              <span class="text-muted" style="font-size:11px">Destructive opt-in: safely removed from watch folder only after QC pass and DB mark_ready.</span>
+            </div>
           </div>
 
           <div style="display:flex;gap:12px;align-items:center;margin-top:16px">
             <button class="btn btn-primary" style="padding:10px 32px;font-size:14px" @click="saveConfig">Save Configuration</button>
             <span v-if="saveMsg" :class="['save-msg', saveOk ? 'save-ok' : 'save-err']">{{ saveMsg }}</span>
           </div>
+        </div>
+
+        <div v-if="activeTab === 'database'" class="tab-panel">
+          <DbViewer />
         </div>
 
         <div v-if="activeTab === 'logs'" class="tab-panel">
@@ -251,6 +262,7 @@ import { useEventStream, type ConfigPayload } from './composables/useEventStream
 import BroadcastTopBar from './components/BroadcastTopBar.vue'
 import IngestQueuePanel from './components/IngestQueuePanel.vue'
 import AssetRegistryGrid from './components/AssetRegistryGrid.vue'
+import DbViewer from './components/DbViewer.vue'
 
 const PRESETS = ['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']
 const AUDIO_CODECS = ['aac', 'pcm_s16le', 'libmp3lame']
@@ -259,6 +271,7 @@ const RETRY_POLICIES = ['never', 'once', 'always']
 
 const tabs = [
   { id: 'dashboard', label: 'Dashboard' },
+  { id: 'database', label: 'Database' },
   { id: 'config', label: 'Configuration' },
   { id: 'logs', label: 'Logs' },
 ]
@@ -299,6 +312,7 @@ const editCpuCores = ref(0)
 const editAutoRetryOnStart = ref(true)
 const editMaxAttempts = ref(2)
 const editRetryDelayMs = ref(2000)
+const editCleanSourceAfterSuccess = ref(false)
 
 const editAudioMode = ref<'legacy_v1_encode' | 'ebu_r128' | 'atsc_a85' | 'passthrough_validate' | 'analyze_only'>('legacy_v1_encode')
 const editAudioTargetLufs = ref<number | undefined>(undefined)
@@ -388,6 +402,7 @@ function populateFromConfig(cfg: ConfigPayload) {
   editAutoRetryOnStart.value = cfg.ingestion.auto_retry_on_start ?? true
   editMaxAttempts.value = cfg.ingestion.max_attempts ?? 2
   editRetryDelayMs.value = cfg.ingestion.retry_delay_ms ?? 2000
+  editCleanSourceAfterSuccess.value = cfg.ingestion.clean_source_after_success ?? false
   if (cfg.audio_policy) {
     editAudioMode.value = cfg.audio_policy.mode || 'legacy_v1_encode'
     editAudioTargetLufs.value = cfg.audio_policy.target_lufs
@@ -448,6 +463,7 @@ async function saveConfig() {
         auto_retry_on_start: editAutoRetryOnStart.value,
         max_attempts: editMaxAttempts.value,
         retry_delay_ms: editRetryDelayMs.value,
+        clean_source_after_success: editCleanSourceAfterSuccess.value,
       },
     } as unknown as Partial<ConfigPayload>)
     saveMsg.value = 'Configuration saved successfully'
