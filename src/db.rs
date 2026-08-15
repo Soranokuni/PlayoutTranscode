@@ -468,6 +468,7 @@ pub async fn find_by_uuid_raw(
 }
 
 /// Find trashed asset by uuid.
+#[allow(dead_code)]
 pub async fn find_trashed_by_uuid(
     pool: &SqlitePool,
     uuid: &str,
