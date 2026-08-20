@@ -871,6 +871,14 @@ pub async fn purge_single_asset_with_context(
                             cleanup_failures.push(msg);
                         }
                     }
+
+                    // Also cleanup legacy adjacent sidecar if distinct from sidecar_path
+                    let legacy_sidecar = media_path.with_extension("uuid.json");
+                    if legacy_sidecar != sidecar_path && legacy_sidecar.exists() {
+                        if tokio::fs::remove_file(&legacy_sidecar).await.is_ok() {
+                            sidecar_removed = true;
+                        }
+                    }
                 }
             }
             Err(e) => {

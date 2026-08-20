@@ -115,7 +115,16 @@
               </td>
               <td>
                 <span v-if="a.sidecar_exists" class="badge badge-success" title="JSON sidecar exists">.json ✓</span>
-                <span v-else class="badge badge-muted">—</span>
+                <span v-else class="badge badge-muted" title="Sidecar missing on disk">—</span>
+                <button
+                  v-if="!a.sidecar_exists && a.status === 'ready' && !a.deleted_at"
+                  class="btn btn-xs btn-outline ml-1"
+                  :disabled="regeneratingSidecarUuid === a.uuid"
+                  @click.stop="regenerateSidecar(a.uuid)"
+                  title="Generate JSON sidecar file in sidecars/ folder"
+                >
+                  {{ regeneratingSidecarUuid === a.uuid ? '...' : 'Rebuild' }}
+                </button>
               </td>
               <td class="text-right">
                 <button class="btn btn-xs" @click="inspectAsset(a.uuid)">Inspect</button>
@@ -424,6 +433,21 @@
                 <div>
                   <span v-if="inspectingAsset.summary.mezzanine_ok" class="badge badge-success">✓ Verified Compliant</span>
                   <span v-else class="badge badge-warning">⚠ Non-Mezzanine</span>
+                </div>
+              </div>
+              <div class="detail-field">
+                <label>JSON Sidecar File</label>
+                <div class="flex items-center gap-2">
+                  <span v-if="inspectingAsset.summary.sidecar_exists" class="badge badge-success">✓ Present on Disk</span>
+                  <span v-else class="badge badge-muted">Missing on Disk</span>
+                  <button
+                    v-if="!inspectingAsset.summary.sidecar_exists && inspectingAsset.summary.status === 'ready'"
+                    class="btn btn-xs btn-outline"
+                    :disabled="regeneratingSidecarUuid === inspectingAsset.summary.uuid"
+                    @click="regenerateSidecar(inspectingAsset.summary.uuid)"
+                  >
+                    {{ regeneratingSidecarUuid === inspectingAsset.summary.uuid ? 'Rebuilding...' : 'Rebuild Sidecar' }}
+                  </button>
                 </div>
               </div>
             </div>
@@ -864,6 +888,29 @@ async function inspectAsset(uuid: string) {
     }
   } catch (err) {
     console.error('Failed to inspect asset:', err)
+  }
+}
+
+const regeneratingSidecarUuid = ref<string | null>(null)
+
+async function regenerateSidecar(uuid: string) {
+  regeneratingSidecarUuid.value = uuid
+  try {
+    const res = await fetch(`/api/v2/assets/${uuid}/regenerate-sidecar`, { method: 'POST' })
+    if (res.ok) {
+      await fetchAssets()
+      if (inspectingAsset.value?.summary.uuid === uuid) {
+        await inspectAsset(uuid)
+      }
+    } else {
+      const err = await res.json().catch(() => ({}))
+      alert(`Failed to regenerate sidecar: ${err.error || res.statusText}`)
+    }
+  } catch (err) {
+    console.error('Failed to regenerate sidecar:', err)
+    alert(`Error regenerating sidecar: ${err}`)
+  } finally {
+    regeneratingSidecarUuid.value = null
   }
 }
 

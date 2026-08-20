@@ -1069,7 +1069,7 @@ fn process_file_inner(
                 file_size_bytes,
             };
 
-            let _ = identity::write_sidecar_next_to_video_with_validation(
+            if let Err(e) = identity::write_sidecar_next_to_video_with_validation(
                 &final_output_path,
                 &metadata_uuid,
                 &probe_data,
@@ -1090,7 +1090,13 @@ fn process_file_inner(
                 Some(validation_report),
                 sha256,
                 file_size_bytes,
-            );
+            ) {
+                tracing::error!(
+                    "Failed to write metadata sidecar for '{}': {}",
+                    final_output_path.display(),
+                    e
+                );
+            }
 
             let keyframe_offsets_json =
                 serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
