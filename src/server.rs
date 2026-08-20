@@ -85,6 +85,7 @@ pub async fn run_server(
         .route("/assets/{uuid}/move", put(put_move))
         .route("/assets/{uuid}/subclip", post(post_subclip))
         .route("/assets/{uuid}/purge", delete(delete_purge_asset))
+        .route("/assets/{uuid}/regenerate-sidecar", post(post_regenerate_sidecar))
         .route("/assets/{uuid}/trash", post(post_trash_asset).put(post_trash_asset))
         .route("/assets/{uuid}/restore", post(post_restore_asset).put(post_restore_asset))
         .route("/assets/batch", post(post_batch))
@@ -101,6 +102,7 @@ pub async fn run_server(
         .route("/db/overview", get(get_db_overview_handler))
         .route("/db/assets", get(get_db_assets_handler))
         .route("/db/assets/{uuid}", get(get_db_asset_detail_handler))
+        .route("/db/assets/{uuid}/regenerate-sidecar", post(post_regenerate_sidecar))
         .route("/db/jobs", get(get_db_jobs_handler))
         .route("/db/jobs/{id}", get(get_db_job_detail_handler))
         .route("/db/folders", get(get_db_folders_handler))
@@ -120,6 +122,7 @@ pub async fn run_server(
         .route("/assets/{uuid}/trash", post(post_trash_asset))
         .route("/assets/{uuid}/restore", post(post_restore_asset))
         .route("/assets/{uuid}/purge", delete(delete_purge_asset))
+        .route("/assets/{uuid}/regenerate-sidecar", post(post_regenerate_sidecar))
         .route("/folders/trash", post(post_trash_folder))
         .route("/folders/restore", post(post_restore_folder))
         .route("/folders/purge", delete(delete_purge_folder))
@@ -132,6 +135,7 @@ pub async fn run_server(
         .route("/db/overview", get(get_db_overview_handler))
         .route("/db/assets", get(get_db_assets_handler))
         .route("/db/assets/{uuid}", get(get_db_asset_detail_handler))
+        .route("/db/assets/{uuid}/regenerate-sidecar", post(post_regenerate_sidecar))
         .route("/db/jobs", get(get_db_jobs_handler))
         .route("/db/jobs/{id}", get(get_db_job_detail_handler))
         .route("/db/folders", get(get_db_folders_handler))
@@ -1607,6 +1611,69 @@ async fn delete_purge_asset(
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn post_regenerate_sidecar(
+    State(state): State<ServerState>,
+    Path(uuid): Path<String>,
+) -> impl IntoResponse {
+    match db::find_by_uuid(&state.pool, &uuid).await {
+        Ok(Some(asset)) => {
+            if asset.current_path.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({"error": "Asset has no current_path"})),
+                )
+                    .into_response();
+            }
+            let media_path = std::path::Path::new(&asset.current_path);
+            if !media_path.exists() {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Mezzanine file not found on disk",
+                        "path": asset.current_path
+                    })),
+                )
+                    .into_response();
+            }
+            match crate::identity::build_sidecar_from_db_asset(&asset) {
+                Ok(path) => {
+                    tracing::info!("Regenerated sidecar for asset '{}': {}", uuid, path.display());
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": true,
+                            "uuid": uuid,
+                            "sidecar_path": path.to_string_lossy(),
+                        })),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    tracing::error!("Failed to rebuild sidecar for '{}': {}", uuid, e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Failed to write sidecar: {}", e)})),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Asset not found"})),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error looking up asset for sidecar regen: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "Database error"})),
             )
                 .into_response()
         }

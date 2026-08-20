@@ -266,7 +266,163 @@ pub struct OutputInfo {
 }
 
 pub fn sidecar_path_for(media_path: &Path) -> PathBuf {
+    let sidecar_filename = match media_path.file_stem() {
+        Some(stem) => format!("{}.uuid.json", stem.to_string_lossy()),
+        None => "metadata.uuid.json".to_string(),
+    };
+
+    if let Some(parent) = media_path.parent() {
+        // 1. If media_path is in a "videos" directory: e.g. <root>/videos/clip.mp4 -> <root>/sidecars/clip.uuid.json
+        if parent.file_name().map(|n| n == "videos").unwrap_or(false) {
+            if let Some(grandparent) = parent.parent() {
+                let sidecars_sibling = grandparent.join("sidecars").join(&sidecar_filename);
+                if sidecars_sibling.exists() {
+                    return sidecars_sibling;
+                }
+                let legacy_adjacent = media_path.with_extension("uuid.json");
+                if legacy_adjacent.exists() {
+                    return legacy_adjacent;
+                }
+                return sidecars_sibling;
+            }
+        }
+
+        // 2. Check if subfolder <parent>/sidecars/<sidecar_filename> exists:
+        let sidecars_subfolder = parent.join("sidecars").join(&sidecar_filename);
+        if sidecars_subfolder.exists() {
+            return sidecars_subfolder;
+        }
+
+        let legacy_adjacent = media_path.with_extension("uuid.json");
+        return legacy_adjacent;
+    }
+
     media_path.with_extension("uuid.json")
+}
+
+pub fn write_sidecar_payload(sidecar_path: &Path, payload: &SidecarPayload) -> Result<PathBuf, String> {
+    if let Some(parent) = sidecar_path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            let err = format!(
+                "Failed to create sidecar directory '{}': {}",
+                parent.display(),
+                e
+            );
+            tracing::error!("{}", err);
+            return Err(err);
+        }
+    }
+
+    let json = serde_json::to_string_pretty(payload)
+        .map_err(|e| format!("Failed to serialize sidecar: {}", e))?;
+
+    let tmp_sidecar_path = if let Some(parent) = sidecar_path.parent() {
+        let sidecar_name = sidecar_path.file_name().unwrap_or_default().to_string_lossy();
+        parent.join(format!(".tmp_{}_{}.tmp_json", payload.id, sidecar_name))
+    } else {
+        sidecar_path.with_extension("tmp_json")
+    };
+
+    if let Err(e) = fs::write(&tmp_sidecar_path, &json) {
+        let _ = fs::remove_file(&tmp_sidecar_path);
+        let err = format!(
+            "Failed to write temporary sidecar '{}': {}",
+            tmp_sidecar_path.display(),
+            e
+        );
+        tracing::error!("{}", err);
+        return Err(err);
+    }
+
+    if let Err(e) = fs::rename(&tmp_sidecar_path, sidecar_path) {
+        let _ = fs::remove_file(&tmp_sidecar_path);
+        let err = format!(
+            "Failed to rename temporary sidecar '{}' -> '{}': {}",
+            tmp_sidecar_path.display(),
+            sidecar_path.display(),
+            e
+        );
+        tracing::error!("{}", err);
+        return Err(err);
+    }
+
+    tracing::info!(
+        "Written UUID sidecar atomically: {} (id={})",
+        sidecar_path.display(),
+        payload.id
+    );
+    Ok(sidecar_path.to_path_buf())
+}
+
+pub fn build_sidecar_from_db_asset(asset: &crate::db::MediaAsset) -> Result<PathBuf, String> {
+    if asset.current_path.is_empty() {
+        return Err("Asset current_path is empty".to_string());
+    }
+    let media_path = Path::new(&asset.current_path);
+    let sidecar_path = sidecar_path_for(media_path);
+
+    let filename = media_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+
+    let warnings: Vec<String> = serde_json::from_str(&asset.warnings).unwrap_or_default();
+    let file_size_bytes = std::fs::metadata(media_path).ok().map(|m| m.len());
+    let duration_secs = asset.duration_ms as f64 / 1000.0;
+
+    let payload = SidecarPayload {
+        playoutvue_id: asset.uuid.clone(),
+        id: asset.uuid.clone(),
+        path: asset.current_path.clone(),
+        duration_ms: asset.duration_ms,
+        trim_in_ms: asset.trim_in_ms,
+        trim_out_ms: asset.trim_out_ms,
+        fps_num: asset.fps_num,
+        fps_den: asset.fps_den,
+        mezzanine_ok: asset.mezzanine_ok,
+        filename,
+        filepath: asset.current_path.clone(),
+        transcoded_at: Utc::now().to_rfc3339(),
+        profile_used: "rebuilt_from_db".to_string(),
+        original_source: SourceInfo {
+            path: asset.current_path.clone(),
+            codec: "h264".to_string(),
+            duration_secs,
+            frame_count: asset.total_frames,
+            width: 1920,
+            height: 1080,
+            fps: asset.fps,
+            fps_num: asset.fps_num,
+            fps_den: asset.fps_den,
+            field_order: "progressive".to_string(),
+        },
+        output_media: OutputInfo {
+            duration_secs,
+            frame_count: asset.total_frames,
+            width: 1920,
+            height: 1080,
+            codec: "h264".to_string(),
+            audio_codec: "aac".to_string(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            fps_num: asset.fps_num,
+            fps_den: asset.fps_den,
+        },
+        fps: asset.fps,
+        total_frames: asset.total_frames,
+        gop_frames: asset.gop_frames,
+        keyframe_safe_start_ms: asset.keyframe_safe_start_ms,
+        warnings,
+        findings: None,
+        qc_report: None,
+        loudness: None,
+        sha256: None,
+        file_size_bytes,
+        validation_report: None,
+    };
+
+    write_sidecar_payload(&sidecar_path, &payload)
 }
 
 #[allow(dead_code)]
@@ -363,35 +519,7 @@ pub fn write_sidecar_next_to_video_with_validation(
         payload.file_size_bytes = file_size_bytes;
     }
 
-    let json = serde_json::to_string_pretty(&payload)
-        .map_err(|e| format!("Failed to serialize sidecar: {}", e))?;
-
-    let tmp_sidecar_path = sidecar_path.with_extension("tmp_json");
-    if let Err(e) = fs::write(&tmp_sidecar_path, &json) {
-        let _ = fs::remove_file(&tmp_sidecar_path);
-        return Err(format!(
-            "Failed to write temporary sidecar '{}': {}",
-            tmp_sidecar_path.display(),
-            e
-        ));
-    }
-
-    if let Err(e) = fs::rename(&tmp_sidecar_path, &sidecar_path) {
-        let _ = fs::remove_file(&tmp_sidecar_path);
-        return Err(format!(
-            "Failed to rename temporary sidecar '{}' -> '{}': {}",
-            tmp_sidecar_path.display(),
-            sidecar_path.display(),
-            e
-        ));
-    }
-
-    tracing::info!(
-        "Written UUID sidecar atomically: {} (id={})",
-        sidecar_path.display(),
-        uuid
-    );
-    Ok(sidecar_path)
+    write_sidecar_payload(&sidecar_path, &payload)
 }
 
 pub fn sanitize_filename(raw: &str) -> String {
@@ -408,4 +536,74 @@ pub fn sanitize_filename(raw: &str) -> String {
         .collect::<String>()
         .trim_matches('_')
         .to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sidecar_path_resolves_to_sibling_sidecars() {
+        let media = Path::new("C:/media/target/videos/clip_abc.mp4");
+        let sidecar = sidecar_path_for(media);
+        let normalized = sidecar.to_string_lossy().replace('\\', "/");
+        assert_eq!(normalized, "C:/media/target/sidecars/clip_abc.uuid.json");
+    }
+
+    #[test]
+    fn test_sidecar_path_generic_folder_defaults_to_adjacent() {
+        let media = Path::new("C:/media/custom_folder/clip_abc.mp4");
+        let sidecar = sidecar_path_for(media);
+        let normalized = sidecar.to_string_lossy().replace('\\', "/");
+        assert_eq!(normalized, "C:/media/custom_folder/clip_abc.uuid.json");
+    }
+
+    #[test]
+    fn test_build_sidecar_from_db_asset_creates_file() {
+        let temp_dir = std::env::temp_dir().join(format!("pt_sidecar_test_{}", uuid::Uuid::new_v4()));
+        let videos_dir = temp_dir.join("videos");
+        std::fs::create_dir_all(&videos_dir).unwrap();
+        let media_file = videos_dir.join("test_clip.mp4");
+        std::fs::write(&media_file, b"fake video content").unwrap();
+
+        let asset = crate::db::MediaAsset {
+            uuid: "test-uuid-1234".to_string(),
+            fingerprint: 12345,
+            current_path: media_file.to_string_lossy().into_owned(),
+            duration_ms: 10000,
+            trim_in_ms: 0,
+            trim_out_ms: 10000,
+            rating: "12".to_string(),
+            tp: "None".to_string(),
+            status: "ready".to_string(),
+            display_name: "Test Clip".to_string(),
+            virtual_folder: "/".to_string(),
+            mezzanine_ok: true,
+            fps: 25.0,
+            fps_num: 25,
+            fps_den: 1,
+            total_frames: 250,
+            gop_frames: 50,
+            keyframe_safe_start_ms: 0,
+            warnings: "[]".to_string(),
+            keyframe_offsets_json: "[]".to_string(),
+            deleted_at: None,
+            original_virtual_folder: None,
+        };
+
+        let result = build_sidecar_from_db_asset(&asset).unwrap();
+        let normalized = result.to_string_lossy().replace('\\', "/");
+        assert!(normalized.ends_with("sidecars/test_clip.uuid.json"));
+        assert!(result.exists(), "Sidecar file must exist on disk");
+
+        let content = std::fs::read_to_string(&result).unwrap();
+        let parsed: SidecarPayload = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.id, "test-uuid-1234");
+        assert_eq!(parsed.duration_ms, 10000);
+        assert_eq!(parsed.fps_num, 25);
+        assert_eq!(parsed.fps_den, 1);
+        assert!(parsed.mezzanine_ok);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
 }
