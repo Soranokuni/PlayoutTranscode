@@ -7,13 +7,13 @@
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-Ready-green.svg)](https://ffmpeg.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
-**PlayoutTranscode** is an automated, broadcast-grade media ingestion, analysis, and mezzanine transcoding engine developed by **[Soranokuni](https://github.com/Soranokuni)**. Engineered in **Rust** as a resilient Windows service daemon, it monitors watch folders, performs rational FPS snapping, normalizes incoming media into standardized frame-accurate mezzanine streams (Profiles A/B/C), writes JSON identity sidecars, and exposes a high-performance REST and Server-Sent Events (SSE) API to downstream clients like **[PlayOutVue](https://github.com/Soranokuni/PlayOutVue)**.
+**PlayoutTranscode** is an automated, broadcast-grade media ingestion, analysis, and mezzanine transcoding engine developed by **[Soranokuni](https://github.com/Soranokuni)**. Engineered in **Rust** as a resilient Windows service daemon, it monitors watch folders, performs rational FPS snapping, normalizes audio to **EBU R128 / ATSC A/85** loudness standards, transcodes incoming media into standardized frame-accurate mezzanine streams (Profiles A/B/C), writes JSON identity sidecars, and exposes a high-performance REST and Server-Sent Events (SSE) API to downstream clients like **[PlayOutVue](https://github.com/Soranokuni/PlayOutVue)**.
 
 ---
 
 ## Architecture & Ingest Pipeline
 
-The pipeline guarantees zero partial-read hazards through atomic `.tmp` staging, strict FFprobe validation, and deferred database publication.
+The pipeline guarantees zero partial-read hazards through atomic `.tmp` staging, strict FFprobe validation, two-pass loudness normalization, and deferred database publication.
 
 ```mermaid
 graph TD
@@ -24,8 +24,9 @@ graph TD
         Queue[jobs.rs - In-Memory Job Queue]
         Processor[processor.rs - Pipeline Coordinator]
         Probe[probe.rs - FFprobe & Rational FPS Snapper]
+        Loudness[probe.rs - Pass 1: EBU R128 Loudness Measurer]
         Fingerprint[fingerprint.rs - SHA-256 Deduplication]
-        Encoder[encoder.rs - FFmpeg CFR Transcoder]
+        Encoder[encoder.rs - Pass 2: FFmpeg CFR & Loudnorm Transcoder]
         Validator[processor.rs - Mezzanine Quality Validation]
         Sidecar[identity.rs - Atomic JSON Sidecar Writer]
     end
@@ -49,7 +50,7 @@ graph TD
     WatchFolder -->|New File Detected| Watcher
     Watcher -->|Settling Confirmed| Queue
     Queue --> Processor
-    Processor --> Probe --> Fingerprint --> Encoder
+    Processor --> Probe --> Loudness --> Fingerprint --> Encoder
     Encoder -->|Write Transcode| StagingFile
     Processor -->|Validate Stream| Validator
     Validator --> StagingFile
@@ -68,11 +69,41 @@ graph TD
 
 1. **Active Settling & Debounce**: Detects file writes across network and local filesystems, applying file-settling heuristics to avoid reading partial files during copy operations.
 2. **Rational FPS Snapping**: Snaps probed frame rates to exact broadcast rationals (e.g. `25/1`, `30000/1001`, `24000/1001`, `60000/1001`) instead of lossy float approximations.
-3. **Deterministic Transcoding**: Uses `libx264`, constant frame rate (CFR), 2.0-second closed GOPs, faststart `moov` atom placement, and 48 kHz stereo audio resampling.
-4. **Zero Partial-Read Staging**: Encodes media directly into temporary files (`.tmp_{uuid}_{filename}`) on the target volume and atomically renames them only after complete validation.
-5. **Mezzanine Contract Enforcement**: Never calls `db::mark_ready` until duration, closed GOP, audio rate, faststart header, and sidecar JSON are verified.
-6. **Soft-Delete Recycle Bin & Reference Checking**: Allows soft-deleting media into a recycle bin, preventing physical deletion of assets that are actively scheduled in broadcast rundowns.
-7. **Process Priority & Concurrency Throttling**: Limits simultaneous FFmpeg processes and sets OS thread priorities to `Below-Normal` to ensure playout machines remain responsive.
+3. **EBU R128 & ATSC A/85 Audio Normalization**: Automated two-pass loudness analysis and dynamic linear correction targeting statutory broadcast levels (-23 LUFS / -24 LUFS) with ITU-R BS.775 downmixing.
+4. **Deterministic Transcoding**: Uses `libx264`, constant frame rate (CFR), 2.0-second closed GOPs, faststart `moov` atom placement, and 48 kHz stereo audio resampling.
+5. **Zero Partial-Read Staging**: Encodes media directly into temporary files (`.tmp_{uuid}_{filename}`) on the target volume and atomically renames them only after complete validation.
+6. **Mezzanine Contract Enforcement**: Never calls `db::mark_ready` until duration, closed GOP, audio rate, faststart header, and sidecar JSON are verified.
+7. **Soft-Delete Recycle Bin & Reference Checking**: Allows soft-deleting media into a recycle bin, preventing physical deletion of assets that are actively scheduled in broadcast rundowns.
+8. **Process Priority & Concurrency Throttling**: Limits simultaneous FFmpeg processes and sets OS thread priorities to `Below-Normal` to ensure playout machines remain responsive.
+
+---
+
+## Audio Loudness Normalization Engine
+
+PlayoutTranscode provides professional, broadcast-standard audio normalization to eliminate loudness jumps between commercials, live shows, and legacy content:
+
+### 1. Supported Loudness Standards
+- **EBU R128 (European Broadcast Standard)**:
+  - Integrated Loudness: **`-23.0 LUFS`** (configurable)
+  - Maximum True Peak: **`-1.0 dBTP`**
+  - Loudness Range (LRA): **`7.0 LU`**
+- **ATSC A/85 (US / North American Standard)**:
+  - Integrated Loudness: **`-24.0 LUFS`** (configurable)
+  - Maximum True Peak: **`-2.0 dBTP`**
+  - Loudness Range (LRA): **`11.0 LU`**
+- **Legacy / Custom Mode**: Resamples to 48 kHz stereo with configurable bitrates (`aac`, `pcm_s16le`, `libmp3lame`).
+
+### 2. Two-Pass Measurement & Correction
+- **Pass 1 (Analysis)**: `RealLoudnessMeasurer` (`probe.rs`) runs FFmpeg with the `loudnorm` filter in JSON output mode, extracting exact `input_i`, `input_tp`, `input_lra`, and `input_thresh`.
+- **Pass 2 (Correction)**: `profiles.rs` injects the measured values into the encoding filterchain (`measured_I`, `measured_TP`, `measured_LRA`, `measured_thresh`, `offset`, `linear`) to perform linear gain adjustment without dynamic pumping or distortion.
+
+### 3. Channel Mapping & ITU-R BS.775 Downmix
+- **Mono (1.0) $\rightarrow$ Dual Mono / Stereo**: `pan=stereo|c0=c0|c1=c0`
+- **5.1 Surround (6.0) $\rightarrow$ Stereo Downmix**:
+  ```text
+  pan=stereo|FL=0.4142*c0+0.2929*c2+0.2929*c4|FR=0.4142*c1+0.2929*c2+0.2929*c5
+  ```
+- **Passthrough Mode**: Set `preserve_original = true` to preserve source multi-channel audio tracks.
 
 ---
 
@@ -88,7 +119,7 @@ PlayoutTranscode provides three standard broadcast profiles configurable in `con
 
 ### Common Stream Properties (All Profiles)
 - **Video Codec**: `libx264` (CRF-based, closed GOP: 50 frames @ 25fps / 60 frames @ 29.97fps)
-- **Audio Codec**: AAC / PCM stereo at **48,000 Hz** (broadcast standard)
+- **Audio Codec**: AAC / PCM stereo at **48,000 Hz** (EBU R128 / ATSC A/85 normalized)
 - **Container**: MP4 with faststart enabled (`moov` atom at file beginning)
 
 ---
@@ -155,6 +186,17 @@ default_profile = "ProfileA"
 max_concurrency = 2
 process_priority = "BelowNormal"
 settling_delay_seconds = 5
+
+[audio]
+mode = "ebu_r128"          # Options: "ebu_r128", "atsc_a85", "legacy_v1_encode", "passthrough_validate"
+codec = "aac"
+bitrate = "320k"
+sample_rate_hz = 48000
+channels = 2
+target_lufs = -23.0
+true_peak_dbtp = -1.0
+lra_target = 7.0
+preserve_original = false
 
 [cleanup]
 auto_purge_days = 30
