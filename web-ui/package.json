@@ -1,6 +1,13 @@
 {
   "name": "playout-transcode-ui",
   "version": "1.0.0",
+  "description": "PlayoutTranscode Web UI & Ingest Monitor",
+  "author": "Soranokuni <shadowsora13@hotmail.gr> (https://github.com/Soranokuni)",
+  "homepage": "https://github.com/Soranokuni/PlayoutTranscode",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Soranokuni/PlayoutTranscode.git"
+  },
   "private": true,
   "type": "module",
   "scripts": {
