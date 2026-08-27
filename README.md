@@ -16,75 +16,50 @@
 The pipeline guarantees zero partial-read hazards through atomic `.tmp` staging, strict FFprobe validation, and deferred database publication.
 
 ```mermaid
-flowchart TD
-    classDef watch fill:#1e3a8a,stroke:#3b82f6,stroke-width:2px,color:#fff;
-    classDef process fill:#78350f,stroke:#f59e0b,stroke-width:2px,color:#fff;
-    classDef storage fill:#064e3b,stroke:#10b981,stroke-width:2px,color:#fff;
-    classDef api fill:#4c1d95,stroke:#8b5cf6,stroke-width:2px,color:#fff;
-    classDef client fill:#1e293b,stroke:#64748b,stroke-width:2px,color:#fff;
+graph TD
+    WatchFolder[Watch Folder / Ingest Root]
 
-    WatchFolder[["Watch Folder / Ingest Root"]]:::watch
-
-    subgraph INGEST_ENGINE ["PlayoutTranscode Pipeline (Rust)"]
-        direction TB
-        Watcher["watcher.rs<br/>Filesystem Watcher + Settling Debounce"]:::process
-        ServiceHandle["service_handle.rs<br/>Worker Pool & Concurrency Limiter"]:::process
-        JobQueue["jobs.rs<br/>In-Memory Priority Job Queue"]:::process
-        Processor["processor.rs<br/>Pipeline Orchestrator"]:::process
-
-        subgraph WORKERS ["Media Analysis & Processing Steps"]
-            Bootstrap["bootstrap.rs<br/>FFmpeg/FFprobe Discovery"]:::process
-            Probe["probe.rs<br/>FFprobe Rational FPS Snapper"]:::process
-            Fingerprint["fingerprint.rs<br/>SHA-256 Content Deduplicator"]:::process
-            Encoder["encoder.rs & profiles.rs<br/>FFmpeg CFR Transcoder (Profiles A/B/C)"]:::process
-            Validator["processor.rs<br/>Closed GOP / 48kHz / Faststart Check"]:::process
-            Sidecar["identity.rs<br/>Atomic .uuid.json Sidecar Writer"]:::process
-        end
+    subgraph Ingest [PlayoutTranscode Ingestion Engine]
+        Watcher[watcher.rs - Watcher & Settling Debounce]
+        Queue[jobs.rs - In-Memory Job Queue]
+        Processor[processor.rs - Pipeline Coordinator]
+        Probe[probe.rs - FFprobe & Rational FPS Snapper]
+        Fingerprint[fingerprint.rs - SHA-256 Deduplication]
+        Encoder[encoder.rs - FFmpeg CFR Transcoder]
+        Validator[processor.rs - Mezzanine Quality Validation]
+        Sidecar[identity.rs - Atomic JSON Sidecar Writer]
     end
 
-    subgraph STORAGE_LAYER ["Target Storage & Metadata Layer"]
-        StagingFile[[".tmp_{uuid}_{file}<br/>Atomic Staging File"]]:::storage
-        MezzanineFile[["Mezzanine File<br/>1080p/1080i Broadcast Mezzanine"]]:::storage
-        JSONSidecar[[".uuid.json Sidecar<br/>Stable Identity Metadata"]]:::storage
-        SQLiteDB[("SQLite Database<br/>media_assets.db (WAL Mode)")]:::storage
+    subgraph Storage [Storage Layer]
+        StagingFile[Temporary Staging: .tmp_uuid_file]
+        Mezzanine[Final Mezzanine: 1080p/1080i]
+        JSONFile[.uuid.json Sidecar Metadata]
+        SQLite[(SQLite DB: media_assets.db)]
     end
 
-    subgraph API_LAYER ["REST & Real-Time SSE Distribution (Port: 4353)"]
-        AxumServer["server.rs<br/>Axum Web Server"]:::api
-        REST_API["REST API Endpoints<br/>/api/assets, /api/jobs, /api/folders"]:::api
-        SSE_Stream["SSE Event Stream<br/>/api/events (Job Progress)"]:::api
-        DB_Viewer["Embedded DB Viewer<br/>/api/db/overview & UI"]:::api
+    subgraph API [REST & Real-Time Distribution]
+        Axum[server.rs - Axum Web Server :4353]
+        REST[REST API: /api/assets, /api/jobs, /api/folders]
+        SSE[SSE Stream: /api/events]
+        DBViewer[Embedded DB Viewer & UI]
     end
 
-    PlayOutClient["PlayOutVue MCR Client"]:::client
+    Client[PlayOutVue MCR Client]
 
-    %% Ingestion Flow
-    WatchFolder -- "1. File Added / Copied" --> Watcher
-    Watcher -- "2. Settling Confirmed" --> JobQueue
-    ServiceHandle -- "3. Pulls Job" --> JobQueue
-    JobQueue --> Processor
-
-    %% Execution Flow
-    Processor --> Bootstrap
-    Processor --> Probe
-    Processor --> Fingerprint
-    Processor -- "4. Transcode to Staging" --> Encoder
-    Encoder --> StagingFile
-    Processor -- "5. Validate Mezzanine" --> Validator
+    WatchFolder -->|New File Detected| Watcher
+    Watcher -->|Settling Confirmed| Queue
+    Queue --> Processor
+    Processor --> Probe --> Fingerprint --> Encoder
+    Encoder -->|Write Transcode| StagingFile
+    Processor -->|Validate Stream| Validator
     Validator --> StagingFile
-    Processor -- "6. Atomic Rename" --> MezzanineFile
-    Processor -- "7. Write Sidecar" --> Sidecar
-    Sidecar --> JSONSidecar
-    Processor -- "8. db::mark_ready" --> SQLiteDB
-
-    %% Distribution Flow
-    SQLiteDB <--> REST_API
-    JobQueue -- "Broadcast Status" --> SSE_Stream
-    REST_API --> AxumServer
-    SSE_Stream --> AxumServer
-    DB_Viewer --> AxumServer
-
-    AxumServer <--> PlayOutClient
+    Processor -->|Atomic Rename| Mezzanine
+    Processor -->|Write Sidecar| Sidecar --> JSONFile
+    Processor -->|db::mark_ready| SQLite
+    SQLite <--> REST
+    Queue -->|Status Updates| SSE
+    REST & SSE & DBViewer --> Axum
+    Axum <--> Client
 ```
 
 ---
