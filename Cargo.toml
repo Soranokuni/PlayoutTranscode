@@ -2,7 +2,10 @@
 name = "playout-transcode"
 version = "1.0.0"
 edition = "2021"
-description = "FFAStrans-style automated broadcast media transcoding service"
+authors = ["Soranokuni <shadowsora13@hotmail.gr>"]
+repository = "https://github.com/Soranokuni/PlayoutTranscode"
+license = "MIT"
+description = "PlayoutTranscode - Automated broadcast media ingest, analysis, and mezzanine transcoding engine"
 
 [[bin]]
 name = "PlayoutTranscode"
