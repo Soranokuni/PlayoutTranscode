@@ -1093,7 +1093,12 @@ pub async fn purge_asset_completely(
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
 
 pub fn is_valid_rating(rating: &str) -> bool {
-    let trimmed = rating.trim_end_matches('+').to_ascii_uppercase();
+    let base = if let Some((first, _)) = rating.split_once('|') {
+        first
+    } else {
+        rating
+    };
+    let trimmed = base.trim().trim_end_matches('+').to_ascii_uppercase();
     VALID_RATINGS.contains(&trimmed.as_str()) || trimmed == "NONE" || trimmed.is_empty()
 }
 
@@ -2212,8 +2217,12 @@ mod tests {
         assert!(is_valid_rating("K"));
         assert!(is_valid_rating("12"));
         assert!(is_valid_rating("18+"));
+        assert!(is_valid_rating("NONE"));
         assert!(is_valid_rating(""));
+        assert!(is_valid_rating("16|NONE|NONE|[{\"start\":0,\"text\":\"ΠΕΡΙΕΧΕΙ ΣΚΗΝΕΣ ΒΙΑΣ\"}]"));
+        assert!(is_valid_rating("12|TP|SHOW|[]"));
         assert!(!is_valid_rating("21"));
+        assert!(!is_valid_rating("21|NONE|NONE|[]"));
     }
 
     #[test]
