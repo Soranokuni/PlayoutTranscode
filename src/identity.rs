@@ -522,8 +522,157 @@ pub fn write_sidecar_next_to_video_with_validation(
     write_sidecar_payload(&sidecar_path, &payload)
 }
 
+pub fn transliterate_greek(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(chars.len() * 2);
+    let mut i = 0;
+
+    fn is_voiceless(c: char) -> bool {
+        matches!(
+            c,
+            'θ' | 'Θ' | 'κ' | 'Κ' | 'ξ' | 'Ξ' | 'π' | 'Π' | 'σ' | 'Σ' | 'ς' | 'τ' | 'Τ' | 'φ'
+                | 'Φ' | 'χ' | 'Χ' | 'ψ' | 'Ψ'
+        )
+    }
+
+    while i < chars.len() {
+        let c = chars[i];
+        let next = if i + 1 < chars.len() {
+            Some(chars[i + 1])
+        } else {
+            None
+        };
+
+        if let Some(n) = next {
+            let pair = (c, n);
+            match pair {
+                ('α' | 'Α' | 'ά' | 'Ά', 'υ' | 'Υ' | 'ύ' | 'Ύ') => {
+                    let next_next = if i + 2 < chars.len() {
+                        Some(chars[i + 2])
+                    } else {
+                        None
+                    };
+                    let v = if next_next.map_or(false, is_voiceless) {
+                        "af"
+                    } else {
+                        "av"
+                    };
+                    out.push_str(v);
+                    i += 2;
+                    continue;
+                }
+                ('ε' | 'Ε' | 'έ' | 'Έ', 'υ' | 'Υ' | 'ύ' | 'Ύ') => {
+                    let next_next = if i + 2 < chars.len() {
+                        Some(chars[i + 2])
+                    } else {
+                        None
+                    };
+                    let v = if next_next.map_or(false, is_voiceless) {
+                        "ef"
+                    } else {
+                        "ev"
+                    };
+                    out.push_str(v);
+                    i += 2;
+                    continue;
+                }
+                ('η' | 'Η' | 'ή' | 'Ή', 'υ' | 'Υ' | 'ύ' | 'Ύ') => {
+                    let next_next = if i + 2 < chars.len() {
+                        Some(chars[i + 2])
+                    } else {
+                        None
+                    };
+                    let v = if next_next.map_or(false, is_voiceless) {
+                        "if"
+                    } else {
+                        "iv"
+                    };
+                    out.push_str(v);
+                    i += 2;
+                    continue;
+                }
+                ('ο' | 'Ο' | 'ό' | 'Ό', 'υ' | 'Υ' | 'ύ' | 'Ύ') => {
+                    out.push_str("ou");
+                    i += 2;
+                    continue;
+                }
+                ('γ' | 'Γ', 'γ' | 'Γ') => {
+                    out.push_str("ng");
+                    i += 2;
+                    continue;
+                }
+                ('γ' | 'Γ', 'κ' | 'Κ') => {
+                    out.push_str("gk");
+                    i += 2;
+                    continue;
+                }
+                ('γ' | 'Γ', 'ξ' | 'Ξ') => {
+                    out.push_str("nx");
+                    i += 2;
+                    continue;
+                }
+                ('γ' | 'Γ', 'χ' | 'Χ') => {
+                    out.push_str("nch");
+                    i += 2;
+                    continue;
+                }
+                ('μ' | 'Μ', 'π' | 'Π') => {
+                    let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+                    let is_word_start = prev.map_or(true, |p| !p.is_alphabetic());
+                    if is_word_start {
+                        out.push_str("b");
+                    } else {
+                        out.push_str("mp");
+                    }
+                    i += 2;
+                    continue;
+                }
+                ('ν' | 'Ν', 'τ' | 'Τ') => {
+                    out.push_str("nt");
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        match c {
+            'α' | 'Α' | 'ά' | 'Ά' => out.push('a'),
+            'β' | 'Β' => out.push('v'),
+            'γ' | 'Γ' => out.push('g'),
+            'δ' | 'Δ' => out.push('d'),
+            'ε' | 'Ε' | 'έ' | 'Έ' => out.push('e'),
+            'ζ' | 'Ζ' => out.push('z'),
+            'η' | 'Η' | 'ή' | 'Ή' => out.push('i'),
+            'θ' | 'Θ' => out.push_str("th"),
+            'ι' | 'Ι' | 'ί' | 'Ί' | 'ϊ' | 'Ϊ' | 'ΐ' => out.push('i'),
+            'κ' | 'Κ' => out.push('k'),
+            'λ' | 'Λ' => out.push('l'),
+            'μ' | 'Μ' => out.push('m'),
+            'ν' | 'Ν' => out.push('n'),
+            'ξ' | 'Ξ' => out.push('x'),
+            'ο' | 'Ο' | 'ό' | 'Ό' => out.push('o'),
+            'π' | 'Π' => out.push('p'),
+            'ρ' | 'Ρ' => out.push('r'),
+            'σ' | 'Σ' | 'ς' => out.push('s'),
+            'τ' | 'Τ' => out.push('t'),
+            'υ' | 'Υ' | 'ύ' | 'Ύ' | 'ϋ' | 'Ϋ' | 'ΰ' => out.push('y'),
+            'φ' | 'Φ' => out.push('f'),
+            'χ' | 'Χ' => out.push_str("ch"),
+            'ψ' | 'Ψ' => out.push_str("ps"),
+            'ω' | 'Ω' | 'ώ' | 'Ώ' => out.push('o'),
+            other => out.push(other),
+        }
+        i += 1;
+    }
+
+    out
+}
+
 pub fn sanitize_filename(raw: &str) -> String {
-    raw.chars()
+    let transliterated = transliterate_greek(raw);
+    transliterated
+        .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
                 c
@@ -605,5 +754,16 @@ mod tests {
         assert!(parsed.mezzanine_ok);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_sanitize_filename_greek_elot743() {
+        assert_eq!(sanitize_filename("ΕΙΔΗΣΕΙΣ_2026"), "eidiseis_2026");
+        assert_eq!(sanitize_filename("Δελτίο Ειδήσεων"), "deltio_eidiseon");
+        assert_eq!(sanitize_filename("ΧΑΡΑΥΓΗ"), "charavgi");
+        assert_eq!(sanitize_filename("αυτοκίνητο"), "aftokinito");
+        assert_eq!(sanitize_filename("ΨΥΧΗ"), "psychi");
+        assert_eq!(sanitize_filename("ΘΕΑΤΡΟ"), "theatro");
+        assert_eq!(sanitize_filename("   ___ΕΛΛΑΔΑ___  "), "ellada");
     }
 }

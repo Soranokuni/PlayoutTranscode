@@ -104,6 +104,9 @@ pub fn transcode_file(
         audio_policy,
         measured_loudness,
         source_probe.audio_channels,
+        source_probe.audio_sample_rate,
+        source_probe.height,
+        source_probe.is_interlaced(),
     ) {
         Ok(a) => a,
         Err(e) => {
