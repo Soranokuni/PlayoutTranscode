@@ -301,6 +301,9 @@ impl EncodingProfile {
             &policy,
             None,
             2,
+            48000,
+            1080,
+            false,
         )
         .unwrap_or_else(|_| Vec::new())
     }
@@ -315,6 +318,9 @@ impl EncodingProfile {
         audio_policy: &crate::config::AudioPolicy,
         measured_loudness: Option<&crate::probe::MeasuredLoudness>,
         audio_channels: i64,
+        audio_sample_rate: i64,
+        source_height: i64,
+        source_interlaced: bool,
     ) -> Result<Vec<String>, String> {
         let profile_cfg = self.config_for(config);
 
@@ -337,13 +343,27 @@ impl EncodingProfile {
             "+genpts".to_string(),
             "-i".to_string(),
             input_path.to_string(),
+        ];
+
+        let has_audio = audio_channels > 0 && audio_sample_rate > 0;
+
+        if !has_audio {
+            args.extend_from_slice(&[
+                "-f".to_string(),
+                "lavfi".to_string(),
+                "-i".to_string(),
+                "anullsrc=channel_layout=stereo:sample_rate=48000".to_string(),
+            ]);
+        }
+
+        args.extend_from_slice(&[
             "-map_metadata".to_string(),
             "-1".to_string(),
             "-map_chapters".to_string(),
             "-1".to_string(),
-        ];
+        ]);
 
-        let vf = self.build_vf(fps_num, fps_den);
+        let vf = self.build_vf(fps_num, fps_den, source_height, source_interlaced);
         args.extend_from_slice(&["-vf".to_string(), vf]);
 
         args.extend_from_slice(&[
@@ -383,6 +403,8 @@ impl EncodingProfile {
             self.color_trc.to_string(),
             "-color_primaries".to_string(),
             self.color_primaries.to_string(),
+            "-color_range".to_string(),
+            "tv".to_string(),
         ]);
 
         args.extend_from_slice(&[
@@ -427,12 +449,22 @@ impl EncodingProfile {
             .effective_threads_per_encode(config.ingestion.max_concurrency);
         args.extend_from_slice(&["-threads".to_string(), per_encode_threads.to_string()]);
 
-        args.extend_from_slice(&[
-            "-map".to_string(),
-            "0:v:0".to_string(),
-            "-map".to_string(),
-            "0:a:0?".to_string(),
-        ]);
+        if has_audio {
+            args.extend_from_slice(&[
+                "-map".to_string(),
+                "0:v:0".to_string(),
+                "-map".to_string(),
+                "0:a:0?".to_string(),
+            ]);
+        } else {
+            args.extend_from_slice(&[
+                "-map".to_string(),
+                "0:v:0".to_string(),
+                "-map".to_string(),
+                "1:a:0".to_string(),
+                "-shortest".to_string(),
+            ]);
+        }
 
         if audio_policy.mode == crate::config::AudioMode::LegacyV1Encode {
             let audio_codec = &config.encoding.audio_codec;
@@ -469,7 +501,7 @@ impl EncodingProfile {
         } else {
             let audio_codec = &audio_policy.codec;
 
-            if audio_channels > 0 {
+            if has_audio {
                 let downmix_filter =
                     build_downmix_filter(audio_channels, audio_policy.preserve_original)?;
 
@@ -500,7 +532,7 @@ impl EncodingProfile {
 
             args.extend_from_slice(&["-c:a".to_string(), audio_codec.clone()]);
 
-            let out_channels = if audio_policy.preserve_original && audio_channels > 2 {
+            let out_channels = if has_audio && audio_policy.preserve_original && audio_channels > 2 {
                 audio_channels
             } else {
                 2
@@ -542,13 +574,35 @@ impl EncodingProfile {
         Ok(args)
     }
 
-    fn build_vf(&self, fps_num: i64, fps_den: i64) -> String {
+    fn build_vf(
+        &self,
+        fps_num: i64,
+        fps_den: i64,
+        source_height: i64,
+        source_interlaced: bool,
+    ) -> String {
+        let mut prefix = String::new();
+
+        if source_height == 608 {
+            prefix.push_str("crop=in_w:576:0:32,setdar=dar,");
+        } else if source_height == 1088 {
+            prefix.push_str("crop=in_w:1080:0:0,setdar=dar,");
+        }
+
+        if !self.interlaced && source_interlaced {
+            prefix.push_str("yadif=deint=interlaced,");
+        }
+
         let w = self.target_width;
         let h = self.target_height;
 
         format!(
-            "fps={n}/{d},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
-            n = fps_num, d = fps_den, w = w, h = h
+            "{prefix}fps={n}/{d},scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p",
+            prefix = prefix,
+            n = fps_num,
+            d = fps_den,
+            w = w,
+            h = h
         )
     }
 }
@@ -582,6 +636,13 @@ pub fn build_downmix_filter(channels: i64, preserve_original: bool) -> Result<St
             }
         }
         2 => Ok(String::new()),
+        4 => {
+            if preserve_original {
+                Ok(String::new())
+            } else {
+                Ok("pan=stereo|c0=c0|c1=c1,".to_string())
+            }
+        }
         6 => {
             if preserve_original {
                 Ok(String::new())
@@ -596,7 +657,7 @@ pub fn build_downmix_filter(channels: i64, preserve_original: bool) -> Result<St
             if preserve_original {
                 Ok(String::new())
             } else {
-                Err("unsupported_audio_channel_layout".to_string())
+                Ok("pan=stereo|c0=c0|c1=c1,".to_string())
             }
         }
         _ => Err("unsupported_audio_channel_layout".to_string()),
@@ -799,7 +860,9 @@ mod tests {
         let policy = config.effective_audio_policy();
         assert_eq!(policy.mode, crate::config::AudioMode::LegacyV1Encode);
         let explicit_args = p
-            .build_ffmpeg_args_with_audio(&config, "in.mov", "out.mp4", 25, 1, &policy, None, 2)
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 1080, false,
+            )
             .unwrap();
 
         assert_eq!(
@@ -844,7 +907,9 @@ mod tests {
         policy.mode = crate::config::AudioMode::EbuR128;
 
         let args = p
-            .build_ffmpeg_args_with_audio(&config, "in.mov", "out.mp4", 25, 1, &policy, None, 1)
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 1, 48000, 1080, false,
+            )
             .unwrap();
         let af_idx = args.iter().position(|a| a == "-af").unwrap();
         let af = &args[af_idx + 1];
@@ -882,6 +947,9 @@ mod tests {
                 &policy,
                 Some(&measured),
                 2,
+                48000,
+                1080,
+                false,
             )
             .unwrap();
         let af_idx = args.iter().position(|a| a == "-af").unwrap();
@@ -898,7 +966,9 @@ mod tests {
         policy.preserve_original = false;
 
         let args = p
-            .build_ffmpeg_args_with_audio(&config, "in.mov", "out.mp4", 25, 1, &policy, None, 6)
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 6, 48000, 1080, false,
+            )
             .unwrap();
         let af_idx = args.iter().position(|a| a == "-af").unwrap();
         let af = &args[af_idx + 1];
@@ -914,7 +984,9 @@ mod tests {
         policy.preserve_original = true;
 
         let args = p
-            .build_ffmpeg_args_with_audio(&config, "in.mov", "out.mp4", 25, 1, &policy, None, 6)
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 6, 48000, 1080, false,
+            )
             .unwrap();
         let af_idx = args.iter().position(|a| a == "-af").unwrap();
         let af = &args[af_idx + 1];
@@ -935,12 +1007,169 @@ mod tests {
         policy.mode = crate::config::AudioMode::EbuR128;
         policy.preserve_original = false;
 
+        // 4ch and 8ch must succeed with stereo downmix
         assert!(p
-            .build_ffmpeg_args_with_audio(&config, "in.mov", "out.mp4", 25, 1, &policy, None, 8)
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 8, 48000, 1080, false,
+            )
+            .is_ok());
+        assert!(p
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 4, 48000, 1080, false,
+            )
+            .is_ok());
+
+        // Odd / invalid channel layouts must error
+        assert!(p
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 3, 48000, 1080, false,
+            )
             .is_err());
         assert!(p
-            .build_ffmpeg_args_with_audio(&config, "in.mov", "out.mp4", 25, 1, &policy, None, 4)
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 5, 48000, 1080, false,
+            )
             .is_err());
+        assert!(p
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 7, 48000, 1080, false,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn test_4ch_and_8ch_downmix_filter() {
+        let config = AppConfig::default();
+        let p = EncodingProfile::by_id(ProfileId::ProfileA);
+        let mut policy = crate::config::AudioPolicy::default();
+        policy.mode = crate::config::AudioMode::EbuR128;
+        policy.preserve_original = false;
+
+        let args_4ch = p
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 4, 48000, 1080, false,
+            )
+            .unwrap();
+        let af_idx = args_4ch.iter().position(|a| a == "-af").unwrap();
+        assert!(args_4ch[af_idx + 1].starts_with("pan=stereo|c0=c0|c1=c1,loudnorm="));
+
+        let args_8ch = p
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 8, 48000, 1080, false,
+            )
+            .unwrap();
+        let af_idx = args_8ch.iter().position(|a| a == "-af").unwrap();
+        assert!(args_8ch[af_idx + 1].starts_with("pan=stereo|c0=c0|c1=c1,loudnorm="));
+    }
+
+    #[test]
+    fn test_missing_or_corrupt_audio_injects_anullsrc() {
+        let config = AppConfig::default();
+        let p = EncodingProfile::by_id(ProfileId::ProfileA);
+        let policy = crate::config::AudioPolicy::default();
+
+        for (channels, rate) in [(0, 0), (0, 48000), (2, 0), (3, 0), (6, 0)] {
+            let mut pol = policy.clone();
+            pol.preserve_original = true;
+            let args = p
+                .build_ffmpeg_args_with_audio(
+                    &config, "in.mov", "out.mp4", 25, 1, &pol, None, channels, rate, 1080, false,
+                )
+                .unwrap();
+
+            let lavfi_pos = args.iter().position(|a| a == "-f").unwrap();
+            assert_eq!(args[lavfi_pos + 1], "lavfi");
+            assert_eq!(args[lavfi_pos + 2], "-i");
+            assert_eq!(args[lavfi_pos + 3], "anullsrc=channel_layout=stereo:sample_rate=48000");
+
+            assert!(args.contains(&"-shortest".to_string()));
+            assert!(!args.contains(&"0:a:0?".to_string()));
+            let map1_pos = args.iter().position(|a| a == "1:a:0").unwrap();
+            assert_eq!(args[map1_pos - 1], "-map");
+
+            // Synthetic silence must not have loudnorm or downmix filter applied
+            assert!(!args.contains(&"-af".to_string()));
+            // Output channels must always be stereo (2)
+            let ac_pos = args.iter().position(|a| a == "-ac").unwrap();
+            assert_eq!(args[ac_pos + 1], "2");
+        }
+    }
+
+    #[test]
+    fn test_geometry_cropping_and_deinterlace() {
+        let config = AppConfig::default();
+        let p_a = EncodingProfile::by_id(ProfileId::ProfileA);
+        let policy = crate::config::AudioPolicy::default();
+
+        // 608 lines crop
+        let args_608 = p_a
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 608, false,
+            )
+            .unwrap();
+        let vf_idx = args_608.iter().position(|a| a == "-vf").unwrap();
+        assert!(args_608[vf_idx + 1].starts_with("crop=in_w:576:0:32,setdar=dar,fps="));
+
+        // 1088 lines crop
+        let args_1088 = p_a
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 1088, false,
+            )
+            .unwrap();
+        let vf_idx = args_1088.iter().position(|a| a == "-vf").unwrap();
+        assert!(args_1088[vf_idx + 1].starts_with("crop=in_w:1080:0:0,setdar=dar,fps="));
+
+        // Interlaced input to progressive profile (Profile A)
+        let args_deint = p_a
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 1080, true,
+            )
+            .unwrap();
+        let vf_idx = args_deint.iter().position(|a| a == "-vf").unwrap();
+        assert!(args_deint[vf_idx + 1].starts_with("yadif=deint=interlaced,fps="));
+
+        // 608 interlaced to progressive profile
+        let args_608_deint = p_a
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 608, true,
+            )
+            .unwrap();
+        let vf_idx = args_608_deint.iter().position(|a| a == "-vf").unwrap();
+        assert!(args_608_deint[vf_idx + 1].starts_with("crop=in_w:576:0:32,setdar=dar,yadif=deint=interlaced,fps="));
+
+        // 1088 interlaced to progressive profile
+        let args_1088_deint = p_a
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 1088, true,
+            )
+            .unwrap();
+        let vf_idx = args_1088_deint.iter().position(|a| a == "-vf").unwrap();
+        assert!(args_1088_deint[vf_idx + 1].starts_with("crop=in_w:1080:0:0,setdar=dar,yadif=deint=interlaced,fps="));
+
+        // Interlaced input to interlaced profile (Profile B) must NOT deinterlace
+        let p_b = EncodingProfile::by_id(ProfileId::ProfileB);
+        let args_b = p_b
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 1080, true,
+            )
+            .unwrap();
+        let vf_idx = args_b.iter().position(|a| a == "-vf").unwrap();
+        assert!(!args_b[vf_idx + 1].contains("yadif"));
+    }
+
+    #[test]
+    fn test_color_range_tv_enforced() {
+        let config = AppConfig::default();
+        let p = EncodingProfile::by_id(ProfileId::ProfileA);
+        let policy = crate::config::AudioPolicy::default();
+
+        let args = p
+            .build_ffmpeg_args_with_audio(
+                &config, "in.mov", "out.mp4", 25, 1, &policy, None, 2, 48000, 1080, false,
+            )
+            .unwrap();
+        let cr_idx = args.iter().position(|a| a == "-color_range").unwrap();
+        assert_eq!(args[cr_idx + 1], "tv");
     }
 
     #[test]
@@ -974,6 +1203,9 @@ mod tests {
                 &policy,
                 Some(&silent_measured),
                 2,
+                48000,
+                1080,
+                false,
             )
             .unwrap();
         assert!(

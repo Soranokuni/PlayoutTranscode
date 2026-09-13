@@ -38,12 +38,26 @@ impl ProbeData {
         }
     }
 
+    pub fn is_interlaced(&self) -> bool {
+        matches!(
+            self.field_order.as_str(),
+            "tt" | "tb" | "tff" | "bff" | "bb" | "bt"
+        )
+    }
+
+    pub fn has_valid_audio(&self) -> bool {
+        self.audio_sample_rate > 0 && self.audio_channels > 0
+    }
+
     pub fn profile_id(&self) -> ProfileId {
         if self.height > 900 {
-            match self.field_order.as_str() {
-                "tt" | "tb" | "tff" | "bff" | "bb" | "bt" => ProfileId::ProfileB,
-                _ => ProfileId::ProfileA,
+            if self.is_interlaced() {
+                ProfileId::ProfileB
+            } else {
+                ProfileId::ProfileA
             }
+        } else if self.height >= 700 && !self.is_interlaced() {
+            ProfileId::ProfileA
         } else {
             ProfileId::ProfileC
         }
@@ -174,21 +188,26 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
     let video_codec = vstream
         .and_then(|s| s.codec_name.clone())
         .unwrap_or_else(|| "unknown".into());
-    let audio_codec = astream
-        .and_then(|s| s.codec_name.clone())
-        .unwrap_or_else(|| "none".into());
-
     let width = vstream.and_then(|s| s.width).unwrap_or(0) as i64;
     let height = vstream.and_then(|s| s.height).unwrap_or(0) as i64;
-
-    let audio_sample_rate = astream
+    let raw_audio_sample_rate = astream
         .and_then(|s| s.sample_rate.as_ref())
         .and_then(|v| v.parse_i64())
         .unwrap_or(0);
-    let audio_channels = astream
+    let raw_audio_channels = astream
         .and_then(|s| s.channels.as_ref())
         .and_then(|v| v.parse_i64())
         .unwrap_or(0);
+
+    let (audio_sample_rate, audio_channels, audio_codec) =
+        if raw_audio_sample_rate == 0 || raw_audio_channels == 0 {
+            (0, 0, "none".to_string())
+        } else {
+            let codec = astream
+                .and_then(|s| s.codec_name.clone())
+                .unwrap_or_else(|| "none".into());
+            (raw_audio_sample_rate, raw_audio_channels, codec)
+        };
 
     let (fps_num_raw, fps_den_raw) = vstream
         .and_then(|s| s.r_frame_rate.as_ref())
@@ -491,7 +510,7 @@ impl LoudnessMeasurer for RealLoudnessMeasurer {
         duration_secs: f64,
         policy: &crate::config::AudioPolicy,
     ) -> Result<Option<MeasuredLoudness>, String> {
-        if policy.mode == crate::config::AudioMode::LegacyV1Encode || channels == 0 {
+        if policy.mode == crate::config::AudioMode::LegacyV1Encode || channels <= 0 {
             return Ok(None);
         }
 
@@ -679,5 +698,64 @@ mod tests {
             !res.is_linear,
             "Measured LRA exceeds 1.5x target -> linear mode must be false"
         );
+    }
+
+    #[test]
+    fn test_profile_id_routing_progressive_height_700() {
+        let make_probe = |height: i64, field_order: &str| ProbeData {
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1280,
+            height,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            fps_num: 25,
+            fps_den: 1,
+            field_order: field_order.into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "test.mp4".into(),
+        };
+
+        // 720p progressive -> Profile A (1080p25 HD)
+        let p720p = make_probe(720, "progressive");
+        assert_eq!(p720p.profile_id(), ProfileId::ProfileA);
+
+        // 1080p progressive -> Profile A
+        let p1080p = make_probe(1080, "progressive");
+        assert_eq!(p1080p.profile_id(), ProfileId::ProfileA);
+
+        // 1080i interlaced -> Profile B
+        let p1080i = make_probe(1080, "tff");
+        assert_eq!(p1080i.profile_id(), ProfileId::ProfileB);
+
+        // 576i SD -> Profile C
+        let p576i = make_probe(576, "tff");
+        assert_eq!(p576i.profile_id(), ProfileId::ProfileC);
+
+        // 576p SD -> Profile C (height < 700)
+        let p576p = make_probe(576, "progressive");
+        assert_eq!(p576p.profile_id(), ProfileId::ProfileC);
+    }
+
+    #[test]
+    fn test_corrupt_audio_detection() {
+        let p_corrupt = ProbeData {
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "none".into(),
+            audio_sample_rate: 0,
+            audio_channels: 0,
+            fps_num: 25,
+            fps_den: 1,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "test.mp4".into(),
+        };
+        assert!(!p_corrupt.has_valid_audio());
     }
 }

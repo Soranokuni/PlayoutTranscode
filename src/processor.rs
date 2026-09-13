@@ -598,8 +598,12 @@ fn process_file_inner(
     let metadata_uuid = Uuid::new_v4().to_string();
     let video_dir = target_root.join("videos");
     let _ = std::fs::create_dir_all(&video_dir);
-    let safe_stem =
-        identity::sanitize_filename(&input_path.file_stem().unwrap_or_default().to_string_lossy());
+    let raw_stem = input_path
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    let safe_stem = identity::sanitize_filename(&raw_stem);
 
     let final_output_path = build_unique_output_path(&video_dir, &safe_stem, &metadata_uuid);
     let publisher = LocalFilePublisher;
@@ -611,7 +615,7 @@ fn process_file_inner(
         &metadata_uuid,
         fingerprint,
         &input_path.to_string_lossy(),
-        &safe_stem,
+        &raw_stem,
     )) {
         tracing::error!(
             "DB insert processing failed for {}: {}",
@@ -676,33 +680,37 @@ fn process_file_inner(
     }
 
     let audio_policy = config.effective_audio_policy();
-    let measured_loudness = match measurer.measure_loudness(
-        tools,
-        input_path,
-        probe_data.audio_channels,
-        probe_data.duration_secs,
-        &audio_policy,
-    ) {
-        Ok(m) => m,
-        Err(e) => {
-            let _ = queue.transition(
-                &job.id,
-                jobs::JobPhase::Failed,
-                Some("Failed".into()),
-                |j| {
-                    j.error = Some(format!("Audio measurement failed: {}", e));
-                    j.error_category = Some("audio_measurement_failure".into());
-                },
-            );
-            tracing::error!(
-                "Audio measurement failed for {}: {}",
-                input_path.display(),
-                e
-            );
-            queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Audio measurement failed: {}", e)}).to_string());
-            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
-            publisher.cleanup_staging(&staged_output_path);
-            return;
+    let measured_loudness = if !probe_data.has_valid_audio() {
+        None
+    } else {
+        match measurer.measure_loudness(
+            tools,
+            input_path,
+            probe_data.audio_channels,
+            probe_data.duration_secs,
+            &audio_policy,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                let _ = queue.transition(
+                    &job.id,
+                    jobs::JobPhase::Failed,
+                    Some("Failed".into()),
+                    |j| {
+                        j.error = Some(format!("Audio measurement failed: {}", e));
+                        j.error_category = Some("audio_measurement_failure".into());
+                    },
+                );
+                tracing::error!(
+                    "Audio measurement failed for {}: {}",
+                    input_path.display(),
+                    e
+                );
+                queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Audio measurement failed: {}", e)}).to_string());
+                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                publisher.cleanup_staging(&staged_output_path);
+                return;
+            }
         }
     };
 
@@ -1623,7 +1631,7 @@ fn classify_probe_match(
     } else {
         40.0
     };
-    let tolerance_ms = (frame_duration_ms * 2.0).max(40.0);
+    let tolerance_ms = (frame_duration_ms * 2.0).max(1200.0);
     let diff_ms = ((output_duration - source_duration).abs() * 1000.0).round() as f64;
     if diff_ms > tolerance_ms {
         return Err(format!(
@@ -2625,6 +2633,39 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&watch);
         let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn test_classify_probe_match_duration_tolerance() {
+        let source = probe::ProbeData {
+            duration_secs: 10.0,
+            frame_count: 250,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: 48000,
+            audio_channels: 2,
+            fps_num: 25,
+            fps_den: 1,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "source.ts".into(),
+        };
+
+        // 1000ms difference (e.g. PTS lead-in skew) within 1200ms tolerance -> Success
+        let output_1000ms_skew = probe::ProbeData {
+            duration_secs: 11.0,
+            ..source.clone()
+        };
+        assert!(classify_probe_match(output_1000ms_skew, &source).is_ok());
+
+        // 1500ms difference exceeds 1200ms tolerance -> Error
+        let output_1500ms_skew = probe::ProbeData {
+            duration_secs: 11.5,
+            ..source.clone()
+        };
+        assert!(classify_probe_match(output_1500ms_skew, &source).is_err());
     }
 }
 

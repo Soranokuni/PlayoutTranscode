@@ -5,7 +5,10 @@ use std::time::UNIX_EPOCH;
 use tokio::sync::mpsc;
 use walkdir::WalkDir;
 
-static SUPPORTED_EXTENSIONS: &[&str] = &["mp4", "mov", "mxf", "mkv", "avi", "webm", "ts", "m2ts"];
+static SUPPORTED_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "mxf", "mkv", "avi", "webm", "ts", "m2ts", "mpg", "mpeg", "m4v", "vob", "mts",
+    "m2t", "wmv", "asf", "flv",
+];
 
 static TEMP_EXTENSIONS: &[&str] = &[
     "tmp",
@@ -359,6 +362,15 @@ mod tests {
         // Default allowed
         assert!(is_extension_allowed("mp4", &[], &[]));
         assert!(is_extension_allowed("MOV", &[], &[]));
+        assert!(is_extension_allowed("mpg", &[], &[]));
+        assert!(is_extension_allowed("mpeg", &[], &[]));
+        assert!(is_extension_allowed("m4v", &[], &[]));
+        assert!(is_extension_allowed("vob", &[], &[]));
+        assert!(is_extension_allowed("mts", &[], &[]));
+        assert!(is_extension_allowed("m2t", &[], &[]));
+        assert!(is_extension_allowed("wmv", &[], &[]));
+        assert!(is_extension_allowed("asf", &[], &[]));
+        assert!(is_extension_allowed("flv", &[], &[]));
         assert!(!is_extension_allowed("txt", &[], &[]));
         assert!(!is_extension_allowed("exe", &[], &[]));
 
