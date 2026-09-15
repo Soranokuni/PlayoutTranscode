@@ -602,7 +602,11 @@ async fn get_config(State(state): State<ServerState>) -> Json<serde_json::Value>
 
 #[derive(Deserialize)]
 struct ConfigUpdate {
+    /// Accepted for wire compatibility but deliberately ignored: the config
+    /// version is derived from which sections are present, never asserted by
+    /// the caller.
     #[serde(default)]
+    #[allow(dead_code)]
     version: Option<u32>,
     #[serde(default)]
     paths: Option<PathsConfigUpdate>,
@@ -690,167 +694,185 @@ struct IngestionConfigUpdate {
     clean_source_after_success: Option<bool>,
 }
 
+/// Apply a `PUT /api/config` patch to a copy of the running config and
+/// validate the result.
+///
+/// Extracted from the handler so it is pure and testable: the handler must
+/// never mutate `state.config` or touch the on-disk file unless this returns
+/// `Ok`. The old code did the opposite — it mutated the shared config, wrote
+/// `config.toml`, and only then validated, so an invalid patch was persisted
+/// and silently disabled auto-start at the next boot (F-03).
+fn apply_config_patch(current: &AppConfig, body: ConfigUpdate) -> Result<AppConfig, String> {
+    let mut config = current.clone();
+
+    // `version` is derived, never taken from the request body.
+    if let Some(p) = body.paths {
+        if let Some(w) = p.watch_folder {
+            config.paths.watch_folder = w;
+        }
+        if let Some(t) = p.target_folder {
+            config.paths.target_folder = t;
+        }
+    }
+    if let Some(e) = body.encoding {
+        if let Some(v) = e.preset {
+            config.encoding.preset = v;
+        }
+        if let Some(v) = e.ffmpeg_threads {
+            config.encoding.ffmpeg_threads = v;
+        }
+        if let Some(v) = e.cpu_cores {
+            config.encoding.cpu_cores = v;
+        }
+        if let Some(v) = e.audio_codec {
+            config.encoding.audio_codec = v;
+        }
+        if let Some(v) = e.audio_bitrate {
+            config.encoding.audio_bitrate = v;
+        }
+        if let Some(v) = e.tune {
+            config.encoding.tune = v;
+        }
+        if let Some(v) = e.probesize {
+            config.encoding.probesize = v;
+        }
+        if let Some(v) = e.analyzeduration {
+            config.encoding.analyzeduration = v;
+        }
+    }
+    if let Some(p) = body.profile_a {
+        if let Some(v) = p.enabled {
+            config.profile_a.enabled = v;
+        }
+        if let Some(v) = p.crf {
+            config.profile_a.crf = v;
+        }
+        if let Some(v) = p.maxrate {
+            config.profile_a.maxrate = v;
+        }
+        if let Some(v) = p.bufsize {
+            config.profile_a.bufsize = v;
+        }
+    }
+    if let Some(p) = body.profile_b {
+        if let Some(v) = p.enabled {
+            config.profile_b.enabled = v;
+        }
+        if let Some(v) = p.crf {
+            config.profile_b.crf = v;
+        }
+        if let Some(v) = p.maxrate {
+            config.profile_b.maxrate = v;
+        }
+        if let Some(v) = p.bufsize {
+            config.profile_b.bufsize = v;
+        }
+    }
+    if let Some(p) = body.profile_c {
+        if let Some(v) = p.enabled {
+            config.profile_c.enabled = v;
+        }
+        if let Some(v) = p.crf {
+            config.profile_c.crf = v;
+        }
+        if let Some(v) = p.maxrate {
+            config.profile_c.maxrate = v;
+        }
+        if let Some(v) = p.bufsize {
+            config.profile_c.bufsize = v;
+        }
+    }
+    if let Some(i) = body.ingestion {
+        if let Some(v) = i.settle_secs {
+            config.ingestion.settle_secs = v;
+        }
+        if let Some(v) = i.poll_secs {
+            config.ingestion.poll_secs = v;
+        }
+        if let Some(v) = i.max_concurrency {
+            config.ingestion.max_concurrency = v;
+        }
+        if let Some(v) = i.stable_polls_min {
+            config.ingestion.stable_polls_min = v;
+        }
+        if let Some(v) = i.retry_policy {
+            config.ingestion.retry_policy = v;
+        }
+        if let Some(v) = i.auto_retry_on_start {
+            config.ingestion.auto_retry_on_start = v;
+        }
+        if let Some(v) = i.max_attempts {
+            config.ingestion.max_attempts = v;
+        }
+        if let Some(v) = i.retry_delay_ms {
+            config.ingestion.retry_delay_ms = v;
+        }
+        if let Some(v) = i.clean_source_after_success {
+            config.ingestion.clean_source_after_success = v;
+        }
+    }
+
+    let mut saw_v2 = false;
+    if let Some(ap) = body.audio_policy {
+        config.audio_policy = Some(ap);
+        saw_v2 = true;
+    }
+    if let Some(vp) = body.validation_policy {
+        config.validation_policy = Some(vp);
+        saw_v2 = true;
+    }
+    if let Some(sp) = body.storage_policy {
+        config.storage_policy = Some(sp);
+        saw_v2 = true;
+    }
+    if let Some(rp) = body.retry_policy_v2 {
+        config.retry_policy_v2 = Some(rp);
+        saw_v2 = true;
+    }
+    if let Some(tp) = body.toolchain_policy {
+        config.toolchain_policy = Some(tp);
+        saw_v2 = true;
+    }
+    if saw_v2 {
+        config.version = 2;
+    }
+
+    config.initialized = true;
+    config.validate()?;
+    Ok(config)
+}
+
 async fn put_config(
     State(state): State<ServerState>,
     Json(body): Json<ConfigUpdate>,
 ) -> impl IntoResponse {
-    {
-        let mut config = state.config.lock();
-        if let Some(v) = body.version {
-            config.version = v;
-        }
-        if let Some(p) = body.paths {
-            if let Some(w) = p.watch_folder {
-                config.paths.watch_folder = w;
-            }
-            if let Some(t) = p.target_folder {
-                config.paths.target_folder = t;
-            }
-        }
-        if let Some(e) = body.encoding {
-            if let Some(v) = e.preset {
-                config.encoding.preset = v;
-            }
-            if let Some(v) = e.ffmpeg_threads {
-                config.encoding.ffmpeg_threads = v;
-            }
-            if let Some(v) = e.cpu_cores {
-                config.encoding.cpu_cores = v;
-            }
-            if let Some(v) = e.audio_codec {
-                config.encoding.audio_codec = v;
-            }
-            if let Some(v) = e.audio_bitrate {
-                config.encoding.audio_bitrate = v;
-            }
-            if let Some(v) = e.tune {
-                config.encoding.tune = v;
-            }
-            if let Some(v) = e.probesize {
-                config.encoding.probesize = v;
-            }
-            if let Some(v) = e.analyzeduration {
-                config.encoding.analyzeduration = v;
-            }
-        }
-        if let Some(p) = body.profile_a {
-            if let Some(v) = p.enabled {
-                config.profile_a.enabled = v;
-            }
-            if let Some(v) = p.crf {
-                config.profile_a.crf = v;
-            }
-            if let Some(v) = p.maxrate {
-                config.profile_a.maxrate = v;
-            }
-            if let Some(v) = p.bufsize {
-                config.profile_a.bufsize = v;
-            }
-        }
-        if let Some(p) = body.profile_b {
-            if let Some(v) = p.enabled {
-                config.profile_b.enabled = v;
-            }
-            if let Some(v) = p.crf {
-                config.profile_b.crf = v;
-            }
-            if let Some(v) = p.maxrate {
-                config.profile_b.maxrate = v;
-            }
-            if let Some(v) = p.bufsize {
-                config.profile_b.bufsize = v;
-            }
-        }
-        if let Some(p) = body.profile_c {
-            if let Some(v) = p.enabled {
-                config.profile_c.enabled = v;
-            }
-            if let Some(v) = p.crf {
-                config.profile_c.crf = v;
-            }
-            if let Some(v) = p.maxrate {
-                config.profile_c.maxrate = v;
-            }
-            if let Some(v) = p.bufsize {
-                config.profile_c.bufsize = v;
-            }
-        }
-        if let Some(i) = body.ingestion {
-            if let Some(v) = i.settle_secs {
-                config.ingestion.settle_secs = v;
-            }
-            if let Some(v) = i.poll_secs {
-                config.ingestion.poll_secs = v;
-            }
-            if let Some(v) = i.max_concurrency {
-                config.ingestion.max_concurrency = v;
-            }
-            if let Some(v) = i.stable_polls_min {
-                config.ingestion.stable_polls_min = v;
-            }
-            if let Some(v) = i.retry_policy {
-                config.ingestion.retry_policy = v;
-            }
-            if let Some(v) = i.auto_retry_on_start {
-                config.ingestion.auto_retry_on_start = v;
-            }
-            if let Some(v) = i.max_attempts {
-                config.ingestion.max_attempts = v;
-            }
-            if let Some(v) = i.retry_delay_ms {
-                config.ingestion.retry_delay_ms = v;
-            }
-            if let Some(v) = i.clean_source_after_success {
-                config.ingestion.clean_source_after_success = v;
-            }
-        }
-        if let Some(ap) = body.audio_policy {
-            config.audio_policy = Some(ap);
-            config.version = 2;
-        }
-        if let Some(vp) = body.validation_policy {
-            config.validation_policy = Some(vp);
-            config.version = 2;
-        }
-        if let Some(sp) = body.storage_policy {
-            config.storage_policy = Some(sp);
-            config.version = 2;
-        }
-        if let Some(rp) = body.retry_policy_v2 {
-            config.retry_policy_v2 = Some(rp);
-            config.version = 2;
-        }
-        if let Some(tp) = body.toolchain_policy {
-            config.toolchain_policy = Some(tp);
-            config.version = 2;
-        }
-
-        config.initialized = true;
-
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let config_path = exe_dir.join("config.toml");
-        if let Err(e) = config.save_to(&config_path) {
-            tracing::error!("Failed to save config: {}", e);
+    let current = state.config.lock().clone();
+    let patched = match apply_config_patch(&current, body) {
+        Ok(c) => c,
+        Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to save config: {}", e)})),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": format!("Config validation: {}", e)})),
             )
                 .into_response();
         }
-    }
+    };
 
-    let config = state.config.lock().clone();
-    if let Err(e) = config.validate() {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let config_path = exe_dir.join("config.toml");
+    if let Err(e) = patched.save_to(&config_path) {
+        tracing::error!("Failed to save config to {}: {}", config_path.display(), e);
         return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": format!("Config validation: {}", e)})),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "config_save_failed"})),
         )
             .into_response();
     }
 
+    *state.config.lock() = patched;
     Json(serde_json::json!({"success": true})).into_response()
 }
 
@@ -2333,6 +2355,83 @@ mod tests {
     fn safe_join_rejects_absurd_depth() {
         let deep = "/a".repeat(64);
         assert!(safe_join(root(), &deep).is_none());
+    }
+
+    fn patch_test_config(tag: &str) -> (AppConfig, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pt-patch-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let watch = dir.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+        let mut cfg = AppConfig::default();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = dir.join("target").to_string_lossy().to_string();
+        assert!(cfg.validate().is_ok(), "fixture must be valid");
+        (cfg, dir)
+    }
+
+    fn patch_from(json: serde_json::Value) -> ConfigUpdate {
+        serde_json::from_value(json).expect("patch body")
+    }
+
+    #[test]
+    fn config_patch_rejects_target_inside_watch() {
+        let (cfg, dir) = patch_test_config("overlap");
+        let nested = std::path::Path::new(&cfg.paths.watch_folder).join("out");
+        let err = apply_config_patch(
+            &cfg,
+            patch_from(serde_json::json!({
+                "paths": { "target_folder": nested.to_string_lossy() }
+            })),
+        )
+        .expect_err("target inside watch must be rejected");
+        assert!(err.contains("overlap"), "unexpected message: {}", err);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_patch_rejects_bad_ffmpeg_strings() {
+        let (cfg, dir) = patch_test_config("ffstr");
+        assert!(apply_config_patch(
+            &cfg,
+            patch_from(serde_json::json!({ "encoding": { "tune": "nope" } }))
+        )
+        .is_err());
+        assert!(apply_config_patch(
+            &cfg,
+            patch_from(serde_json::json!({ "profile_a": { "maxrate": "15M -f null -" } }))
+        )
+        .is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_patch_ignores_caller_supplied_version() {
+        let (cfg, dir) = patch_test_config("version");
+        let before = cfg.version;
+        let patched = apply_config_patch(&cfg, patch_from(serde_json::json!({ "version": 99 })))
+            .expect("empty patch is valid");
+        assert_eq!(patched.version, before, "version must be derived, not taken");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_patch_applies_valid_changes() {
+        let (cfg, dir) = patch_test_config("apply");
+        let patched = apply_config_patch(
+            &cfg,
+            patch_from(serde_json::json!({
+                "encoding": { "preset": "veryfast", "tune": "film" },
+                "ingestion": { "max_concurrency": 3 }
+            })),
+        )
+        .expect("valid patch");
+        assert_eq!(patched.encoding.preset, "veryfast");
+        assert_eq!(patched.encoding.tune, "film");
+        assert_eq!(patched.ingestion.max_concurrency, 3);
+        assert!(patched.initialized);
+        // The source config is untouched.
+        assert_eq!(cfg.ingestion.max_concurrency, AppConfig::default().ingestion.max_concurrency);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

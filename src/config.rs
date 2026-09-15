@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn default_config_path() -> PathBuf {
     let exe_dir = std::env::current_exe()
@@ -37,6 +37,144 @@ pub struct ServerConfig {
     /// allowed; everything else is rejected.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+}
+
+/// `true` when `s` is an FFmpeg size/rate literal: digits, optional decimal
+/// part, optional `k`/`M`/`G` suffix. Anything else is passed straight to
+/// FFmpeg on the command line and breaks every subsequent encode (F-03).
+pub fn is_valid_ffmpeg_quantity(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 32 {
+        return false;
+    }
+    let body = match s.chars().last() {
+        Some(c) if matches!(c, 'k' | 'K' | 'm' | 'M' | 'g' | 'G') => &s[..s.len() - c.len_utf8()],
+        _ => s,
+    };
+    if body.is_empty() {
+        return false;
+    }
+    let mut seen_dot = false;
+    for ch in body.chars() {
+        if ch == '.' {
+            if seen_dot {
+                return false;
+            }
+            seen_dot = true;
+        } else if !ch.is_ascii_digit() {
+            return false;
+        }
+    }
+    body.chars().any(|c| c.is_ascii_digit())
+}
+
+/// Lower-cased, separator-normalised form used for the "is this a forbidden
+/// or overlapping directory" comparisons. Windows paths are case-insensitive
+/// and accept either separator, so compare on a normalised form rather than
+/// on the raw string.
+fn normalize_dir(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+/// `true` when a normalised path is a drive root (`c:`) or the POSIX root
+/// (which normalises to the empty string).
+fn is_drive_or_fs_root(norm: &str) -> bool {
+    norm.is_empty() || (norm.len() <= 2 && norm.ends_with(':'))
+}
+
+/// `true` when `child` is `parent` or lives underneath it.
+fn is_within(child: &str, parent: &str) -> bool {
+    child == parent || child.starts_with(&format!("{}/", parent))
+}
+
+/// Directories the service must never be pointed at, as `(root, exact_only)`
+/// pairs.
+///
+/// `PUT /api/config` is reachable without credentials, and
+/// `clean_source_after_success` deletes sources after a successful encode, so
+/// `watch_folder = C:\Users` was a remote-driven mass-deletion primitive
+/// (F-03). System trees are forbidden outright; the profile containers are
+/// forbidden only as exact roots, because `C:\Users\op\Media\Ingest` is a
+/// perfectly ordinary place to put a watch folder.
+fn forbidden_roots() -> Vec<(String, bool)> {
+    let mut roots: Vec<(String, bool)> = Vec::new();
+    for var in ["SystemRoot", "windir", "ProgramFiles", "ProgramFiles(x86)"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                roots.push((normalize_dir(Path::new(&v)), false));
+            }
+        }
+    }
+    for var in ["ProgramData", "USERPROFILE", "PUBLIC"] {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                let norm = normalize_dir(Path::new(&v));
+                // Also forbid the container itself (`C:/Users`).
+                if let Some(parent) = Path::new(&norm).parent() {
+                    let parent = normalize_dir(parent);
+                    if !is_drive_or_fs_root(&parent) {
+                        roots.push((parent, true));
+                    }
+                }
+                roots.push((norm, true));
+            }
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            roots.push((normalize_dir(dir), false));
+        }
+    }
+    if !cfg!(windows) {
+        for r in ["/bin", "/boot", "/dev", "/etc", "/proc", "/sys", "/usr"] {
+            roots.push((r.to_string(), false));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// Reject a media root that is a drive/filesystem root, a system location, or
+/// the exe directory.
+fn validate_media_root(label: &str, raw: &str) -> Result<String, String> {
+    let path = Path::new(raw);
+    if !path.is_absolute() {
+        return Err(format!("{} must be an absolute path: '{}'", label, raw));
+    }
+    let norm = normalize_dir(path);
+    // A drive root normalises to "c:" and a POSIX root to "".
+    if is_drive_or_fs_root(&norm) {
+        return Err(format!("{} must not be a filesystem or drive root", label));
+    }
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) {
+        return Err(format!("{} must not contain '.' or '..': '{}'", label, raw));
+    }
+    for (root, exact_only) in forbidden_roots() {
+        let hit = if exact_only {
+            norm == root
+        } else {
+            is_within(&norm, &root)
+        };
+        if hit {
+            return Err(format!(
+                "{} must not be a system, program or profile directory ('{}')",
+                label, raw
+            ));
+        }
+    }
+    Ok(norm)
 }
 
 /// True when `bind_address` only accepts connections from this machine.
@@ -635,8 +773,19 @@ impl AppConfig {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config dir: {}", e))?;
         }
-        fs::write(path, serialized)
-            .map_err(|e| format!("Failed to write config '{}': {}", path.display(), e))?;
+        // Write-then-rename so a crash or a full disk mid-write cannot leave a
+        // truncated config.toml behind (same pattern as `write_sidecar_payload`).
+        let tmp = path.with_extension("toml.tmp");
+        fs::write(&tmp, serialized)
+            .map_err(|e| format!("Failed to write config '{}': {}", tmp.display(), e))?;
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(format!(
+                "Failed to replace config '{}': {}",
+                path.display(),
+                e
+            ));
+        }
         Ok(())
     }
 
@@ -746,15 +895,40 @@ impl AppConfig {
         if self.paths.target_folder.trim().is_empty() {
             return Err("Target folder is not configured".into());
         }
-        let watch = std::path::Path::new(&self.paths.watch_folder);
+        let watch_norm = validate_media_root("watch_folder", self.paths.watch_folder.trim())?;
+        let target_norm = validate_media_root("target_folder", self.paths.target_folder.trim())?;
+
+        // Overlap makes every published mezzanine look like a new source, so
+        // the service re-ingests its own output forever (F-14).
+        if is_within(&target_norm, &watch_norm) || is_within(&watch_norm, &target_norm) {
+            return Err(
+                "watch_folder and target_folder must not overlap; publishing into the watch \
+                 folder causes an endless re-ingest loop"
+                    .into(),
+            );
+        }
+        // If both already exist, compare their canonical forms too, so symlinks
+        // and 8.3 short names cannot hide the overlap.
+        let watch = Path::new(self.paths.watch_folder.trim());
+        let target = Path::new(self.paths.target_folder.trim());
+        if let (Ok(cw), Ok(ct)) = (watch.canonicalize(), target.canonicalize()) {
+            let cw = normalize_dir(&cw);
+            let ct = normalize_dir(&ct);
+            if is_within(&ct, &cw) || is_within(&cw, &ct) {
+                return Err(
+                    "watch_folder and target_folder resolve to overlapping directories".into(),
+                );
+            }
+        }
         if !watch.exists() || !watch.is_dir() {
             return Err(format!(
                 "Watch folder does not exist: {}",
                 self.paths.watch_folder
             ));
         }
-        fs::create_dir_all(&self.paths.target_folder)
-            .map_err(|e| format!("Cannot create target folder: {}", e))?;
+        // `validate()` is pure: the target directory is created by
+        // `start_processing_loop`, not as a side effect of validating an
+        // unauthenticated `PUT /api/config` body.
 
         let valid_presets = [
             "ultrafast",
@@ -788,6 +962,76 @@ impl AppConfig {
         }
         if self.profile_c.crf > 51 {
             return Err("Profile C CRF must be 0-51".into());
+        }
+
+
+        // Every string below is handed to FFmpeg on the command line. An
+        // unvalidated value does not fail here, it fails on every encode from
+        // then on (F-03).
+        let valid_tunes = [
+            "film",
+            "animation",
+            "grain",
+            "stillimage",
+            "fastdecode",
+            "zerolatency",
+            "none",
+            "",
+        ];
+        if !valid_tunes.contains(&self.encoding.tune.trim()) {
+            return Err(format!(
+                "Invalid encoding.tune '{}'. Valid: {:?}",
+                self.encoding.tune, valid_tunes
+            ));
+        }
+        for (label, value) in [
+            ("encoding.probesize", &self.encoding.probesize),
+            ("encoding.analyzeduration", &self.encoding.analyzeduration),
+            ("encoding.audio_bitrate", &self.encoding.audio_bitrate),
+            ("profile_a.maxrate", &self.profile_a.maxrate),
+            ("profile_a.bufsize", &self.profile_a.bufsize),
+            ("profile_b.maxrate", &self.profile_b.maxrate),
+            ("profile_b.bufsize", &self.profile_b.bufsize),
+            ("profile_c.maxrate", &self.profile_c.maxrate),
+            ("profile_c.bufsize", &self.profile_c.bufsize),
+        ] {
+            if !is_valid_ffmpeg_quantity(value) {
+                return Err(format!(
+                    "{} '{}' is not a valid FFmpeg quantity (e.g. 15M, 320k, 5000000)",
+                    label, value
+                ));
+            }
+        }
+
+        if self.ingestion.settle_secs > 3600 {
+            return Err("ingestion.settle_secs must be <= 3600".into());
+        }
+        if self.ingestion.poll_secs == 0 || self.ingestion.poll_secs > 3600 {
+            return Err("ingestion.poll_secs must be between 1 and 3600".into());
+        }
+        if self.ingestion.max_concurrency > 64 {
+            return Err("ingestion.max_concurrency must be <= 64".into());
+        }
+        if self.ingestion.max_attempts > 10 {
+            return Err("ingestion.max_attempts must be <= 10".into());
+        }
+        if self.ingestion.retry_delay_ms > 600_000 {
+            return Err("ingestion.retry_delay_ms must be <= 600000".into());
+        }
+        if self.ingestion.stable_polls_min > 100 {
+            return Err("ingestion.stable_polls_min must be <= 100".into());
+        }
+
+        if self.server.web_port == 0 {
+            return Err("server.web_port must not be 0".into());
+        }
+
+        let valid_levels = ["error", "warn", "info", "debug", "trace"];
+        if !valid_levels.contains(&self.logging.level.trim().to_lowercase().as_str()) {
+            return Err(format!(
+                "Invalid logging.level '{}'. Valid: {:?}",
+                self.logging.level, valid_levels
+            ));
         }
 
         if self.ingestion.max_concurrency == 0 {
@@ -837,6 +1081,29 @@ impl AppConfig {
         if audio_pol.sample_rate_hz == 0 {
             return Err("AudioPolicy sample_rate_hz must be > 0".into());
         }
+        let valid_audio_codecs = ["aac", "pcm_s16le", "libmp3lame"];
+        if !valid_audio_codecs.contains(&audio_pol.codec.trim()) {
+            return Err(format!(
+                "Invalid audio_policy.codec '{}'. Valid: {:?}",
+                audio_pol.codec, valid_audio_codecs
+            ));
+        }
+        if !is_valid_ffmpeg_quantity(&audio_pol.bitrate) {
+            return Err(format!(
+                "audio_policy.bitrate '{}' is not a valid FFmpeg quantity",
+                audio_pol.bitrate
+            ));
+        }
+        if let Some(layout) = audio_pol.channel_layout.as_deref() {
+            let valid_layouts = ["mono", "stereo", "5.1", "5.1(side)", "7.1"];
+            if !valid_layouts.contains(&layout.trim()) {
+                return Err(format!(
+                    "Invalid audio_policy.channel_layout '{}'. Valid: {:?}",
+                    layout, valid_layouts
+                ));
+            }
+        }
+
         if audio_pol.channels == 0 {
             return Err("AudioPolicy channels must be > 0".into());
         }
@@ -983,8 +1250,12 @@ clean_source_after_success = false
     #[test]
     fn test_validation_rules_for_v2_audio_policy() {
         let mut cfg = AppConfig::default();
-        cfg.paths.watch_folder = std::env::temp_dir().to_string_lossy().to_string();
-        cfg.paths.target_folder = std::env::temp_dir().to_string_lossy().to_string();
+        // Distinct, non-overlapping roots: T0-6 rejects watch == target.
+        let base = std::env::temp_dir().join("pt-audio-policy-validate");
+        let watch = base.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = base.join("target").to_string_lossy().to_string();
 
         cfg.audio_policy = Some(AudioPolicy {
             mode: AudioMode::EbuR128,
@@ -1128,6 +1399,276 @@ mod bind_tests {
 
         cfg.server.allowed_origins = vec!["http://localhost:5173".into()];
         assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+
+    fn tmp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pt-val-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A config that validates cleanly, so each negative test below changes
+    /// exactly one thing.
+    fn good_config(dir: &Path) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        let watch = dir.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = dir.join("target").to_string_lossy().to_string();
+        cfg
+    }
+
+    #[test]
+    fn baseline_config_is_valid() {
+        let dir = tmp_dir("baseline");
+        assert_eq!(good_config(&dir).validate(), Ok(()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffmpeg_quantity_grammar() {
+        for ok in ["15M", "320k", "5000000", "1.5M", "2G", "8m", "512K"] {
+            assert!(is_valid_ffmpeg_quantity(ok), "{} should be valid", ok);
+        }
+        for bad in [
+            "",
+            "M",
+            "15 M",
+            "15MB",
+            "-5M",
+            "1.2.3M",
+            "15M; rm -rf /",
+            "$(whoami)",
+            "0x10",
+            "abc",
+        ] {
+            assert!(!is_valid_ffmpeg_quantity(bad), "{} should be invalid", bad);
+        }
+    }
+
+    #[test]
+    fn relative_and_root_media_paths_are_rejected() {
+        let dir = tmp_dir("paths");
+
+        let mut cfg = good_config(&dir);
+        cfg.paths.watch_folder = "media/in".into();
+        assert!(cfg.validate().is_err(), "relative watch_folder");
+
+        let mut cfg = good_config(&dir);
+        cfg.paths.watch_folder = if cfg!(windows) { "C:\\" } else { "/" }.into();
+        assert!(cfg.validate().is_err(), "drive root watch_folder");
+
+        let mut cfg = good_config(&dir);
+        cfg.paths.target_folder = if cfg!(windows) { "D:\\" } else { "/" }.into();
+        assert!(cfg.validate().is_err(), "drive root target_folder");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn system_and_profile_roots_are_rejected() {
+        let dir = tmp_dir("system");
+
+        if let Ok(sysroot) = std::env::var("SystemRoot") {
+            let mut cfg = good_config(&dir);
+            cfg.paths.watch_folder = sysroot.clone();
+            assert!(cfg.validate().is_err(), "SystemRoot watch_folder");
+
+            let mut cfg = good_config(&dir);
+            cfg.paths.target_folder = format!("{}\\Temp\\out", sysroot);
+            assert!(cfg.validate().is_err(), "inside SystemRoot target_folder");
+        }
+        if let Ok(profile) = std::env::var("USERPROFILE") {
+            let mut cfg = good_config(&dir);
+            cfg.paths.watch_folder = profile.clone();
+            assert!(cfg.validate().is_err(), "user profile root watch_folder");
+
+            // C:\Users — the F-03 mass-deletion example.
+            if let Some(parent) = Path::new(&profile).parent() {
+                let mut cfg = good_config(&dir);
+                cfg.paths.watch_folder = parent.to_string_lossy().to_string();
+                assert!(cfg.validate().is_err(), "profile container watch_folder");
+            }
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn overlapping_watch_and_target_are_rejected() {
+        let dir = tmp_dir("overlap");
+
+        // Equal.
+        let mut cfg = good_config(&dir);
+        cfg.paths.target_folder = cfg.paths.watch_folder.clone();
+        assert!(cfg.validate().is_err(), "watch == target");
+
+        // Target inside watch — the F-14 re-ingest loop.
+        let mut cfg = good_config(&dir);
+        cfg.paths.target_folder = Path::new(&cfg.paths.watch_folder)
+            .join("out")
+            .to_string_lossy()
+            .to_string();
+        assert!(cfg.validate().is_err(), "target inside watch");
+
+        // Watch inside target.
+        let mut cfg = good_config(&dir);
+        let nested = dir.join("target").join("in");
+        fs::create_dir_all(&nested).unwrap();
+        cfg.paths.watch_folder = nested.to_string_lossy().to_string();
+        assert!(cfg.validate().is_err(), "watch inside target");
+
+        // Sibling prefixes must still be allowed: /media/in vs /media/input.
+        let mut cfg = good_config(&dir);
+        let sibling = dir.join("watchx");
+        fs::create_dir_all(&sibling).unwrap();
+        cfg.paths.watch_folder = sibling.to_string_lossy().to_string();
+        cfg.paths.target_folder = dir.join("watch").to_string_lossy().to_string();
+        assert!(cfg.validate().is_ok(), "sibling prefix must be allowed");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ffmpeg_bound_strings_are_validated() {
+        let dir = tmp_dir("ffstrings");
+
+        let mut cfg = good_config(&dir);
+        cfg.encoding.tune = "nonsense".into();
+        assert!(cfg.validate().is_err(), "tune");
+
+        let mut cfg = good_config(&dir);
+        cfg.encoding.tune = "film".into();
+        assert!(cfg.validate().is_ok(), "valid tune");
+
+        let mut cfg = good_config(&dir);
+        cfg.encoding.probesize = "lots".into();
+        assert!(cfg.validate().is_err(), "probesize");
+
+        let mut cfg = good_config(&dir);
+        cfg.encoding.analyzeduration = "-1".into();
+        assert!(cfg.validate().is_err(), "analyzeduration");
+
+        let mut cfg = good_config(&dir);
+        cfg.encoding.audio_bitrate = "320 kbps".into();
+        assert!(cfg.validate().is_err(), "audio_bitrate");
+
+        let mut cfg = good_config(&dir);
+        cfg.profile_a.maxrate = "15M -f null -".into();
+        assert!(cfg.validate().is_err(), "profile_a.maxrate");
+
+        let mut cfg = good_config(&dir);
+        cfg.profile_c.bufsize = "".into();
+        assert!(cfg.validate().is_err(), "profile_c.bufsize");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ingestion_and_logging_bounds() {
+        let dir = tmp_dir("bounds");
+
+        let mut cfg = good_config(&dir);
+        cfg.ingestion.settle_secs = 3601;
+        assert!(cfg.validate().is_err(), "settle_secs");
+
+        let mut cfg = good_config(&dir);
+        cfg.ingestion.poll_secs = 0;
+        assert!(cfg.validate().is_err(), "poll_secs 0");
+
+        let mut cfg = good_config(&dir);
+        cfg.ingestion.max_concurrency = 65;
+        assert!(cfg.validate().is_err(), "max_concurrency");
+
+        let mut cfg = good_config(&dir);
+        cfg.ingestion.max_attempts = 11;
+        assert!(cfg.validate().is_err(), "max_attempts");
+
+        let mut cfg = good_config(&dir);
+        cfg.ingestion.retry_delay_ms = 600_001;
+        assert!(cfg.validate().is_err(), "retry_delay_ms");
+
+        let mut cfg = good_config(&dir);
+        cfg.ingestion.stable_polls_min = 101;
+        assert!(cfg.validate().is_err(), "stable_polls_min");
+
+        let mut cfg = good_config(&dir);
+        cfg.server.web_port = 0;
+        assert!(cfg.validate().is_err(), "web_port 0");
+
+        let mut cfg = good_config(&dir);
+        cfg.logging.level = "verbose".into();
+        assert!(cfg.validate().is_err(), "logging.level");
+
+        let mut cfg = good_config(&dir);
+        cfg.logging.level = "DEBUG".into();
+        assert!(cfg.validate().is_ok(), "logging.level is case-insensitive");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_policy_strings_are_validated() {
+        let dir = tmp_dir("audiopol");
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.codec = "flac".into();
+        cfg.audio_policy = Some(pol);
+        assert!(cfg.validate().is_err(), "codec");
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.bitrate = "loud".into();
+        cfg.audio_policy = Some(pol);
+        assert!(cfg.validate().is_err(), "bitrate");
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.channel_layout = Some("quadraphonic".into());
+        cfg.audio_policy = Some(pol);
+        assert!(cfg.validate().is_err(), "channel_layout");
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.channel_layout = Some("5.1(side)".into());
+        cfg.audio_policy = Some(pol);
+        assert!(cfg.validate().is_ok(), "valid channel_layout");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_does_not_create_the_target_directory() {
+        let dir = tmp_dir("noside");
+        let cfg = good_config(&dir);
+        let target = PathBuf::from(&cfg.paths.target_folder);
+        assert!(!target.exists());
+        assert!(cfg.validate().is_ok());
+        assert!(
+            !target.exists(),
+            "validate() must be pure; directory creation belongs to start_processing_loop"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_to_writes_atomically_and_leaves_no_temp_file() {
+        let dir = tmp_dir("save");
+        let cfg = good_config(&dir);
+        let path = dir.join("config.toml");
+        cfg.save_to(&path).unwrap();
+        assert!(path.exists());
+        assert!(!dir.join("config.toml.tmp").exists());
+        let reloaded: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(reloaded.paths.watch_folder, cfg.paths.watch_folder);
         let _ = fs::remove_dir_all(&dir);
     }
 }
