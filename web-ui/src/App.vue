@@ -9,8 +9,6 @@
       @start="onStart"
       @stop="stopService"
       @download="downloadFFmpeg"
-      @install="onInstall"
-      @uninstall="onUninstall"
     />
 
     <nav class="tab-bar">
@@ -281,7 +279,7 @@ const {
   jobs, assets, watchfolder, stats, config, toolchain,
   serviceRunning, downloading, logs, uptimeMs,
   fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
-  installService, uninstallService, clearLogs, retryJob, cancelJob, retryAllFailed,
+  clearLogs, retryJob, cancelJob, retryAllFailed,
 } = useEventStream()
 
 const configStatus = ref<'loading' | 'ready'>('loading')
@@ -487,16 +485,6 @@ async function saveConfigAndStart() {
 async function onStart() {
   const r = await startService()
   if (r && !r.success) alert(r.error || 'Failed to start service')
-}
-
-async function onInstall() {
-  const r = await installService()
-  alert(r?.message || r?.error || 'Done')
-}
-
-async function onUninstall() {
-  const r = await uninstallService()
-  alert(r?.message || r?.error || 'Done')
 }
 
 onMounted(loadAndDecideWizard)

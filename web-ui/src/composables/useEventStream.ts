@@ -381,14 +381,6 @@ export function useEventStream() {
     return r
   }
 
-  async function installService() {
-    return apiPost<{ success?: boolean; message?: string; error?: string }>('/service/install')
-  }
-
-  async function uninstallService() {
-    return apiPost<{ success?: boolean; message?: string; error?: string }>('/service/uninstall')
-  }
-
   async function cancelJob(id: string): Promise<{ success: boolean; error?: string }> {
     try {
       const r = await fetch('/api/jobs/' + encodeURIComponent(id) + '/cancel', {
@@ -450,8 +442,6 @@ export function useEventStream() {
     startService,
     stopService,
     downloadFFmpeg,
-    installService,
-    uninstallService,
     clearLogs,
     retryJob,
     cancelJob,
