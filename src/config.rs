@@ -671,6 +671,13 @@ pub struct ToolchainPolicy {
     pub ffprobe_path: Option<String>,
     #[serde(default = "default_true")]
     pub verify_on_startup: bool,
+    /// Expected SHA-256 (64 hex chars) of the FFmpeg release archive.
+    ///
+    /// Empty disables the automatic download entirely: fetching an executable
+    /// that the service then runs, with no integrity pin, is not acceptable on
+    /// a broadcast host (F-04).
+    #[serde(default)]
+    pub download_sha256: String,
 }
 
 impl Default for ToolchainPolicy {
@@ -679,6 +686,7 @@ impl Default for ToolchainPolicy {
             ffmpeg_path: None,
             ffprobe_path: None,
             verify_on_startup: true,
+            download_sha256: String::new(),
         }
     }
 }

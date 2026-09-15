@@ -360,13 +360,27 @@ pub fn trigger_download(handle: &ServiceHandle) -> bool {
     handle.add_log("info", "Starting FFmpeg download (full build)...");
 
     let h = handle.clone();
-    std::thread::spawn(move || match crate::bootstrap::download_ffmpeg() {
-        Ok(_) => {
-            *h.download_status.lock() = Some("ok".to_string());
-        }
-        Err(e) => {
-            *h.download_status.lock() = Some(format!("error: {}", e));
-        }
+    std::thread::spawn(move || {
+        // A panic in here used to leave `download_status` stuck at
+        // "downloading" forever, disabling the button until a process restart
+        // (F-24). Always land on a terminal status.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+            crate::bootstrap::download_ffmpeg,
+        ));
+        let status = match outcome {
+            Ok(Ok(_)) => "ok".to_string(),
+            Ok(Err(e)) => format!("error: {}", e),
+            Err(payload) => {
+                let msg = payload
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "unknown panic".to_string());
+                tracing::error!("PANIC in FFmpeg download worker: {}", msg);
+                format!("error: download worker panicked: {}", msg)
+            }
+        };
+        *h.download_status.lock() = Some(status);
     });
     true
 }
