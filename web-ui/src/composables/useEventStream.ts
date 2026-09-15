@@ -1,4 +1,5 @@
 import { ref, onMounted, onUnmounted } from 'vue'
+import { apiFetch, eventSourceUrl, onAuthRequired, setApiToken, getApiToken } from '../api/auth'
 
 export interface JobRecord {
   id: string
@@ -153,13 +154,29 @@ export function useEventStream() {
   const logs = ref<string[]>([])
   const uptimeMs = ref(0)
 
+  // True once the service has answered 401: the operator must enter the token
+  // configured in `server.api_token` (T1-1).
+  const authRequired = ref(false)
+  const apiToken = ref(getApiToken())
+  onAuthRequired((required) => {
+    authRequired.value = required
+  })
+
+  function applyApiToken(value: string) {
+    setApiToken(value)
+    apiToken.value = getApiToken()
+    // The SSE stream carries the token in its URL, so it has to be rebuilt.
+    connectSSE()
+    void fetchAll()
+  }
+
   let sseConnection: EventSource | null = null
   let pollInterval: number = 0
   let reconnectDelay = 500
 
   async function apiGet<T = unknown>(path: string): Promise<T | null> {
     try {
-      const r = await fetch('/api' + path)
+      const r = await apiFetch('/api' + path)
       if (!r.ok) return null
       const text = await r.text()
       if (!text || text.trim() === '') {
@@ -179,7 +196,7 @@ export function useEventStream() {
 
   async function apiPost<T = unknown>(path: string): Promise<T | null> {
     try {
-      const r = await fetch('/api' + path, { method: 'POST' })
+      const r = await apiFetch('/api' + path, { method: 'POST' })
       if (!r.ok) return null
       const text = await r.text()
       if (!text || text.trim() === '') {
@@ -224,7 +241,7 @@ export function useEventStream() {
 
   async function apiPut<T = unknown>(path: string, body: unknown): Promise<T | null> {
     try {
-      const r = await fetch('/api' + path, {
+      const r = await apiFetch('/api' + path, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -259,7 +276,7 @@ export function useEventStream() {
   /** Manually re-queue one failed job for immediate reprocessing. */
   async function retryJob(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const r = await fetch('/api/jobs/' + encodeURIComponent(id) + '/retry', {
+      const r = await apiFetch('/api/jobs/' + encodeURIComponent(id) + '/retry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -277,7 +294,7 @@ export function useEventStream() {
   /** Re-queue all currently-failed jobs in one shot. */
   async function retryAllFailed(): Promise<{ submitted: number; source_missing: number; errors: number }> {
     try {
-      const r = await fetch('/api/jobs/retry-failed', { method: 'POST' })
+      const r = await apiFetch('/api/jobs/retry-failed', { method: 'POST' })
       const text = await r.text()
       if (!text) return { submitted: 0, source_missing: 0, errors: 0 }
       const parsed = JSON.parse(text) as { submitted?: number; source_missing?: number; errors?: number }
@@ -335,7 +352,7 @@ export function useEventStream() {
 
   function connectSSE() {
     if (sseConnection) sseConnection.close()
-    sseConnection = new EventSource('/api/events')
+    sseConnection = new EventSource(eventSourceUrl('/api/events'))
 
     sseConnection.addEventListener('progress', (e) => {
       try { handleSSEEvent('progress', JSON.parse(e.data)) } catch { /* ignore parse errors */ }
@@ -383,7 +400,7 @@ export function useEventStream() {
 
   async function cancelJob(id: string): Promise<{ success: boolean; error?: string }> {
     try {
-      const r = await fetch('/api/jobs/' + encodeURIComponent(id) + '/cancel', {
+      const r = await apiFetch('/api/jobs/' + encodeURIComponent(id) + '/cancel', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -447,5 +464,8 @@ export function useEventStream() {
     cancelJob,
     retryAllFailed,
     shortFileName,
+    authRequired,
+    apiToken,
+    applyApiToken,
   }
 }

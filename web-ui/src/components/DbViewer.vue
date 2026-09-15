@@ -532,6 +532,7 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
+import { apiFetch } from '../api/auth'
 
 interface DbOverview {
   total_assets: number
@@ -804,7 +805,7 @@ function nextJobPage() {
 // Data Fetching
 async function fetchOverview() {
   try {
-    const res = await fetch('/api/v2/db/overview')
+    const res = await apiFetch('/api/v2/db/overview')
     if (res.ok) {
       overview.value = await res.json()
     }
@@ -822,7 +823,7 @@ async function fetchAssets() {
       limit: String(assetLimit.value),
       offset: String(assetOffset.value),
     })
-    const res = await fetch(`/api/v2/db/assets?${params}`)
+    const res = await apiFetch(`/api/v2/db/assets?${params}`)
     if (res.ok) {
       assetsPage.value = await res.json()
     }
@@ -842,7 +843,7 @@ async function fetchJobs() {
       limit: String(jobLimit.value),
       offset: String(jobOffset.value),
     })
-    const res = await fetch(`/api/v2/db/jobs?${params}`)
+    const res = await apiFetch(`/api/v2/db/jobs?${params}`)
     if (res.ok) {
       jobsPage.value = await res.json()
     }
@@ -856,7 +857,7 @@ async function fetchJobs() {
 async function fetchFolders() {
   loadingFolders.value = true
   try {
-    const res = await fetch('/api/v2/db/folders')
+    const res = await apiFetch('/api/v2/db/folders')
     if (res.ok) {
       folders.value = await res.json()
     }
@@ -869,7 +870,7 @@ async function fetchFolders() {
 
 async function fetchSchema() {
   try {
-    const res = await fetch('/api/v2/db/schema')
+    const res = await apiFetch('/api/v2/db/schema')
     if (res.ok) {
       schemaTables.value = await res.json()
     }
@@ -880,7 +881,7 @@ async function fetchSchema() {
 
 async function inspectAsset(uuid: string) {
   try {
-    const res = await fetch(`/api/v2/db/assets/${uuid}`)
+    const res = await apiFetch(`/api/v2/db/assets/${uuid}`)
     if (res.ok) {
       inspectingAsset.value = await res.json()
       inspectingJob.value = null
@@ -896,7 +897,7 @@ const regeneratingSidecarUuid = ref<string | null>(null)
 async function regenerateSidecar(uuid: string) {
   regeneratingSidecarUuid.value = uuid
   try {
-    const res = await fetch(`/api/v2/assets/${uuid}/regenerate-sidecar`, { method: 'POST' })
+    const res = await apiFetch(`/api/v2/assets/${uuid}/regenerate-sidecar`, { method: 'POST' })
     if (res.ok) {
       await fetchAssets()
       if (inspectingAsset.value?.summary.uuid === uuid) {
@@ -916,7 +917,7 @@ async function regenerateSidecar(uuid: string) {
 
 async function inspectJob(id: string) {
   try {
-    const res = await fetch(`/api/v2/db/jobs/${id}`)
+    const res = await apiFetch(`/api/v2/db/jobs/${id}`)
     if (res.ok) {
       inspectingJob.value = await res.json()
       inspectingAsset.value = null

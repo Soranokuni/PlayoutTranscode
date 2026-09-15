@@ -18,7 +18,35 @@
     </nav>
 
     <main class="main-content">
-      <div v-if="configStatus === 'loading'" class="loading-splash">
+      <!-- The service requires an API token (server.api_token). Nothing below
+           can load until the operator provides it. -->
+      <div v-if="authRequired" class="tab-panel">
+        <div class="wizard-card">
+          <div class="wizard-header">
+            <h2>API token required</h2>
+          </div>
+          <p class="text-muted" style="margin-bottom:14px">
+            This service is configured with an API token. Paste the value printed by
+            <code>PlayoutTranscode gen-token</code> (also stored in <code>config.toml</code> as
+            <code>server.api_token</code>). It is kept for this browser tab only.
+          </p>
+          <form @submit.prevent="onSubmitToken">
+            <input
+              v-model="tokenInput"
+              type="password"
+              class="input"
+              autocomplete="off"
+              placeholder="API token"
+              style="width:100%;margin-bottom:12px"
+            />
+            <button class="btn btn-primary" type="submit" :disabled="!tokenInput.trim()">
+              Connect
+            </button>
+          </form>
+        </div>
+      </div>
+
+      <div v-else-if="configStatus === 'loading'" class="loading-splash">
         <div class="spinner"></div>
         <span>Loading configuration...</span>
       </div>
@@ -280,7 +308,18 @@ const {
   serviceRunning, downloading, logs, uptimeMs,
   fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
   clearLogs, retryJob, cancelJob, retryAllFailed,
+  authRequired, applyApiToken,
 } = useEventStream()
+
+const tokenInput = ref('')
+
+function onSubmitToken() {
+  const value = tokenInput.value.trim()
+  if (!value) return
+  applyApiToken(value)
+  tokenInput.value = ''
+  void loadAndDecideWizard()
+}
 
 const configStatus = ref<'loading' | 'ready'>('loading')
 const showWizard = ref(false)

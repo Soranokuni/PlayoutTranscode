@@ -171,10 +171,12 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 
 ## Configuration (`config.toml`)
 
-> **Security warning.** The HTTP API is unauthenticated. `bind_address` must be a
-> loopback address (`127.0.0.1`, `::1` or `localhost`); any other value is
-> rejected at startup, because binding to `0.0.0.0` would expose every mutating
-> route — including config changes and library purge — to the whole LAN.
+> **Security warning.** `bind_address` must be a loopback address (`127.0.0.1`,
+> `::1` or `localhost`) unless `server.api_token` is set. Binding to `0.0.0.0`
+> without a token would expose every mutating route — config changes, library
+> purge, service stop — to the whole LAN, so it is rejected at startup.
+> Generate a token with `PlayoutTranscode gen-token`; it is required on every
+> `/api/**` call except `GET /api/health` and `GET /api/v2/health`.
 
 ```toml
 [server]
@@ -183,6 +185,10 @@ bind_address = "127.0.0.1"
 # Extra browser origins allowed by CORS. Loopback origins on web_port are
 # always allowed; this is only needed for the Vue dev server.
 allowed_origins = []
+# Shared secret required on every /api/** call except the health endpoints.
+# Generate with `PlayoutTranscode gen-token`. Empty = loopback-only, no auth.
+# A non-loopback bind_address requires this to be set.
+api_token = ""
 
 [paths]
 watch_folder = "D:/Media/Ingest"

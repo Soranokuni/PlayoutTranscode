@@ -3,7 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
-fn default_config_path() -> PathBuf {
+pub fn default_config_path() -> PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
@@ -37,6 +37,14 @@ pub struct ServerConfig {
     /// allowed; everything else is rejected.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Shared secret required on every `/api/**` request except the health
+    /// endpoints. Empty means "loopback-only, no auth", which is only legal
+    /// when `bind_address` is a loopback address.
+    ///
+    /// Generate one with `PlayoutTranscode gen-token`. Never logged, and
+    /// reported by `GET /api/config` as `api_token_set` only.
+    #[serde(default)]
+    pub api_token: String,
 }
 
 /// `true` when `s` is an FFmpeg size/rate literal: digits, optional decimal
@@ -175,6 +183,86 @@ fn validate_media_root(label: &str, raw: &str) -> Result<String, String> {
         }
     }
     Ok(norm)
+}
+
+/// Minimum length for `server.api_token`. `gen_api_token` produces 43
+/// characters (32 random bytes, URL-safe base64, unpadded).
+pub const MIN_API_TOKEN_LEN: usize = 32;
+
+/// Generate a fresh API token: 32 bytes of OS randomness, URL-safe base64.
+///
+/// Hand-rolled rather than pulling in `rand`/`base64` for one call site; the
+/// entropy comes from the OS via `getrandom`-equivalent APIs.
+pub fn gen_api_token() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let bytes = os_random_bytes(32);
+    let mut out = String::with_capacity(43);
+    // Standard base64url over 32 bytes = 42 full chars + 1 from the remainder.
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        let chars = [(n >> 18) & 63, (n >> 12) & 63, (n >> 6) & 63, n & 63];
+        let keep = match chunk.len() {
+            1 => 2,
+            2 => 3,
+            _ => 4,
+        };
+        for &c in chars.iter().take(keep) {
+            out.push(ALPHABET[c as usize] as char);
+        }
+    }
+    out
+}
+
+fn os_random_bytes(n: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; n];
+    #[cfg(windows)]
+    {
+        // BCryptGenRandom via the documented "use system preferred RNG" flag.
+        extern "system" {
+            fn BCryptGenRandom(
+                h_algorithm: *mut std::ffi::c_void,
+                pb_buffer: *mut u8,
+                cb_buffer: u32,
+                dw_flags: u32,
+            ) -> i32;
+        }
+        const BCRYPT_USE_SYSTEM_PREFERRED_RNG: u32 = 0x0000_0002;
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        assert!(status >= 0, "BCryptGenRandom failed with status {}", status);
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut buf))
+            .expect("read /dev/urandom");
+    }
+    buf
+}
+
+/// Constant-time comparison, so a wrong token cannot be recovered by timing
+/// how far the comparison got.
+pub fn tokens_match(expected: &str, provided: &str) -> bool {
+    let a = expected.as_bytes();
+    let b = provided.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
 }
 
 /// True when `bind_address` only accepts connections from this machine.
@@ -651,6 +739,7 @@ impl Default for AppConfig {
                 web_port: 4353,
                 bind_address: "127.0.0.1".into(),
                 allowed_origins: Vec::new(),
+                api_token: String::new(),
             },
             encoding: EncodingConfig {
                 preset: "medium".into(),
@@ -866,14 +955,28 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        // The HTTP API is unauthenticated (F-02). Binding it anywhere other
-        // than loopback exposes every mutating route to the LAN, so refuse.
-        // T1-1 will relax this once `server.api_token` exists.
-        if !is_loopback_bind(&self.server.bind_address) {
+        // Binding anywhere other than loopback exposes every mutating route to
+        // the LAN, so it is allowed only with an API token set (F-02).
+        if !is_loopback_bind(&self.server.bind_address) && self.server.api_token.trim().is_empty() {
             return Err(format!(
-                "server.bind_address '{}' is not a loopback address; the API is unauthenticated,                  so only 127.0.0.1, ::1 or localhost are allowed",
+                "server.bind_address '{}' is not a loopback address; a non-loopback bind                  requires server.api_token (run `PlayoutTranscode gen-token`)",
                 self.server.bind_address
             ));
+        }
+        if !self.server.api_token.is_empty() {
+            let t = self.server.api_token.trim();
+            if t.len() < MIN_API_TOKEN_LEN {
+                return Err(format!(
+                    "server.api_token must be at least {} characters",
+                    MIN_API_TOKEN_LEN
+                ));
+            }
+            if t.len() != self.server.api_token.len() {
+                return Err("server.api_token must not have leading or trailing whitespace".into());
+            }
+            if !t.chars().all(|c| c.is_ascii_graphic()) {
+                return Err("server.api_token must be printable ASCII with no spaces".into());
+            }
         }
         for origin in &self.server.allowed_origins {
             if !origin.starts_with("http://") && !origin.starts_with("https://") {
@@ -1669,6 +1772,96 @@ mod validation_tests {
         assert!(!dir.join("config.toml.tmp").exists());
         let reloaded: AppConfig = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(reloaded.paths.watch_folder, cfg.paths.watch_folder);
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod token_tests {
+    use super::*;
+
+    #[test]
+    fn generated_tokens_are_long_unique_and_url_safe() {
+        let a = gen_api_token();
+        let b = gen_api_token();
+        assert_ne!(a, b, "tokens must not repeat");
+        assert!(
+            a.len() >= MIN_API_TOKEN_LEN,
+            "token too short: {} chars",
+            a.len()
+        );
+        assert!(
+            a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "token must be URL-safe: {}",
+            a
+        );
+    }
+
+    #[test]
+    fn token_comparison_rejects_mismatches() {
+        let t = gen_api_token();
+        assert!(tokens_match(&t, &t));
+        assert!(!tokens_match(&t, ""));
+        assert!(!tokens_match(&t, &t[..t.len() - 1]));
+        let mut wrong = t.clone();
+        wrong.pop();
+        wrong.push(if t.ends_with('A') { 'B' } else { 'A' });
+        assert!(!tokens_match(&t, &wrong), "same length, different content");
+    }
+
+    fn token_config(dir: &Path) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        let watch = dir.join("watch");
+        fs::create_dir_all(&watch).unwrap();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = dir.join("target").to_string_lossy().to_string();
+        cfg
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("pt-tok-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn non_loopback_bind_requires_a_token() {
+        let dir = tmp("bind");
+        let mut cfg = token_config(&dir);
+        cfg.server.bind_address = "0.0.0.0".into();
+        let err = cfg.validate().expect_err("0.0.0.0 without a token");
+        assert!(err.contains("api_token"), "unexpected message: {}", err);
+
+        cfg.server.api_token = gen_api_token();
+        assert!(
+            cfg.validate().is_ok(),
+            "0.0.0.0 with a token must be allowed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn weak_or_malformed_tokens_are_rejected() {
+        let dir = tmp("weak");
+
+        let mut cfg = token_config(&dir);
+        cfg.server.api_token = "short".into();
+        assert!(cfg.validate().is_err(), "too short");
+
+        let mut cfg = token_config(&dir);
+        cfg.server.api_token = format!(" {} ", gen_api_token());
+        assert!(cfg.validate().is_err(), "surrounding whitespace");
+
+        let mut cfg = token_config(&dir);
+        cfg.server.api_token = "a b".repeat(20);
+        assert!(cfg.validate().is_err(), "contains spaces");
+
+        let mut cfg = token_config(&dir);
+        cfg.server.api_token = gen_api_token();
+        assert!(cfg.validate().is_ok());
+
         let _ = fs::remove_dir_all(&dir);
     }
 }
