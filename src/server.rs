@@ -209,6 +209,154 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .with_state(state)
 }
 
+/// `true` when `s` is a canonical, hyphenated UUID.
+///
+/// PlayOut validates ids client-side, but the service had no server-side
+/// guarantee at all: a `{uuid}` path segment was any string (F-08, PlayOut
+/// handoff §3.1). Every `{uuid}`/`{id}` route now rejects anything else with
+/// 422 before touching the database.
+pub fn is_canonical_uuid(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if c != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !c.is_ascii_hexdigit() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Reject a non-canonical id with a 422 that says which field was wrong.
+fn reject_bad_id(kind: &'static str) -> Response {
+    (
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Json(serde_json::json!({ "error": format!("invalid {} id", kind) })),
+    )
+        .into_response()
+}
+
+/// Upper bound on a `tp` compliance string.
+pub const MAX_TP_LEN: usize = 512;
+
+/// `true` when `tp` is an acceptable compliance marker.
+///
+/// PlayOut's `ComplianceModule.vue` writes this and the service stored any
+/// string of any length. This is the provisional grammar from the remediation
+/// plan; `docs/audit-2026-09-15/PLAYOUT-CLIENT-CHANGES.md` §3 asks the PlayOut
+/// team whether `tp` is really an enumeration, in which case this becomes an
+/// allow-list.
+pub fn is_valid_tp(tp: &str) -> bool {
+    if tp.len() > MAX_TP_LEN {
+        return false;
+    }
+    tp.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(
+                c,
+                ' ' | '_' | '-' | '|' | ':' | '[' | ']' | '{' | '}' | '"' | ',' | '.'
+            )
+    })
+}
+
+/// Named colours the UI offers, alongside `#rrggbb`.
+const NAMED_FOLDER_COLORS: &[&str] = &[
+    "default", "red", "orange", "yellow", "green", "teal", "blue", "purple", "pink", "grey",
+    "gray",
+];
+
+/// `true` when `color` is safe to interpolate into a CSS `style` binding.
+///
+/// `DbViewer.vue` renders this value straight into a style attribute, so an
+/// arbitrary string was a CSS-injection sink (F-08).
+pub fn is_valid_folder_color(color: &str) -> bool {
+    if color.is_empty() {
+        return true; // clears the colour
+    }
+    if let Some(hex) = color.strip_prefix('#') {
+        return hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    NAMED_FOLDER_COLORS.contains(&color.to_ascii_lowercase().as_str())
+}
+
+/// `true` when a user-supplied display name is safe to store.
+///
+/// Length is checked by the caller against `db::MAX_DISPLAY_NAME_LEN`; this
+/// rejects control characters, which would corrupt log lines, the sidecar JSON
+/// and PlayOut's own rendering.
+pub fn is_valid_display_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= db::MAX_DISPLAY_NAME_LEN
+        && name == name.trim()
+        && !name.chars().any(|c| c.is_control())
+}
+
+/// Validate a caller-supplied retry `input_path`.
+///
+/// Blocking (`canonicalize`) — call it from `spawn_blocking`. A UNC path is
+/// rejected outright: `exists()` on `\\host\share` makes the service open an
+/// outbound SMB connection and leak an NTLM handshake to an attacker-chosen
+/// host (F-08).
+pub fn validate_retry_input_path(raw: &str, watch_folder: &str) -> Result<std::path::PathBuf, &'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("input_path must not be empty");
+    }
+    if trimmed.starts_with("\\\\") || trimmed.starts_with("//") {
+        return Err("UNC paths are not accepted");
+    }
+    let p = std::path::Path::new(trimmed);
+    if !p.is_absolute() {
+        return Err("input_path must be absolute");
+    }
+    let watch = std::path::Path::new(watch_folder.trim());
+    let (Ok(canon), Ok(canon_watch)) = (p.canonicalize(), watch.canonicalize()) else {
+        return Err("input_path could not be resolved");
+    };
+    if !canon.starts_with(&canon_watch) {
+        return Err("input_path must be inside the watch folder");
+    }
+    Ok(canon)
+}
+
+/// Path extractor that accepts only a canonical UUID.
+///
+/// Used for every `{uuid}` and `{id}` route (job ids are v4 UUIDs too), so an
+/// id can never reach a query as an arbitrary string.
+pub struct AssetId(pub String);
+
+impl<S> axum::extract::FromRequestParts<S> for AssetId
+where
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let Path(raw) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|_| reject_bad_id("asset"))?;
+        if is_canonical_uuid(&raw) {
+            Ok(AssetId(raw))
+        } else {
+            tracing::warn!("rejected non-canonical id on {}", parts.uri.path());
+            Err(reject_bad_id("asset"))
+        }
+    }
+}
+
 /// Paths that stay reachable without a token.
 ///
 /// PlayOut polls health every 5 s and treats it as the liveness signal; the web
@@ -547,7 +695,7 @@ async fn get_profiles_v2() -> impl IntoResponse {
     Json(crate::profiles::get_standard_broadcast_profiles())
 }
 
-async fn get_job_v2(State(state): State<ServerState>, Path(id): Path<String>) -> impl IntoResponse {
+async fn get_job_v2(State(state): State<ServerState>, AssetId(id): AssetId) -> impl IntoResponse {
     if let Some(job) = state.jobs.get(&id) {
         Json(job).into_response()
     } else {
@@ -1176,7 +1324,7 @@ struct RetryJobBody {
 
 async fn post_retry_job(
     State(state): State<ServerState>,
-    Path(id): Path<String>,
+    AssetId(id): AssetId,
     body: Option<Json<RetryJobBody>>,
 ) -> impl IntoResponse {
     let jobs = state.jobs.all_recent();
@@ -1197,17 +1345,34 @@ async fn post_retry_job(
         )
             .into_response();
     }
-    let path = std::path::PathBuf::from(&path_str);
-    if !path.exists() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(
-                serde_json::json!({"error": format!("source file no longer exists: {}", path_str)}),
-            ),
-        )
-            .into_response();
-    }
-    match state.service_handle.submit_retry(path) {
+    // `canonicalize`/`exists` are blocking, and on a UNC path `exists()` opens
+    // an outbound SMB connection that leaks an NTLM handshake to whatever host
+    // the caller named (F-08). Validate off the async runtime, and only accept
+    // a path that really resolves inside the watch folder.
+    let watch_folder = state.config.lock().paths.watch_folder.clone();
+    let validated = match tokio::task::spawn_blocking(move || {
+        validate_retry_input_path(&path_str, &watch_folder)
+    })
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(reason)) => {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({ "error": reason })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!("retry path validation task failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal error"})),
+            )
+                .into_response();
+        }
+    };
+    match state.service_handle.submit_retry(validated) {
         Ok(_) => {
             let _ = state.jobs.transition(
                 &id,
@@ -1229,7 +1394,7 @@ async fn post_retry_job(
 
 async fn post_cancel_job(
     State(state): State<ServerState>,
-    Path(id): Path<String>,
+    AssetId(id): AssetId,
 ) -> impl IntoResponse {
     match state.jobs.request_cancel(&id) {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
@@ -1359,7 +1524,7 @@ async fn list_assets(
 
 async fn get_asset(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
     match db::find_by_uuid(&state.pool, &uuid).await {
         Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
@@ -1381,7 +1546,7 @@ async fn get_asset(
 
 async fn put_trim(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     Json(body): Json<TrimRequest>,
 ) -> impl IntoResponse {
     if body.trim_in_ms < 0 {
@@ -1476,7 +1641,7 @@ async fn put_trim(
 
 async fn put_rating(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     Json(body): Json<RatingRequest>,
 ) -> impl IntoResponse {
     if !db::is_valid_rating(&body.rating) {
@@ -1521,9 +1686,16 @@ async fn put_rating(
 
 async fn put_tp(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     Json(body): Json<TpRequest>,
 ) -> impl IntoResponse {
+    if !is_valid_tp(&body.tp) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid tp"})),
+        )
+            .into_response();
+    }
     match db::set_tp(&state.pool, &uuid, &body.tp).await {
         Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
             Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
@@ -1559,21 +1731,18 @@ async fn put_tp(
 
 async fn post_subclip(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     Json(body): Json<SubclipRequest>,
 ) -> impl IntoResponse {
-    if body.display_name.is_empty() {
+    if !is_valid_display_name(&body.display_name) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "display_name must not be empty"})),
+            Json(serde_json::json!({"error": format!(
+                "display_name must be 1-{} characters, trimmed, with no control characters",
+                db::MAX_DISPLAY_NAME_LEN
+            )})),
         )
             .into_response();
-    }
-    if body.display_name.len() > db::MAX_DISPLAY_NAME_LEN {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": format!("display_name must not exceed {} characters", db::MAX_DISPLAY_NAME_LEN)})),
-        ).into_response();
     }
     if body.trim_in_ms < 0 {
         return (
@@ -1736,7 +1905,7 @@ async fn get_recycle_bin(State(state): State<ServerState>) -> impl IntoResponse 
 
 async fn post_trash_asset(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
     match db::trash_asset(&state.pool, &uuid).await {
         Ok(true) => (
@@ -1794,7 +1963,7 @@ async fn post_trash_folder(
 
 async fn post_restore_asset(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     body: Option<Json<RestoreAssetRequest>>,
 ) -> impl IntoResponse {
     let target = body.and_then(|b| b.target_folder.clone());
@@ -1870,7 +2039,7 @@ async fn post_restore_folder(
 
 async fn delete_purge_asset(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
     let mode = if state
         .config
@@ -1919,7 +2088,7 @@ async fn delete_purge_asset(
 
 async fn post_regenerate_sidecar(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
     match db::find_by_uuid(&state.pool, &uuid).await {
         Ok(Some(asset)) => {
@@ -2131,20 +2300,16 @@ async fn post_auto_purge(
 
 async fn put_rename(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     Json(body): Json<RenameRequest>,
 ) -> impl IntoResponse {
-    if body.display_name.is_empty() {
+    if !is_valid_display_name(&body.display_name) {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": "display_name must not be empty"})),
-        )
-            .into_response();
-    }
-    if body.display_name.len() > db::MAX_DISPLAY_NAME_LEN {
-        return (
-            StatusCode::UNPROCESSABLE_ENTITY,
-            Json(serde_json::json!({"error": format!("display_name must not exceed {} characters", db::MAX_DISPLAY_NAME_LEN)})),
+            Json(serde_json::json!({"error": format!(
+                "display_name must be 1-{} characters, trimmed, with no control characters",
+                db::MAX_DISPLAY_NAME_LEN
+            )})),
         )
             .into_response();
     }
@@ -2183,7 +2348,7 @@ async fn put_rename(
 
 async fn put_move(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
     Json(body): Json<MoveRequest>,
 ) -> impl IntoResponse {
     if !db::is_valid_virtual_folder(&body.virtual_folder) {
@@ -2240,6 +2405,13 @@ async fn post_batch(
 
     let mut seen = HashSet::with_capacity(body.len());
     for uuid in &body {
+        if !is_canonical_uuid(uuid) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "invalid asset id in batch request"})),
+            )
+                .into_response();
+        }
         if !seen.insert(uuid) {
             return (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -2305,6 +2477,13 @@ async fn put_folder_color(
         )
             .into_response();
     }
+    if !is_valid_folder_color(&body.color) {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({"error": "invalid color; expected #rrggbb or a named colour"})),
+        )
+            .into_response();
+    }
     match db::set_folder_color(&state.pool, &body.virtual_folder, &body.color).await {
         Ok(_) => StatusCode::OK.into_response(),
         Err(e) => {
@@ -2358,7 +2537,7 @@ async fn get_db_assets_handler(
 
 async fn get_db_asset_detail_handler(
     State(state): State<ServerState>,
-    Path(uuid): Path<String>,
+    AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
     match db::get_db_asset_detail(&state.pool, &uuid).await {
         Ok(Some(detail)) => (StatusCode::OK, Json(detail)).into_response(),
@@ -2402,7 +2581,7 @@ async fn get_db_jobs_handler(
 
 async fn get_db_job_detail_handler(
     State(state): State<ServerState>,
-    Path(id): Path<String>,
+    AssetId(id): AssetId,
 ) -> impl IntoResponse {
     match db::get_db_job_detail(&state.pool, &id).await {
         Ok(Some(detail)) => (StatusCode::OK, Json(detail)).into_response(),
@@ -2499,6 +2678,120 @@ mod tests {
     fn safe_join_rejects_absurd_depth() {
         let deep = "/a".repeat(64);
         assert!(safe_join(root(), &deep).is_none());
+    }
+
+    #[test]
+    fn canonical_uuid_grammar() {
+        assert!(is_canonical_uuid("3f2504e0-4f89-41d3-9a0c-0305e82c3301"));
+        assert!(is_canonical_uuid("3F2504E0-4F89-41D3-9A0C-0305E82C3301"));
+
+        for bad in [
+            "",
+            "3f2504e0-4f89-41d3-9a0c-0305e82c330",
+            "3f2504e0-4f89-41d3-9a0c-0305e82c33011",
+            "3f2504e04f8941d39a0c0305e82c3301",
+            "3f2504e0-4f89-41d3-9a0c-0305e82c330g",
+            "3f2504e0_4f89_41d3_9a0c_0305e82c3301",
+            "../../config.toml",
+            "' OR 1=1 --",
+        ] {
+            assert!(!is_canonical_uuid(bad), "{:?} must be rejected", bad);
+        }
+    }
+
+    #[test]
+    fn tp_grammar() {
+        for ok in ["", "TP", "SHOW", "TP|18:00", "A,B.C [x] {y} \"z\"", "x"] {
+            assert!(is_valid_tp(ok), "{:?} should be valid", ok);
+        }
+        for bad in [
+            "<script>",
+            "drop\u{0}table",
+            "new\nline",
+            "tab\there",
+            "emoji \u{1F600}",
+        ] {
+            assert!(!is_valid_tp(bad), "{:?} should be invalid", bad);
+        }
+        assert!(is_valid_tp(&"x".repeat(MAX_TP_LEN)));
+        assert!(!is_valid_tp(&"x".repeat(MAX_TP_LEN + 1)));
+    }
+
+    #[test]
+    fn folder_color_grammar() {
+        for ok in ["", "#a1b2c3", "#FFFFFF", "blue", "GREY"] {
+            assert!(is_valid_folder_color(ok), "{:?} should be valid", ok);
+        }
+        for bad in [
+            "#12345",
+            "#1234567",
+            "#gggggg",
+            "rgb(1,2,3)",
+            "red; background: url(http://evil.example/x)",
+            "expression(alert(1))",
+            "chartreuse",
+        ] {
+            assert!(!is_valid_folder_color(bad), "{:?} should be invalid", bad);
+        }
+    }
+
+    #[test]
+    fn display_name_grammar() {
+        assert!(is_valid_display_name("Promo 2026 - Final"));
+        assert!(is_valid_display_name("Ειδήσεις 20:00"));
+        assert!(is_valid_display_name(&"x".repeat(db::MAX_DISPLAY_NAME_LEN)));
+
+        for bad in [
+            "",
+            " leading",
+            "trailing ",
+            "line\nbreak",
+            "bell\u{7}",
+        ] {
+            assert!(!is_valid_display_name(bad), "{:?} should be invalid", bad);
+        }
+        assert!(!is_valid_display_name(&"x".repeat(db::MAX_DISPLAY_NAME_LEN + 1)));
+    }
+
+    #[test]
+    fn retry_input_path_rules() {
+        let dir = std::env::temp_dir().join(format!("pt-retry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let watch = dir.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+        let inside = watch.join("clip.mp4");
+        std::fs::write(&inside, b"x").unwrap();
+        let outside = dir.join("elsewhere.mp4");
+        std::fs::write(&outside, b"x").unwrap();
+
+        let watch_str = watch.to_string_lossy().to_string();
+
+        assert!(validate_retry_input_path(&inside.to_string_lossy(), &watch_str).is_ok());
+
+        // A UNC path must be refused before anything touches the filesystem:
+        // `exists()` on one leaks an NTLM handshake to the named host.
+        assert_eq!(
+            validate_retry_input_path("\\\\evil.example\\share\\x.mp4", &watch_str),
+            Err("UNC paths are not accepted")
+        );
+        assert_eq!(
+            validate_retry_input_path("//evil.example/share/x.mp4", &watch_str),
+            Err("UNC paths are not accepted")
+        );
+        assert_eq!(
+            validate_retry_input_path("relative/clip.mp4", &watch_str),
+            Err("input_path must be absolute")
+        );
+        assert_eq!(
+            validate_retry_input_path("", &watch_str),
+            Err("input_path must not be empty")
+        );
+        assert_eq!(
+            validate_retry_input_path(&outside.to_string_lossy(), &watch_str),
+            Err("input_path must be inside the watch folder")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn patch_test_config(tag: &str) -> (AppConfig, std::path::PathBuf) {
