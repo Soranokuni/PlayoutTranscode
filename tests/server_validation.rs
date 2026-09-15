@@ -228,3 +228,52 @@ async fn retry_rejects_unc_and_out_of_watch_paths() {
         "unknown job is rejected before the path is touched"
     );
 }
+
+/// T1-4 / F-09: PlayOut writes error bodies verbatim into its diagnostics log,
+/// so no response body may contain a filesystem path or an OS error string.
+#[tokio::test]
+async fn error_bodies_never_contain_filesystem_paths() {
+    let s = spawn_test_server().await;
+
+    // An asset whose current_path points at a file that does not exist.
+    let uuid = "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d";
+    let missing = s.watch_dir.join("gone.mp4");
+    playout_transcode::db::insert_processing(
+        &s.pool,
+        uuid,
+        1234,
+        &missing.to_string_lossy(),
+        "Gone",
+    )
+    .await
+    .expect("insert");
+
+    let r = s
+        .post_json(&format!("/api/assets/{}/regenerate-sidecar", uuid), json!({}))
+        .await;
+    assert_eq!(r.status(), 404);
+    let body = r.text().await.expect("body");
+    assert_eq!(body, r#"{"error":"mezzanine_missing"}"#);
+
+    // Belt and braces: no drive letter, no separator, no temp dir name.
+    for needle in [":\\", ":/", "/tmp", "Temp", "pt-it-"] {
+        assert!(
+            !body.contains(needle),
+            "error body leaked {:?}: {}",
+            needle,
+            body
+        );
+    }
+
+    // The config-save failure path is code-only, not path-bearing.
+    let r = s
+        .put_json("/api/config", json!({ "encoding": { "tune": "bogus" } }))
+        .await;
+    assert_eq!(r.status(), 422);
+    let body = r.text().await.expect("body");
+    assert!(
+        !body.contains("config.toml"),
+        "validation error leaked the config path: {}",
+        body
+    );
+}

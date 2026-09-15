@@ -786,23 +786,34 @@ pub fn validate_purge_path(
         return Err("Cannot purge root directory".to_string());
     }
 
+    // Fail closed. Both the "inside target" and "not inside watch" checks used
+    // to run only when *both* sides canonicalized, so an empty or temporarily
+    // unreachable `target_folder` skipped them entirely and `remove_file`
+    // proceeded on whatever `current_path` held — which for `processing` and
+    // `error` rows is the source file in the watch folder (F-19).
+    let Some(target) = managed_target_dir else {
+        return Err("target directory not verified".to_string());
+    };
+    let Ok(can_target) = target.canonicalize() else {
+        return Err("target directory could not be resolved".to_string());
+    };
+    let Ok(can_path) = path.canonicalize() else {
+        return Err("path could not be resolved".to_string());
+    };
+    if !can_path.starts_with(&can_target) {
+        return Err("Path is outside managed target directory root".to_string());
+    }
+
     if let Some(watch) = watch_dir {
-        if let (Ok(can_path), Ok(can_watch)) = (path.canonicalize(), watch.canonicalize()) {
-            if can_path.starts_with(&can_watch) {
-                return Err("Refusing to purge source media in watch folder".to_string());
-            }
+        let Ok(can_watch) = watch.canonicalize() else {
+            return Err("watch directory could not be resolved".to_string());
+        };
+        if can_path.starts_with(&can_watch) {
+            return Err("Refusing to purge source media in watch folder".to_string());
         }
     }
 
-    if let Some(target) = managed_target_dir {
-        if let (Ok(can_path), Ok(can_target)) = (path.canonicalize(), target.canonicalize()) {
-            if !can_path.starts_with(&can_target) {
-                return Err("Path is outside managed target directory root".to_string());
-            }
-        }
-    }
-
-    Ok(path.to_path_buf())
+    Ok(can_path)
 }
 
 /// Purge a single asset with full path validation, reference counting, and physical cleanup.
@@ -839,6 +850,18 @@ pub async fn purge_single_asset_with_context(
     let should_remove_file = match mode {
         PurgeMode::PreserveReferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
         PurgeMode::DeleteUnreferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
+    };
+    // Only a `ready` row's `current_path` points at a published mezzanine.
+    // For `processing` and `error` rows it is still the *source* file, so the
+    // row goes but the file must not (F-19).
+    let should_remove_file = if should_remove_file && a.status != "ready" {
+        warnings.push(format!(
+            "Physical file cleanup skipped: asset status is '{}', not 'ready'",
+            a.status
+        ));
+        false
+    } else {
+        should_remove_file
     };
 
     if remaining_refs > 0 {
@@ -1073,25 +1096,25 @@ pub async fn auto_purge_expired_with_context(
     })
 }
 
-pub async fn purge_asset_with_mode(
+/// Purge with an explicit managed target directory.
+///
+/// The old `purge_asset_with_mode`/`purge_asset_completely` wrappers passed
+/// `None` for both directories, which is precisely the fail-open condition
+/// F-19 describes. They are gone; every caller must name the target directory
+/// it is willing to delete inside, exactly as the HTTP handler does.
+pub async fn purge_asset_in_target(
     pool: &SqlitePool,
     uuid: &str,
     mode: PurgeMode,
+    managed_target_dir: &Path,
 ) -> Result<PurgeOutcome, sqlx::Error> {
-    let res = purge_single_asset_with_context(pool, uuid, mode, None, None).await?;
+    let res =
+        purge_single_asset_with_context(pool, uuid, mode, Some(managed_target_dir), None).await?;
     Ok(PurgeOutcome {
         rows_deleted: res.rows_deleted,
         file_removed: res.media_removed,
         sidecar_removed: res.sidecar_removed,
     })
-}
-
-#[allow(dead_code)]
-pub async fn purge_asset_completely(
-    pool: &SqlitePool,
-    uuid: &str,
-) -> Result<PurgeOutcome, sqlx::Error> {
-    purge_asset_with_mode(pool, uuid, PurgeMode::PreserveReferencedMezzanine).await
 }
 
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
@@ -2353,7 +2376,7 @@ mod tests {
         assert!(video_path.exists());
         assert!(sidecar_path.exists());
 
-        let outcome = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine)
+        let outcome = purge_asset_in_target(&pool, uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
             .await
             .unwrap();
         assert_eq!(outcome.rows_deleted, 1);
@@ -2428,7 +2451,7 @@ mod tests {
 
         // Purge parent only
         let outcome =
-            purge_asset_with_mode(&pool, parent_uuid, PurgeMode::PreserveReferencedMezzanine)
+            purge_asset_in_target(&pool, parent_uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
                 .await
                 .unwrap();
         assert_eq!(outcome.rows_deleted, 1);
@@ -2453,7 +2476,7 @@ mod tests {
 
         // Now purge subclip (final reference)
         let outcome2 =
-            purge_asset_with_mode(&pool, subclip_uuid, PurgeMode::PreserveReferencedMezzanine)
+            purge_asset_in_target(&pool, subclip_uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
                 .await
                 .unwrap();
         assert_eq!(outcome2.rows_deleted, 1);
@@ -2523,7 +2546,7 @@ mod tests {
             3
         );
 
-        let out = purge_asset_with_mode(&pool, sub1, PurgeMode::PreserveReferencedMezzanine)
+        let out = purge_asset_in_target(&pool, sub1, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
             .await
             .unwrap();
         assert_eq!(out.rows_deleted, 1);
@@ -2551,7 +2574,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = purge_asset_with_mode(&pool, uuid, PurgeMode::PreserveReferencedMezzanine)
+        let out = purge_asset_in_target(&pool, uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
             .await
             .unwrap();
         assert_eq!(out.rows_deleted, 1);
@@ -2898,6 +2921,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_purge_is_fail_closed_without_a_verified_target() {
+        let (_pool, temp_dir) = setup_test_pool().await;
+        let media_file = temp_dir.join("mezzanine.mp4");
+        std::fs::File::create(&media_file).unwrap();
+
+        // F-19: with no managed target directory the old code skipped both
+        // location checks and deleted whatever `current_path` held.
+        assert!(validate_purge_path(&media_file.to_string_lossy(), None, None).is_err());
+
+        // An unresolvable target directory must also fail closed, not fall
+        // through — a target folder on a temporarily unreachable share is the
+        // realistic version of this.
+        assert!(validate_purge_path(
+            &media_file.to_string_lossy(),
+            Some(&temp_dir.join("not-mounted")),
+            None,
+        )
+        .is_err());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_purge_of_error_row_keeps_the_source_file() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        // For a `processing`/`error` row, `current_path` is still the SOURCE
+        // file in the watch folder. The row must go; the file must not.
+        let source = temp_dir.join("source_clip.mp4");
+        std::fs::File::create(&source).unwrap();
+
+        let uuid = "error-row-uuid";
+        insert_processing(&pool, uuid, 4242, &source.to_string_lossy(), "Source")
+            .await
+            .unwrap();
+        mark_error(&pool, uuid).await.unwrap();
+
+        let result = purge_single_asset_with_context(
+            &pool,
+            uuid,
+            PurgeMode::PreserveReferencedMezzanine,
+            Some(&temp_dir),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.rows_deleted, 1, "the row is still removed");
+        assert!(!result.media_removed, "the source file must be retained");
+        assert!(
+            source.exists(),
+            "purging a failed asset must never delete its source media"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| w.contains("not 'ready'")),
+            "the operator must be told why cleanup was skipped: {:?}",
+            result.warnings
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
     async fn test_purge_single_asset_with_real_files_and_sidecar() {
         let (pool, temp_dir) = setup_test_pool().await;
         let media_file = temp_dir.join("mezzanine_video.mp4");
@@ -2909,6 +2997,25 @@ mod tests {
         insert_processing(&pool, uuid, 8888, &media_file.to_string_lossy(), "Mezzanine")
             .await
             .unwrap();
+        // Only a `ready` row's current_path points at a published mezzanine;
+        // T1-7 refuses to delete files for any other status.
+        mark_ready(
+            &pool,
+            uuid,
+            &media_file.to_string_lossy(),
+            10000,
+            true,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &[],
+            "[]",
+        )
+        .await
+        .unwrap();
 
         // Purge asset
         let result = purge_single_asset_with_context(

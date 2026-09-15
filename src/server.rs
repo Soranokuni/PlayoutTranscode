@@ -2099,35 +2099,56 @@ async fn post_regenerate_sidecar(
                 )
                     .into_response();
             }
-            let media_path = std::path::Path::new(&asset.current_path);
-            if !media_path.exists() {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "Mezzanine file not found on disk",
-                        "path": asset.current_path
-                    })),
-                )
-                    .into_response();
-            }
-            match crate::identity::build_sidecar_from_db_asset(&asset) {
-                Ok(path) => {
+            // `exists()` and the sidecar write both block; PlayOut writes
+            // error bodies verbatim into its diagnostics log, so internal
+            // paths and OS error strings stay in `tracing` (F-07, F-09).
+            let asset_for_task = asset.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let media_path = std::path::Path::new(&asset_for_task.current_path);
+                if !media_path.exists() {
+                    return Err(None);
+                }
+                crate::identity::build_sidecar_from_db_asset(&asset_for_task).map_err(Some)
+            })
+            .await;
+
+            match outcome {
+                Ok(Ok(path)) => {
                     tracing::info!("Regenerated sidecar for asset '{}': {}", uuid, path.display());
                     (
                         StatusCode::OK,
                         Json(serde_json::json!({
                             "ok": true,
                             "uuid": uuid,
-                            "sidecar_path": path.to_string_lossy(),
                         })),
                     )
                         .into_response()
                 }
-                Err(e) => {
+                Ok(Err(None)) => {
+                    tracing::warn!(
+                        "Sidecar regen for '{}': mezzanine missing at {}",
+                        uuid,
+                        asset.current_path
+                    );
+                    (
+                        StatusCode::NOT_FOUND,
+                        Json(serde_json::json!({"error": "mezzanine_missing"})),
+                    )
+                        .into_response()
+                }
+                Ok(Err(Some(e))) => {
                     tracing::error!("Failed to rebuild sidecar for '{}': {}", uuid, e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": format!("Failed to write sidecar: {}", e)})),
+                        Json(serde_json::json!({"error": "sidecar_write_failed"})),
+                    )
+                        .into_response()
+                }
+                Err(e) => {
+                    tracing::error!("Sidecar regen task failed for '{}': {}", uuid, e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "internal_error"})),
                     )
                         .into_response()
                 }
