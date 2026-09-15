@@ -49,8 +49,6 @@
         <button v-if="!running" class="btn btn-primary" style="padding:4px 14px;font-size:12px" @click="$emit('start')">Start</button>
         <button v-else class="btn btn-danger" style="padding:4px 14px;font-size:12px" @click="$emit('stop')">Stop</button>
       </div>
-      <button class="btn" style="font-size:12px" @click="$emit('install')">Install Svc</button>
-      <button class="btn" style="font-size:12px" @click="$emit('uninstall')">Uninstall</button>
     </div>
   </header>
 </template>
@@ -71,8 +69,6 @@ defineEmits<{
   start: []
   stop: []
   download: []
-  install: []
-  uninstall: []
 }>()
 
 function toolShortVer(v: string) {

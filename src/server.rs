@@ -74,8 +74,9 @@ pub async fn run_server(
         .route("/download/status", get(get_download_status))
         .route("/logs", get(get_logs))
         .route("/diagnostics", get(get_diagnostics))
-        .route("/service/install", post(post_install_service))
-        .route("/service/uninstall", post(post_uninstall_service))
+        // Removed in T0-5; 410 for one release (see removed_service_endpoint).
+        .route("/service/install", post(removed_service_endpoint))
+        .route("/service/uninstall", post(removed_service_endpoint))
         .route("/assets", get(list_assets))
         .route("/assets/{uuid}", get(get_asset))
         .route("/assets/{uuid}/trim", put(put_trim))
@@ -974,6 +975,12 @@ async fn post_stop_service(State(state): State<ServerState>) -> Json<serde_json:
     Json(serde_json::json!({ "success": true }))
 }
 
+/// Starts the FFmpeg download worker.
+///
+/// This writes executables into `<exe_dir>/bin` that the service later runs, so
+/// it must never be reachable from off-box. It is protected today by the
+/// loopback `Host` guard plus the loopback-only bind rule (T0-2); T1-1 adds the
+/// API token on top, and T1-2 pins the download itself.
 async fn post_download_ffmpeg(State(state): State<ServerState>) -> Json<serde_json::Value> {
     let started = crate::service_handle::trigger_download(&state.service_handle);
     Json(serde_json::json!({ "success": started }))
@@ -1107,68 +1114,24 @@ async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoRes
     }))
 }
 
-async fn post_install_service(State(_state): State<ServerState>) -> Json<serde_json::Value> {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("PlayoutTranscode.exe"));
-    let exe_path = exe.to_string_lossy().replace('\'', "''");
-    let config_path = exe
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("config.toml")
-        .to_string_lossy()
-        .replace('\'', "''");
-
-    let ps_script = format!(
-        "$a = @('create','PlayoutTranscode','binPath= \"{}\" run --config \"{}\"','start= auto','DisplayName= PlayoutTranscode Media Service'); Start-Process sc.exe -ArgumentList $a -Verb RunAs -Wait",
-        exe_path, config_path
-    );
-
-    let output = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", &ps_script])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let desc_script = "$a = @('description','PlayoutTranscode','Automated broadcast media transcoding service'); Start-Process sc.exe -ArgumentList $a -Verb RunAs -Wait";
-            let _ = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", desc_script])
-                .output();
-            let start_script = "$a = @('start','PlayoutTranscode'); Start-Process sc.exe -ArgumentList $a -Verb RunAs -Wait";
-            let _ = std::process::Command::new("powershell")
-                .args(["-NoProfile", "-Command", start_script])
-                .output();
-            Json(serde_json::json!({ "success": true, "message": "Installed as Windows Service" }))
-        }
-        Ok(o) => Json(
-            serde_json::json!({ "success": false, "error": String::from_utf8_lossy(&o.stderr) }),
-        ),
-        Err(e) => Json(
-            serde_json::json!({ "success": false, "error": format!("powershell error: {}", e) }),
-        ),
-    }
-}
-
-async fn post_uninstall_service(State(_state): State<ServerState>) -> Json<serde_json::Value> {
-    let stop_script = "$a = @('stop','PlayoutTranscode'); Start-Process sc.exe -ArgumentList $a -Verb RunAs -Wait";
-    let _ = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", stop_script])
-        .output();
-
-    let del_script = "$a = @('delete','PlayoutTranscode'); Start-Process sc.exe -ArgumentList $a -Verb RunAs -Wait";
-    let o = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-Command", del_script])
-        .output();
-    match o {
-        Ok(o) if o.status.success() => {
-            Json(serde_json::json!({ "success": true, "message": "Uninstalled" }))
-        }
-        Ok(o) => Json(
-            serde_json::json!({ "success": false, "error": String::from_utf8_lossy(&o.stderr) }),
-        ),
-        Err(e) => Json(
-            serde_json::json!({ "success": false, "error": format!("powershell error: {}", e) }),
-        ),
-    }
+/// `POST /api/service/install` and `/uninstall` used to spawn
+/// `powershell ... Start-Process sc.exe -Verb RunAs`, popping a UAC prompt on
+/// the console session and, if approved, registering a LocalSystem service
+/// whose binPath pointed at whatever directory the exe happened to live in.
+/// Unauthenticated and reachable cross-site (F-02), that was a
+/// social-engineering privilege-escalation path (F-04).
+///
+/// Service registration belongs to the installer. These stubs stay for one
+/// release so an old cached UI gets a clear message instead of a bare 404.
+async fn removed_service_endpoint() -> Response {
+    (
+        StatusCode::GONE,
+        Json(serde_json::json!({
+            "success": false,
+            "error": "removed; use installer",
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2370,6 +2333,18 @@ mod tests {
     fn safe_join_rejects_absurd_depth() {
         let deep = "/a".repeat(64);
         assert!(safe_join(root(), &deep).is_none());
+    }
+
+    #[tokio::test]
+    async fn removed_service_endpoints_return_410() {
+        let resp = removed_service_endpoint().await;
+        assert_eq!(resp.status(), StatusCode::GONE);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["success"], serde_json::json!(false));
+        assert_eq!(json["error"], serde_json::json!("removed; use installer"));
     }
 
     #[test]
