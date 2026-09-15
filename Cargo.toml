@@ -28,7 +28,8 @@ notify = { version = "7", features = ["macos_kqueue"] }
 walkdir = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tower-http = { version = "0.6", features = ["fs", "cors"] }
+tower = { version = "0.5", features = ["limit", "util"] }
+tower-http = { version = "0.6", features = ["fs", "cors", "timeout", "limit", "trace"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
 zip = "2"

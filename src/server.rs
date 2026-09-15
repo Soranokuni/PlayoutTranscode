@@ -30,6 +30,10 @@ pub struct ServerState {
     pub web_ui_dir: Arc<std::path::PathBuf>,
     pub pool: Arc<SqlitePool>,
     pub started_at: std::time::Instant,
+    /// Expensive, rarely-changing values recomputed on a timer rather than per
+    /// request (F-06, F-07).
+    toolchain_cache: Arc<Cached<ToolchainStatus>>,
+    db_check_cache: Arc<Cached<String>>,
 }
 
 /// Everything `build_router` and `run_server` need, so the argument list stays
@@ -43,11 +47,7 @@ pub struct ServerDeps {
     pub pool: Arc<SqlitePool>,
 }
 
-pub async fn run_server(
-    port: u16,
-    bind_address: &str,
-    deps: ServerDeps,
-) -> Result<(), String> {
+pub async fn run_server(port: u16, bind_address: &str, deps: ServerDeps) -> Result<(), String> {
     let addr = format!("{}:{}", bind_address, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -56,10 +56,30 @@ pub async fn run_server(
     tracing::info!("PlayoutTranscode web UI listening on http://{}", addr);
 
     let app = build_router(port, bind_address, deps);
+    // Ctrl-C used to drop the process with in-flight DB writes and the SQLite
+    // pool mid-write (F-30). Stop accepting, let open requests finish.
     axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
         .await
         .map_err(|e| format!("Server error: {}", e))
 }
+
+async fn shutdown_signal() {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => tracing::info!("Shutdown signal received; draining HTTP requests"),
+        Err(e) => tracing::error!("Failed to install Ctrl-C handler: {}", e),
+    }
+}
+
+/// Requests may not run longer than this, except SSE which streams forever.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Maximum requests in flight. The service shares a host with playout, so an
+/// unbounded queue of expensive reads is a real availability risk (F-10).
+const MAX_CONCURRENT_REQUESTS: usize = 64;
+
+/// Explicit JSON body cap, rather than relying on axum's implicit 2 MiB.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// Build the whole application router.
 ///
@@ -77,14 +97,20 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         web_ui_dir,
         pool,
     } = deps;
+    let state_toolchain = Arc::new(toolchain_status);
     let state = ServerState {
         jobs: jobs.clone(),
         config: Arc::new(Mutex::new(config)),
-        toolchain_status: Arc::new(toolchain_status),
+        toolchain_status: state_toolchain.clone(),
         service_handle,
         web_ui_dir: Arc::new(web_ui_dir),
         pool,
         started_at: std::time::Instant::now(),
+        toolchain_cache: Arc::new(Cached::seeded(
+            TOOLCHAIN_CACHE_TTL,
+            (*state_toolchain).clone(),
+        )),
+        db_check_cache: Arc::new(Cached::new(DB_CHECK_TTL)),
     };
 
     let api = Router::new()
@@ -99,7 +125,6 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/jobs/retry-failed", post(post_retry_all_failed))
         .route("/config", get(get_config).put(put_config))
         .route("/toolchain", get(get_toolchain_status))
-        .route("/events", get(sse_events))
         .route("/stats", get(get_stats))
         .route("/watchfolder", get(get_watchfolder))
         .route("/service/status", get(get_service_status))
@@ -165,7 +190,6 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/recycle-bin", get(get_recycle_bin))
         .route("/recycle-bin/purge", delete(delete_empty_recycle_bin))
         .route("/recycle-bin/auto-purge", post(post_auto_purge))
-        .route("/events", get(sse_events))
         .route("/metrics", get(get_metrics_v2))
         .route("/diagnostics", get(get_diagnostics))
         .route("/db/overview", get(get_db_overview_handler))
@@ -193,11 +217,25 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         tracing::info!("API token required on /api/** (health endpoints exempt)");
     }
 
-    // Layers run outermost-last, so the Host guard sees a request first, then
-    // CORS, then the token check, then the route.
-    Router::new()
+    // `/api/events` is a long-lived SSE stream, so it is mounted here rather
+    // than inside the nested routers, to sit outside the request timeout — a 30 s cap would cut every client's stream.
+    let events = Router::new()
+        .route("/api/events", get(sse_events))
+        .route("/api/v2/events", get(sse_events));
+
+    let timed = Router::new()
         .nest("/api/v2", api_v2)
         .nest("/api", api)
+        .layer(tower_http::timeout::TimeoutLayer::with_status_code(
+            StatusCode::GATEWAY_TIMEOUT,
+            REQUEST_TIMEOUT,
+        ));
+
+    // Layers run outermost-last, so a request is seen by: concurrency limit,
+    // tracing, Host guard, CORS, token, confirmation, then the route.
+    Router::new()
+        .merge(events)
+        .merge(timed)
         .fallback(serve_spa)
         .layer(axum::middleware::from_fn(require_confirmation))
         .layer(axum::middleware::from_fn(move |req, next| {
@@ -207,6 +245,11 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .layer(axum::middleware::from_fn(move |req, next| {
             host_guard(loopback_only, port, req, next)
         }))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(tower::limit::ConcurrencyLimitLayer::new(
+            MAX_CONCURRENT_REQUESTS,
+        ))
         .with_state(state)
 }
 
@@ -355,6 +398,136 @@ where
             tracing::warn!("rejected non-canonical id on {}", parts.uri.path());
             Err(reject_bad_id("asset"))
         }
+    }
+}
+
+/// How long a cached `ToolchainStatus` is served before being recomputed.
+const TOOLCHAIN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a cached database health result is served.
+const DB_CHECK_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// A value recomputed at most once per TTL.
+pub struct Cached<T> {
+    inner: tokio::sync::Mutex<Option<(std::time::Instant, T)>>,
+    ttl: std::time::Duration,
+}
+
+impl<T: Clone> Cached<T> {
+    pub fn new(ttl: std::time::Duration) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(None),
+            ttl,
+        }
+    }
+
+    /// Start warm, with a value computed during startup.
+    pub fn seeded(ttl: std::time::Duration, value: T) -> Self {
+        Self {
+            inner: tokio::sync::Mutex::new(Some((std::time::Instant::now(), value))),
+            ttl,
+        }
+    }
+
+    /// Return whatever is cached without ever recomputing, even if stale.
+    ///
+    /// For `/api/health`, which PlayOut polls every 5 s and treats as the
+    /// liveness signal: it must stay O(1) and side-effect free (handoff §3.5),
+    /// so it never triggers a refresh.
+    pub async fn peek(&self) -> Option<T> {
+        self.inner.lock().await.as_ref().map(|(_, v)| v.clone())
+    }
+
+    /// Return the cached value, recomputing it via `refresh` when stale.
+    ///
+    /// `refresh` runs under the lock, so a burst of concurrent requests
+    /// produces one recomputation, not one per request.
+    pub async fn get_or_refresh<F, Fut>(&self, refresh: F) -> T
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = T>,
+    {
+        let mut slot = self.inner.lock().await;
+        if let Some((at, value)) = slot.as_ref() {
+            if at.elapsed() < self.ttl {
+                return value.clone();
+            }
+        }
+        let value = refresh().await;
+        *slot = Some((std::time::Instant::now(), value.clone()));
+        value
+    }
+
+    /// Drop the cached value so the next read recomputes.
+    pub async fn invalidate(&self) {
+        *self.inner.lock().await = None;
+    }
+}
+
+/// Recompute the toolchain status off the async runtime.
+///
+/// `audit_toolchain` spawns `ffmpeg -version` and `ffprobe -version` and hashes
+/// both binaries, so it is doubly unsuitable for an async handler (F-07) and
+/// far too expensive to run per request: the bundled UI polls `/api/toolchain`
+/// every 2 s, which was two process spawns per second per open tab (F-06).
+async fn refresh_toolchain_status() -> ToolchainStatus {
+    match tokio::task::spawn_blocking(|| crate::bootstrap::audit_toolchain().1).await {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::error!("toolchain audit task failed: {}", e);
+            ToolchainStatus {
+                ffmpeg_found: false,
+                ffprobe_found: false,
+                ffmpeg_version: None,
+                ffprobe_version: None,
+                bundled: false,
+                bin_dir: String::new(),
+                ffmpeg_sha256: None,
+                ffprobe_sha256: None,
+                ffmpeg_path: None,
+            }
+        }
+    }
+}
+
+impl ServerState {
+    /// Toolchain status, recomputed at most once per minute.
+    pub async fn toolchain(&self) -> ToolchainStatus {
+        self.toolchain_cache
+            .get_or_refresh(refresh_toolchain_status)
+            .await
+    }
+
+    /// Whether the toolchain is usable, from the cache only.
+    ///
+    /// Never recomputes: `/api/health` must stay cheap. The cache is seeded at
+    /// startup and refreshed by `/api/toolchain` (which the UI polls) and
+    /// after a successful download, so this is fresh in practice.
+    pub async fn toolchain_ready(&self) -> bool {
+        match self.toolchain_cache.peek().await {
+            Some(s) => s.ffmpeg_found && s.ffprobe_found,
+            None => self.toolchain_status.ffmpeg_found && self.toolchain_status.ffprobe_found,
+        }
+    }
+
+    /// Database health, recomputed at most once per ten minutes.
+    ///
+    /// `PRAGMA integrity_check` walks the entire database; `quick_check` does
+    /// the structural checks only, which is what a diagnostics endpoint needs
+    /// and is orders of magnitude cheaper on a large registry (F-06).
+    pub async fn db_health(&self) -> String {
+        let pool = self.pool.clone();
+        self.db_check_cache
+            .get_or_refresh(|| async move {
+                sqlx::query_scalar::<_, String>("PRAGMA quick_check(1)")
+                    .fetch_one(&*pool)
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::error!("database quick_check failed: {}", e);
+                        "error".to_string()
+                    })
+            })
+            .await
     }
 }
 
@@ -753,11 +926,12 @@ async fn serve_spa(uri: Uri, State(state): State<ServerState>) -> Response {
 
 async fn health(State(state): State<ServerState>) -> Json<serde_json::Value> {
     let uptime_ms = state.started_at.elapsed().as_millis() as u64;
+    let toolchain_ready = state.toolchain_ready().await;
     Json(serde_json::json!({
         "status": "ok",
         "service": "PlayoutTranscode",
         "version": env!("CARGO_PKG_VERSION"),
-        "toolchain_ready": state.toolchain_status.ffmpeg_found && state.toolchain_status.ffprobe_found,
+        "toolchain_ready": toolchain_ready,
         "service_running": state.service_handle.is_running(),
         "uptime_ms": uptime_ms,
     }))
@@ -765,12 +939,13 @@ async fn health(State(state): State<ServerState>) -> Json<serde_json::Value> {
 
 async fn health_v2(State(state): State<ServerState>) -> impl IntoResponse {
     let uptime_secs = state.started_at.elapsed().as_secs();
+    let toolchain_ready = state.toolchain_ready().await;
     Json(serde_json::json!({
         "status": "ok",
         "service": "PlayoutTranscode",
         "api_version": "2.0.0",
         "version": env!("CARGO_PKG_VERSION"),
-        "toolchain_ready": state.toolchain_status.ffmpeg_found && state.toolchain_status.ffprobe_found,
+        "toolchain_ready": toolchain_ready,
         "service_running": state.service_handle.is_running(),
         "uptime_secs": uptime_secs,
     }))
@@ -823,15 +998,11 @@ async fn get_metrics_v2(State(state): State<ServerState>) -> impl IntoResponse {
 }
 
 async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse {
-    let (_, tool_status) = crate::bootstrap::audit_toolchain();
+    let tool_status = state.toolchain().await;
     let config = state.config.lock().clone();
     let uptime_secs = state.started_at.elapsed().as_secs();
     let all_jobs = state.jobs.all();
-
-    let db_ok = sqlx::query_scalar::<_, String>("PRAGMA integrity_check")
-        .fetch_one(&*state.pool)
-        .await
-        .unwrap_or_else(|e| format!("error: {}", e));
+    let db_ok = state.db_health().await;
 
     Json(serde_json::json!({
         "service": {
@@ -1253,9 +1424,8 @@ async fn put_config(
     Json(serde_json::json!({"success": true})).into_response()
 }
 
-async fn get_toolchain_status(State(_state): State<ServerState>) -> Json<ToolchainStatus> {
-    let (_, status) = crate::bootstrap::audit_toolchain();
-    Json(status)
+async fn get_toolchain_status(State(state): State<ServerState>) -> Json<ToolchainStatus> {
+    Json(state.toolchain().await)
 }
 
 #[derive(Deserialize)]
@@ -1348,12 +1518,17 @@ async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json
         );
     }
 
-    let tools = match crate::bootstrap::ensure_toolchain() {
-        Ok(t) => t,
-        Err(e) => {
+    // `ensure_toolchain` spawns processes and hashes binaries (F-07).
+    let tools = match tokio::task::spawn_blocking(crate::bootstrap::ensure_toolchain).await {
+        Ok(Ok(t)) => t,
+        Ok(Err(e)) => {
             return Json(
                 serde_json::json!({ "success": false, "error": format!("FFmpeg toolchain: {}", e) }),
             )
+        }
+        Err(e) => {
+            tracing::error!("toolchain check task failed: {}", e);
+            return Json(serde_json::json!({ "success": false, "error": "internal_error" }));
         }
     };
 
@@ -1493,12 +1668,32 @@ async fn post_cancel_job(
 
 async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoResponse {
     let failed = state.jobs.failed();
+    // One `exists()` per failed job, on a possibly slow network share, would
+    // block a Tokio worker for as long as the whole sweep takes (F-07).
+    let paths: Vec<std::path::PathBuf> =
+        failed.iter().map(|j| j.input_path.clone().into()).collect();
+    let present: Vec<bool> = match tokio::task::spawn_blocking(move || {
+        paths.iter().map(|p| p.exists()).collect::<Vec<bool>>()
+    })
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("bulk retry stat task failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "internal_error"})),
+            )
+                .into_response();
+        }
+    };
+
     let mut submitted = 0usize;
     let mut missing = 0usize;
     let mut errors = 0usize;
-    for job in &failed {
+    for (i, job) in failed.iter().enumerate() {
         let path = std::path::PathBuf::from(&job.input_path);
-        if !path.exists() {
+        if !present.get(i).copied().unwrap_or(false) {
             missing += 1;
             continue;
         }
@@ -1528,6 +1723,7 @@ async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoRes
         "source_missing": missing,
         "errors": errors,
     }))
+    .into_response()
 }
 
 /// `POST /api/service/install` and `/uninstall` used to spawn
