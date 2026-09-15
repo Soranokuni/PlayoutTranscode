@@ -155,6 +155,17 @@ pub fn start_processing_loop(
         return Err("Service already running".into());
     }
 
+    // Creating the target folder used to be a side effect of
+    // `AppConfig::validate()`, which meant an unauthenticated `PUT /api/config`
+    // could create arbitrary directories (F-03). It belongs here, where the
+    // operator has actually asked the service to run.
+    if let Err(e) = std::fs::create_dir_all(&config.paths.target_folder) {
+        return Err(format!(
+            "Cannot create target folder '{}': {}",
+            config.paths.target_folder, e
+        ));
+    }
+
     let (cmd_tx, cmd_rx) = mpsc::channel::<ServiceCmd>(1);
     *handle.cmd_tx.lock() = Some(cmd_tx);
     *handle.running.lock() = true;
