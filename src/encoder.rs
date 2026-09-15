@@ -7,7 +7,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, LazyLock};
-use std::sync::{Arc, Mutex};
+
 
 static TIME_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
@@ -90,7 +90,8 @@ pub fn transcode_file(
     output_path: &Path,
     metadata_uuid: &str,
     progress_tx: mpsc::Sender<EncodeProgress>,
-    active_pids: Option<Arc<Mutex<Vec<u32>>>>,
+    job_id: &str,
+    active_pids: Option<crate::service_handle::ActivePids>,
     audio_policy: &crate::config::AudioPolicy,
     measured_loudness: Option<&crate::probe::MeasuredLoudness>,
 ) -> EncodeResult {
@@ -155,8 +156,8 @@ pub fn transcode_file(
 
     let pid = child.id();
     if let Some(ref pids) = active_pids {
-        if let Ok(mut list) = pids.lock() {
-            list.push(pid);
+        if let Ok(mut map) = pids.lock() {
+            map.insert(job_id.to_string(), pid);
         }
     }
 
@@ -276,8 +277,8 @@ pub fn transcode_file(
         Ok(s) => s,
         Err(e) => {
             if let Some(ref pids) = active_pids {
-                if let Ok(mut list) = pids.lock() {
-                    list.retain(|&x| x != pid);
+                if let Ok(mut map) = pids.lock() {
+                    map.retain(|_, &mut v| v != pid);
                 }
             }
             return EncodeResult {
@@ -291,8 +292,8 @@ pub fn transcode_file(
     };
 
     if let Some(ref pids) = active_pids {
-        if let Ok(mut list) = pids.lock() {
-            list.retain(|&x| x != pid);
+        if let Ok(mut map) = pids.lock() {
+            map.retain(|_, &mut v| v != pid);
         }
     }
 
