@@ -1,5 +1,12 @@
 import { ref, onMounted, onUnmounted } from 'vue'
-import { apiFetch, eventSourceUrl, onAuthRequired, setApiToken, getApiToken } from '../api/auth'
+import {
+  apiFetch,
+  apiFetchDestructive,
+  eventSourceUrl,
+  onAuthRequired,
+  setApiToken,
+  getApiToken,
+} from '../api/auth'
 
 export interface JobRecord {
   id: string
@@ -194,9 +201,10 @@ export function useEventStream() {
     }
   }
 
-  async function apiPost<T = unknown>(path: string): Promise<T | null> {
+  async function apiPost<T = unknown>(path: string, destructive = false): Promise<T | null> {
     try {
-      const r = await apiFetch('/api' + path, { method: 'POST' })
+      const send = destructive ? apiFetchDestructive : apiFetch
+      const r = await send('/api' + path, { method: 'POST' })
       if (!r.ok) return null
       const text = await r.text()
       if (!text || text.trim() === '') {
@@ -239,9 +247,14 @@ export function useEventStream() {
     if (w) watchfolder.value = w
   }
 
-  async function apiPut<T = unknown>(path: string, body: unknown): Promise<T | null> {
+  async function apiPut<T = unknown>(
+    path: string,
+    body: unknown,
+    destructive = false,
+  ): Promise<T | null> {
     try {
-      const r = await apiFetch('/api' + path, {
+      const send = destructive ? apiFetchDestructive : apiFetch
+      const r = await send('/api' + path, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
@@ -264,7 +277,8 @@ export function useEventStream() {
   }
 
   async function putConfig(body: Partial<ConfigPayload>) {
-    await apiPut('/config', body)
+    // PUT /config requires X-Confirm-Destructive (T1-5).
+    await apiPut('/config', body, true)
     await fetchConfig()
   }
   async function fetchConfig() {
@@ -294,7 +308,7 @@ export function useEventStream() {
   /** Re-queue all currently-failed jobs in one shot. */
   async function retryAllFailed(): Promise<{ submitted: number; source_missing: number; errors: number }> {
     try {
-      const r = await apiFetch('/api/jobs/retry-failed', { method: 'POST' })
+      const r = await apiFetchDestructive('/api/jobs/retry-failed', { method: 'POST' })
       const text = await r.text()
       if (!text) return { submitted: 0, source_missing: 0, errors: 0 }
       const parsed = JSON.parse(text) as { submitted?: number; source_missing?: number; errors?: number }
@@ -388,7 +402,7 @@ export function useEventStream() {
   }
 
   async function stopService() {
-    await apiPost('/service/stop')
+    await apiPost('/service/stop', true)
     serviceRunning.value = false
   }
 

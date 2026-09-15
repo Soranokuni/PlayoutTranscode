@@ -199,6 +199,7 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .nest("/api/v2", api_v2)
         .nest("/api", api)
         .fallback(serve_spa)
+        .layer(axum::middleware::from_fn(require_confirmation))
         .layer(axum::middleware::from_fn(move |req, next| {
             require_token(api_token.clone(), req, next)
         }))
@@ -355,6 +356,90 @@ where
             Err(reject_bad_id("asset"))
         }
     }
+}
+
+/// Routes that destroy data or stop ingest, and so require an explicit
+/// confirmation header.
+///
+/// PlayOut already prompts the operator natively before each of these; the
+/// header makes that prompt a protocol requirement rather than a client-side
+/// convention, so a stray or replayed request cannot empty the library
+/// (PlayOut handoff §3.7).
+fn is_destructive(method: &axum::http::Method, path: &str) -> bool {
+    // Strip the API prefix so v1 and v2 are handled by one table.
+    let p = path
+        .strip_prefix("/api/v2")
+        .or_else(|| path.strip_prefix("/api"))
+        .unwrap_or(path);
+
+    match *method {
+        axum::http::Method::DELETE => {
+            p == "/folders/purge"
+                || p == "/recycle-bin/purge"
+                || (p.starts_with("/assets/") && p.ends_with("/purge"))
+        }
+        axum::http::Method::POST => {
+            matches!(
+                p,
+                "/recycle-bin/auto-purge"
+                    | "/folders/trash"
+                    | "/jobs/retry-failed"
+                    | "/service/stop"
+            )
+        }
+        axum::http::Method::PUT => p == "/config" || p == "/folders/trash",
+        _ => false,
+    }
+}
+
+/// Header value that arms a destructive operation.
+const CONFIRM_HEADER: &str = "x-confirm-destructive";
+
+async fn require_confirmation(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = req.uri().path().to_string();
+    if !is_destructive(req.method(), &path) {
+        return next.run(req).await;
+    }
+
+    let confirmed = req
+        .headers()
+        .get(CONFIRM_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().eq_ignore_ascii_case("yes"))
+        .unwrap_or(false);
+    if !confirmed {
+        return (
+            StatusCode::PRECONDITION_REQUIRED,
+            [(header::CONTENT_TYPE, "application/json")],
+            br#"{"error":"confirmation_required"}"#.to_vec(),
+        )
+            .into_response();
+    }
+
+    let method = req.method().clone();
+    let remote = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let response = next.run(req).await;
+
+    // One structured line per destructive operation, on a dedicated target so
+    // T2-3 can route it to its own sink and the UI log bridge can surface it.
+    tracing::warn!(
+        target: "audit",
+        op = %method,
+        path = %path,
+        remote_addr = %remote,
+        status = response.status().as_u16(),
+        "destructive operation"
+    );
+
+    response
 }
 
 /// Paths that stay reachable without a token.
@@ -2699,6 +2784,47 @@ mod tests {
     fn safe_join_rejects_absurd_depth() {
         let deep = "/a".repeat(64);
         assert!(safe_join(root(), &deep).is_none());
+    }
+
+    #[test]
+    fn destructive_route_table() {
+        use axum::http::Method;
+
+        let destructive = [
+            (Method::DELETE, "/api/folders/purge"),
+            (Method::DELETE, "/api/recycle-bin/purge"),
+            (Method::DELETE, "/api/assets/3f2504e0-4f89-41d3-9a0c-0305e82c3301/purge"),
+            (Method::POST, "/api/recycle-bin/auto-purge"),
+            (Method::POST, "/api/folders/trash"),
+            (Method::POST, "/api/jobs/retry-failed"),
+            (Method::POST, "/api/service/stop"),
+            (Method::PUT, "/api/config"),
+            (Method::PUT, "/api/folders/trash"),
+            // v2 resolves through the same table.
+            (Method::DELETE, "/api/v2/folders/purge"),
+            (Method::PUT, "/api/v2/config"),
+        ];
+        for (m, p) in destructive {
+            assert!(is_destructive(&m, p), "{} {} should be destructive", m, p);
+        }
+
+        let safe = [
+            (Method::GET, "/api/config"),
+            (Method::GET, "/api/health"),
+            (Method::GET, "/api/recycle-bin"),
+            (Method::POST, "/api/service/start"),
+            (Method::POST, "/api/folders/restore"),
+            (Method::POST, "/api/assets/3f2504e0-4f89-41d3-9a0c-0305e82c3301/trash"),
+            (Method::POST, "/api/assets/3f2504e0-4f89-41d3-9a0c-0305e82c3301/restore"),
+            (Method::PUT, "/api/assets/3f2504e0-4f89-41d3-9a0c-0305e82c3301/rename"),
+            (Method::DELETE, "/api/assets/3f2504e0-4f89-41d3-9a0c-0305e82c3301"),
+            // A path that merely mentions purge is not a purge route.
+            (Method::GET, "/api/db/assets?search=purge"),
+            (Method::POST, "/purge"),
+        ];
+        for (m, p) in safe {
+            assert!(!is_destructive(&m, p), "{} {} should not be destructive", m, p);
+        }
     }
 
     #[test]

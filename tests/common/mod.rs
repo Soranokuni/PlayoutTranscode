@@ -192,6 +192,49 @@ impl TestServer {
             .unwrap_or_else(|e| panic!("GET {} returned non-JSON ({}): {}", path, e, body))
     }
 
+    /// Send a request carrying `X-Confirm-Destructive: yes`.
+    ///
+    /// Destructive routes answer 428 without it (T1-5), so tests that exercise
+    /// what those routes *do* must arm them the same way the UI and PlayOut do.
+    pub async fn confirmed(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        self.client
+            .request(method, self.url(path))
+            .header("X-Confirm-Destructive", "yes")
+            .json(&body)
+            .send()
+            .await
+            .expect("confirmed request failed")
+    }
+
+    pub async fn post_json_confirmed(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        self.confirmed(reqwest::Method::POST, path, body).await
+    }
+
+    pub async fn put_json_confirmed(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        self.confirmed(reqwest::Method::PUT, path, body).await
+    }
+
+    pub async fn delete_json_confirmed(
+        &self,
+        path: &str,
+        body: serde_json::Value,
+    ) -> reqwest::Response {
+        self.confirmed(reqwest::Method::DELETE, path, body).await
+    }
+
     pub async fn post_json(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
         self.client
             .post(self.url(path))
