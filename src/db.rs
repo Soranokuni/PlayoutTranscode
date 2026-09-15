@@ -1096,12 +1096,31 @@ pub async fn purge_asset_completely(
 
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
 
+/// Upper bound on a rating payload, including the broadcast-metadata tail.
+pub const MAX_RATING_LEN: usize = 4096;
+
 pub fn is_valid_rating(rating: &str) -> bool {
-    let base = if let Some((first, _)) = rating.split_once('|') {
-        first
-    } else {
-        rating
+    // The tail after the first `|` used to be an unbounded, unchecked payload
+    // that was stored verbatim and handed back to PlayOut (F-08).
+    if rating.len() > MAX_RATING_LEN {
+        return false;
+    }
+    if rating.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    let (base, tail) = match rating.split_once('|') {
+        Some((first, rest)) => (first, Some(rest)),
+        None => (rating, None),
     };
+    // A structured tail must be well-formed JSON; anything else is free text.
+    if let Some(tail) = tail {
+        let t = tail.trim();
+        if (t.starts_with('[') || t.starts_with('{'))
+            && serde_json::from_str::<serde_json::Value>(t).is_err()
+        {
+            return false;
+        }
+    }
     let trimmed = base.trim().trim_end_matches('+').to_ascii_uppercase();
     VALID_RATINGS.contains(&trimmed.as_str()) || trimmed == "NONE" || trimmed.is_empty()
 }
@@ -3039,3 +3058,31 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod rating_tests {
+    use super::*;
+
+    #[test]
+    fn rating_payload_is_bounded() {
+        assert!(is_valid_rating("K"));
+        assert!(is_valid_rating("12+"));
+        assert!(is_valid_rating(""));
+        assert!(is_valid_rating("NONE"));
+
+        // Broadcast metadata tail: free text is fine, and a tail that claims
+        // to be JSON must actually parse.
+        assert!(is_valid_rating("K|some free text"));
+        assert!(is_valid_rating(r#"K|["a","b"]"#));
+        assert!(is_valid_rating(r#"K|{"violence":true}"#));
+        assert!(!is_valid_rating(r#"K|[{"broken": }"#));
+        assert!(!is_valid_rating("K|{unclosed"));
+
+        // The tail used to be unbounded (F-08).
+        assert!(is_valid_rating(&format!("K|{}", "x".repeat(MAX_RATING_LEN - 2))));
+        assert!(!is_valid_rating(&format!("K|{}", "x".repeat(MAX_RATING_LEN))));
+
+        assert!(!is_valid_rating("K|line\nbreak"));
+        assert!(!is_valid_rating("NOT-A-RATING"));
+    }
+}
