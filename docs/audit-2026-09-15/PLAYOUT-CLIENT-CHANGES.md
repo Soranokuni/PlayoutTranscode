@@ -73,14 +73,15 @@ installation left on the default (loopback, no token) is unaffected.
 
 ---
 
-## 2. Confirmation header on destructive operations — **not yet shipped**
+## 2. Confirmation header on destructive operations — **required**
 
-**Status in PlayoutTranscode:** planned (T1-5). This section is advance notice
-so it can be scheduled; the header is not enforced yet.
+**Status in PlayoutTranscode:** shipped (T1-5).
 
-Destructive routes will require `X-Confirm-Destructive: yes` and will otherwise
-return `428 Precondition Required` with `{"error":"confirmation_required"}`.
-The affected calls are:
+Destructive routes require `X-Confirm-Destructive: yes` and otherwise return
+`428 Precondition Required` with `{"error":"confirmation_required"}`. The
+header value is matched case-insensitively and surrounding whitespace is
+ignored; any other value (including `no` or an empty string) does not arm the
+operation. The affected calls are:
 
 - `DELETE /api/assets/{uuid}/purge`
 - `DELETE /api/folders/purge`
@@ -91,26 +92,46 @@ The affected calls are:
 - `PUT /api/config`
 - `POST /api/service/stop`
 
+Both the v1 (`/api/...`) and v2 (`/api/v2/...`) forms of these paths are
+gated.
+
 PlayOut already prompts the operator natively before these, so this is a
-one-line addition per call in `ingestor_api.rs`. Adding the header **now** is
-safe: the service ignores unknown headers today.
+one-line addition per call in `ingestor_api.rs`:
+
+```rust
+req = req.header("X-Confirm-Destructive", "yes");
+```
+
+Each destructive request is also written to the service log on the `audit`
+target with the method, path, caller address and resulting status.
+
+**Order of checks:** authentication runs first. A confirmed request without a
+valid token returns 401, not 428, and is not executed.
+
+### Failure mode if PlayOut does not implement this
+
+Purge, trash, empty-recycle-bin, retry-all, config write and service stop all
+fail with 428 and do nothing. Reads and reversible operations (restore,
+single-asset trash, rename, move, service start) are unaffected.
 
 ---
 
 ## 3. Open question for the PlayOut team: what values does `tp` take?
 
-**Blocking:** T1-3 (server-side validation of `PUT /api/assets/{uuid}/tp`).
+**Status: the provisional rule has shipped** (T1-3). It can still be tightened
+once you answer, and tightening it may reject values PlayOut sends today, so
+please read this.
 
-`tp` is written by PlayOut's `ComplianceModule.vue` and stored verbatim. The
-service currently accepts any string of any length, which means PlayOut can
-read back whatever was written into it by anything else that can reach the API.
-
-We intend to validate it server-side. Until we hear from you, the planned
-provisional rule is:
+`tp` is written by PlayOut's `ComplianceModule.vue`. The service used to accept
+any string of any length; it now enforces:
 
 ```
 ^[A-Za-z0-9 _\-|:\[\]{}",.]{0,512}$
 ```
+
+A value outside that set returns `422 {"error":"invalid tp"}`. Note this
+excludes newlines, tabs, NUL and non-ASCII characters (including Greek), so if
+PlayOut writes any of those the call will now fail.
 
 **Please confirm:**
 
@@ -118,9 +139,30 @@ provisional rule is:
 2. If it is structured (the `|`-delimited form seen in `rating`), what is the
    grammar?
 3. What is the realistic maximum length?
+4. Does it ever carry non-ASCII text?
 
 If it is an enumeration we will validate against the list instead, which is
-strictly better. Reply before T1-3 lands or the provisional regex ships.
+strictly better.
+
+### Related: `rating` is now bounded
+
+`PUT /api/assets/{uuid}/rating` caps the whole value at 4 KiB and rejects
+control characters. The broadcast-metadata tail after the first `|` is still
+free text, **except** that a tail beginning with `[` or `{` must be valid JSON.
+PlayOut already sends JSON there, so this should be a no-op.
+
+### Related: `folder_color` is now an allow-list
+
+`PUT /api/folders/colors` accepts `#rrggbb` or one of: `default`, `red`,
+`orange`, `yellow`, `green`, `teal`, `blue`, `purple`, `pink`, `grey`, `gray`.
+Anything else is 422. This closes a CSS-injection path in the DB viewer.
+
+### Related: asset and job ids are validated server-side
+
+Every `{uuid}`/`{id}` path segment, and every element of the
+`POST /api/assets/batch` body, must be a canonical hyphenated UUID. Anything
+else returns `422 {"error":"invalid asset id"}`. This is the server-side
+guarantee behind PlayOut's client-side validation (handoff §3.1).
 
 ---
 
@@ -134,7 +176,8 @@ behaviour is now enforced server-side.
 | §3.2 treat `folder_path` as untrusted | `folder_path` is validated and `LIKE` wildcards are escaped. `/%` returns 422 instead of matching the whole library. |
 | §3.3 bind / CORS | `bind_address` must be loopback unless a token is set. CORS is a loopback allow-list. A non-loopback `Host` header returns 421. PlayOut's `reqwest` client sends a correct `Host`, so it is unaffected. |
 | §3.5 health endpoint cheap | Unchanged and still side-effect free. |
-| §3.6 error bodies must not leak paths | Partly done: the SPA 404 and the config-save error no longer contain paths. The remaining sites are T1-4. |
+| §3.6 error bodies must not leak paths | Done. No response body carries a filesystem path or OS error string; sidecar-regen failures return `mezzanine_missing` / `sidecar_write_failed`, config-save failures return `config_save_failed`, and the SPA 404 is a bare message. Details go to the service log only. |
+| §3.7 purge has no second factor | Done - see section 2 above. |
 
 ### One behaviour change worth noting
 
@@ -142,6 +185,14 @@ behaviour is now enforced server-side.
 **422** instead of silently restoring the asset to `/`. If PlayOut relied on
 the silent fallback, it must handle the 422 — but sending a valid folder path
 is the correct fix.
+
+### One more, about purge
+
+Purging an asset whose status is not `ready` now deletes the registry row but
+**retains the file on disk**, with a warning in the result. For a `processing`
+or `error` row the stored path is still the *source* file in the watch folder,
+and deleting it was a real data-loss path. If PlayOut showed "media removed"
+based on the row disappearing, read `media_removed` from the response instead.
 
 ---
 

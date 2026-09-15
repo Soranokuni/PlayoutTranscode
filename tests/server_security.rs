@@ -156,12 +156,12 @@ async fn wildcard_folder_paths_are_rejected() {
     let s = spawn_test_server().await;
 
     for path in ["/api/folders/trash", "/api/folders/restore"] {
-        let r = s.post_json(path, json!({ "folder_path": "/%" })).await;
+        let r = s.post_json_confirmed(path, json!({ "folder_path": "/%" })).await;
         assert_eq!(r.status(), 422, "{} must reject /%", path);
     }
 
     let r = s
-        .delete_json("/api/folders/purge", json!({ "folder_path": "/%" }))
+        .delete_json_confirmed("/api/folders/purge", json!({ "folder_path": "/%" }))
         .await;
     assert_eq!(r.status(), 422, "purge must reject /%");
 }
@@ -178,7 +178,7 @@ async fn malformed_folder_paths_are_rejected() {
         json!("/trailing "),
     ] {
         let r = s
-            .post_json("/api/folders/trash", json!({ "folder_path": bad }))
+            .post_json_confirmed("/api/folders/trash", json!({ "folder_path": bad }))
             .await;
         assert_eq!(r.status(), 422, "folder_path {} must be rejected", bad);
     }
@@ -190,7 +190,7 @@ async fn ordinary_folder_paths_are_accepted() {
 
     // No matching assets, but the request itself must be well-formed.
     let r = s
-        .post_json(
+        .post_json_confirmed(
             "/api/folders/trash",
             json!({ "folder_path": "/Shows/Season 1_2026" }),
         )
@@ -207,7 +207,7 @@ async fn invalid_config_patch_is_rejected_and_nothing_changes() {
     let before = s.get_json("/api/config").await;
 
     let r = s
-        .put_json(
+        .put_json_confirmed(
             "/api/config",
             json!({ "encoding": { "tune": "not-a-tune" } }),
         )
@@ -227,7 +227,7 @@ async fn config_patch_pointing_target_inside_watch_is_rejected() {
 
     let nested = s.watch_dir.join("published");
     let r = s
-        .put_json(
+        .put_json_confirmed(
             "/api/config",
             json!({ "paths": { "target_folder": nested.to_string_lossy() } }),
         )
@@ -262,7 +262,7 @@ async fn config_patch_pointing_at_a_system_root_is_rejected() {
     };
 
     let r = s
-        .put_json(
+        .put_json_confirmed(
             "/api/config",
             json!({ "paths": { "watch_folder": container } }),
         )
@@ -279,7 +279,7 @@ async fn valid_config_patch_is_applied() {
     let s = spawn_test_server().await;
 
     let r = s
-        .put_json(
+        .put_json_confirmed(
             "/api/config",
             json!({ "encoding": { "preset": "veryfast" }, "ingestion": { "max_concurrency": 3 } }),
         )

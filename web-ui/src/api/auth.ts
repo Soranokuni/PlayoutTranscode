@@ -70,6 +70,20 @@ export async function apiFetch(path: string, init: RequestInit = {}): Promise<Re
 }
 
 /**
+ * `apiFetch` for destructive routes (purge, trash, empty recycle bin, retry
+ * all, config write, service stop). The server answers 428 without this
+ * header, so the caller must have confirmed with the operator first.
+ */
+export async function apiFetchDestructive(
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const headers = new Headers(init.headers ?? {})
+  headers.set('X-Confirm-Destructive', 'yes')
+  return apiFetch(path, { ...init, headers })
+}
+
+/**
  * `EventSource` cannot set headers, so the SSE stream carries the token as a
  * query parameter — the one place the server accepts it that way.
  */

@@ -94,8 +94,10 @@ async fn every_uuid_route_is_guarded() {
         assert_eq!(r.status(), 422, "PUT {} must be 422", path);
     }
 
+    // Destructive routes are gated on the confirmation header first (T1-5), so
+    // arm it to reach the id check underneath.
     let r = s
-        .delete_json(&format!("/api/assets/{}/purge", bad), json!({}))
+        .delete_json_confirmed(&format!("/api/assets/{}/purge", bad), json!({}))
         .await;
     assert_eq!(r.status(), 422);
 }
@@ -267,7 +269,7 @@ async fn error_bodies_never_contain_filesystem_paths() {
 
     // The config-save failure path is code-only, not path-bearing.
     let r = s
-        .put_json("/api/config", json!({ "encoding": { "tune": "bogus" } }))
+        .put_json_confirmed("/api/config", json!({ "encoding": { "tune": "bogus" } }))
         .await;
     assert_eq!(r.status(), 422);
     let body = r.text().await.expect("body");
