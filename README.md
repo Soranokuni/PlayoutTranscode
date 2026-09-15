@@ -215,6 +215,19 @@ preserve_original = false
 [cleanup]
 auto_purge_days = 30
 verified_source_cleanup = false
+
+[toolchain_policy]
+# Absolute paths to the toolchain. Leave unset to search <exe_dir>/bin and then
+# <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately NOT searched: a
+# writable directory earlier in PATH would let a local user supply the
+# ffmpeg.exe this service runs.
+# ffmpeg_path = "C:/PlayoutTranscode/bin/ffmpeg.exe"
+# ffprobe_path = "C:/PlayoutTranscode/bin/ffprobe.exe"
+verify_on_startup = true
+# Expected SHA-256 of the FFmpeg release archive. The in-app download is
+# DISABLED until this is set - an unpinned executable download is not
+# acceptable on a broadcast host. Install manually if you prefer.
+download_sha256 = ""
 ```
 
 ---

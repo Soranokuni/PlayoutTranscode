@@ -130,6 +130,10 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
     profiles::validate_color_constants()
         .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
 
+    // Must happen before any `audit_toolchain()` call so configured paths and
+    // the download digest pin are honoured (T1-2).
+    bootstrap::set_toolchain_policy(app_config.effective_toolchain_policy());
+
     let port = app_config.server.web_port;
     let bind_addr = app_config.server.bind_address.clone();
     let url = format!("http://{}:{}", bind_addr, port);
