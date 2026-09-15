@@ -177,19 +177,136 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/db/folders", get(get_db_folders_handler))
         .route("/db/schema", get(get_db_schema_handler));
 
-    let allowed_origins = allowed_origin_list(port, &state.config.lock().server.allowed_origins);
+    let (allowed_origins, api_token) = {
+        let cfg = state.config.lock();
+        (
+            allowed_origin_list(port, &cfg.server.allowed_origins),
+            Arc::new(cfg.server.api_token.clone()),
+        )
+    };
     let cors = build_cors(&allowed_origins);
     let loopback_only = crate::config::is_loopback_bind(bind_address);
 
+    if api_token.is_empty() {
+        tracing::info!("API token not set; loopback-only mode");
+    } else {
+        tracing::info!("API token required on /api/** (health endpoints exempt)");
+    }
+
+    // Layers run outermost-last, so the Host guard sees a request first, then
+    // CORS, then the token check, then the route.
     Router::new()
         .nest("/api/v2", api_v2)
         .nest("/api", api)
         .fallback(serve_spa)
+        .layer(axum::middleware::from_fn(move |req, next| {
+            require_token(api_token.clone(), req, next)
+        }))
         .layer(cors)
         .layer(axum::middleware::from_fn(move |req, next| {
             host_guard(loopback_only, port, req, next)
         }))
         .with_state(state)
+}
+
+/// Paths that stay reachable without a token.
+///
+/// PlayOut polls health every 5 s and treats it as the liveness signal; the web
+/// UI needs it to show the status light before the operator has typed the
+/// token. Both are cheap and side-effect free, so exempting them costs nothing.
+fn is_auth_exempt(path: &str) -> bool {
+    matches!(path, "/api/health" | "/api/v2/health")
+}
+
+/// Extract a presented token from `X-Api-Token`, `Authorization: Bearer …`, or
+/// a `token=` query parameter.
+///
+/// The query parameter exists only because `EventSource` cannot set headers, so
+/// the SSE stream has no other way to authenticate.
+fn presented_token(headers: &header::HeaderMap, query: Option<&str>) -> Option<String> {
+    if let Some(v) = headers.get("x-api-token").and_then(|v| v.to_str().ok()) {
+        if !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    if let Some(v) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) {
+        if let Some(rest) = v
+            .strip_prefix("Bearer ")
+            .or_else(|| v.strip_prefix("bearer "))
+        {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return Some(rest.to_string());
+            }
+        }
+    }
+    for pair in query.unwrap_or("").split('&') {
+        if let Some(v) = pair.strip_prefix("token=") {
+            if !v.is_empty() {
+                return Some(percent_decode(v));
+            }
+        }
+    }
+    None
+}
+
+/// Minimal percent-decoding for the `token=` query parameter. The token
+/// alphabet is URL-safe base64, so this only has to cope with a client that
+/// encoded it anyway.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                out.push(b);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// Require `server.api_token` on every `/api/**` request except the health
+/// endpoints.
+///
+/// Without this, any LAN host (and, before T0-2, any web page the operator had
+/// open) could drive every mutating route with no credentials at all — config
+/// takeover, library purge, service stop (F-02).
+async fn require_token(
+    expected: Arc<String>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if expected.is_empty() {
+        return next.run(req).await;
+    }
+    let path = req.uri().path();
+    if !path.starts_with("/api/") || is_auth_exempt(path) {
+        return next.run(req).await;
+    }
+
+    let provided = presented_token(req.headers(), req.uri().query());
+    let ok = provided
+        .as_deref()
+        .map(|t| crate::config::tokens_match(&expected, t))
+        .unwrap_or(false);
+    if !ok {
+        // Never log the presented value.
+        tracing::warn!("rejected unauthenticated request to {}", path);
+        return (
+            StatusCode::UNAUTHORIZED,
+            [(header::CONTENT_TYPE, "application/json")],
+            br#"{"error":"unauthorized"}"#.to_vec(),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 /// Browser origins permitted by CORS.
@@ -564,6 +681,9 @@ async fn get_config(State(state): State<ServerState>) -> Json<serde_json::Value>
         "server": {
             "web_port": config.server.web_port,
             "bind_address": config.server.bind_address,
+            "allowed_origins": config.server.allowed_origins,
+            // Never echo the token itself.
+            "api_token_set": !config.server.api_token.is_empty(),
         },
         "encoding": {
             "preset": config.encoding.preset,

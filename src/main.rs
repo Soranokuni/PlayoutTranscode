@@ -29,6 +29,14 @@ enum Commands {
     CheckUpdate,
     #[command(about = "Show current toolchain status")]
     Status,
+    #[command(
+        name = "gen-token",
+        about = "Generate an API token, write it to config.toml, and print it once"
+    )]
+    GenToken {
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -54,6 +62,12 @@ fn main() -> Result<()> {
                 println!("\n{}\n", w);
             }
         }
+        Some(Commands::GenToken { config }) => {
+            if let Err(e) = gen_token(config) {
+                eprintln!("gen-token error: {}", e);
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Status) => {
             let (_, status) = bootstrap::audit_toolchain();
             println!("FFmpeg found: {}", status.ffmpeg_found);
@@ -63,6 +77,35 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Generate a fresh API token, persist it, and print it once.
+///
+/// Printed to stdout and never logged: the operator copies it into PlayOut's
+/// settings and into the web UI, and it is redacted from `GET /api/config`.
+fn gen_token(config_path_override: Option<String>) -> Result<()> {
+    let (mut app_config, config_path) =
+        config::AppConfig::load(config_path_override.as_deref())
+            .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
+
+    let token = config::gen_api_token();
+    app_config.server.api_token = token.clone();
+    app_config
+        .save_to(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to save configuration: {}", e))?;
+
+    println!("
+API token written to {}
+", config_path.display());
+    println!("  {}
+", token);
+    println!("This is the only time it is shown. Set it in:");
+    println!("  - PlayOut  : settings.ingestorApiToken");
+    println!("  - Web UI   : the token prompt on first load");
+    println!("
+Restart the service for it to take effect.
+");
     Ok(())
 }
 
