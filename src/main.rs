@@ -1,17 +1,4 @@
-mod bootstrap;
-mod config;
-mod db;
-mod encoder;
-mod fingerprint;
-mod identity;
-mod jobs;
-mod logging;
-mod probe;
-mod processor;
-mod profiles;
-mod server;
-mod service_handle;
-mod watcher;
+use playout_transcode::{bootstrap, config, db, jobs, logging, profiles, server, service_handle};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -170,12 +157,14 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
         server::run_server(
             port,
             &bind_addr,
-            jq,
-            server_cfg,
-            toolchain_status.clone(),
-            sh,
-            web_ui_dir,
-            server_pool,
+            server::ServerDeps {
+                jobs: jq,
+                config: server_cfg,
+                toolchain_status: toolchain_status.clone(),
+                service_handle: sh,
+                web_ui_dir,
+                pool: server_pool,
+            },
         )
         .await
     });

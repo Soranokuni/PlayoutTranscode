@@ -2,6 +2,8 @@
 // Baseline wire contract integration tests for PlayoutTranscode V2-0.
 // Validates golden JSON contract samples and exercises a live Axum HTTP server endpoint stream.
 
+mod common;
+
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -144,228 +146,119 @@ fn test_golden_watchfolder_contract() {
     assert!(json["max_concurrency"].is_number());
 }
 
+/// Every key present in `sample` must also be present in `actual`, recursively
+/// for objects. Values are not compared — the golden-sample tests above already
+/// pin the contract's values; this pins that the *real* handlers still emit the
+/// contract's shape.
+fn assert_covers_contract(actual: &Value, sample: &Value, path: &str) {
+    match sample {
+        Value::Object(fields) => {
+            let actual_obj = actual.as_object().unwrap_or_else(|| {
+                panic!("{} should be an object, got {}", path, actual)
+            });
+            for (key, sub) in fields {
+                let child = actual_obj
+                    .get(key)
+                    .unwrap_or_else(|| panic!("{}.{} missing from live response", path, key));
+                assert_covers_contract(child, sub, &format!("{}.{}", path, key));
+            }
+        }
+        Value::Array(_) => {
+            assert!(actual.is_array(), "{} should be an array, got {}", path, actual);
+        }
+        _ => {}
+    }
+}
+
 // Live Axum HTTP Server Wire Contract Test
+//
+// These drive the real router, real handlers and real state via the shared
+// harness in tests/common. They used to build stub routers returning the golden
+// JSON verbatim, which proved only that axum can serve a constant (F-31).
 #[tokio::test]
 async fn test_live_axum_wire_contract_endpoints() {
-    use axum::{routing::get, Json, Router};
-
-    let health_sample = read_contract_json("health.example.json");
-    let config_sample = read_contract_json("config.example.json");
-    let stats_sample = read_contract_json("stats.example.json");
-    let watchfolder_sample = read_contract_json("watchfolder.example.json");
-
-    let health_h = health_sample.clone();
-    let config_h = config_sample.clone();
-    let stats_h = stats_sample.clone();
-    let watchfolder_h = watchfolder_sample.clone();
-
-    let api = Router::new()
-        .route("/health", get(move || async move { Json(health_h) }))
-        .route("/config", get(move || async move { Json(config_h) }))
-        .route("/stats", get(move || async move { Json(stats_h) }))
-        .route(
-            "/watchfolder",
-            get(move || async move { Json(watchfolder_h) }),
-        )
-        .route("/assets", get(|| async { Json(serde_json::json!([])) }));
-
-    let app = Router::new().nest("/api", api);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind ephemeral test port");
-    let addr = listener.local_addr().expect("Failed to get local addr");
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{}/api", addr.port());
+    let s = common::spawn_test_server().await;
 
     // 1. GET /api/health
-    let res = client
-        .get(format!("{}/health", base))
-        .send()
-        .await
-        .expect("GET /health failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let health_res: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(health_res["status"], "ok");
-    assert_eq!(health_res["service"], "PlayoutTranscode");
+    let health = s.get_json("/api/health").await;
+    assert_covers_contract(&health, &read_contract_json("health.example.json"), "health");
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["service"], "PlayoutTranscode");
 
     // 2. GET /api/config
-    let res = client
-        .get(format!("{}/config", base))
-        .send()
-        .await
-        .expect("GET /config failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let config_res: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(config_res["server"]["web_port"], 4353);
+    let config = s.get_json("/api/config").await;
+    assert_covers_contract(&config, &read_contract_json("config.example.json"), "config");
+    assert_eq!(config["server"]["web_port"], 4353);
 
     // 3. GET /api/stats
-    let res = client
-        .get(format!("{}/stats", base))
-        .send()
-        .await
-        .expect("GET /stats failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let stats_res: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(stats_res["total"], 47);
+    let stats = s.get_json("/api/stats").await;
+    assert_covers_contract(&stats, &read_contract_json("stats.example.json"), "stats");
+    // A fresh registry is empty, so every counter must be zero and consistent.
+    assert_eq!(stats["total"], 0);
 
     // 4. GET /api/watchfolder
-    let res = client
-        .get(format!("{}/watchfolder", base))
-        .send()
-        .await
-        .expect("GET /watchfolder failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let wf_res: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(wf_res["settle_secs"], 5);
+    let wf = s.get_json("/api/watchfolder").await;
+    assert_covers_contract(
+        &wf,
+        &read_contract_json("watchfolder.example.json"),
+        "watchfolder",
+    );
+    assert_eq!(wf["settle_secs"], 5);
 
     // 5. GET /api/assets
-    let res = client
-        .get(format!("{}/assets", base))
-        .send()
-        .await
-        .expect("GET /assets failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let assets_res: Value = serde_json::from_str(&text).unwrap();
-    assert!(assets_res.is_array());
+    let assets = s.get_json("/api/assets").await;
+    assert!(assets.is_array());
+    assert_eq!(assets.as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
 async fn test_live_axum_v2_wire_contract_endpoints() {
-    use axum::{routing::get, Json, Router};
-
-    let api_v2 = Router::new()
-        .route(
-            "/health",
-            get(|| async {
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "service": "PlayoutTranscode",
-                    "api_version": "2.0.0",
-                    "uptime_secs": 42
-                }))
-            }),
-        )
-        .route(
-            "/profiles",
-            get(|| async {
-                Json(serde_json::json!([
-                    {
-                        "name": "playoutvue-h264-1080p25",
-                        "width": 1920,
-                        "height": 1080,
-                        "fps_num": 25,
-                        "fps_den": 1
-                    }
-                ]))
-            }),
-        )
-        .route(
-            "/metrics",
-            get(|| async {
-                Json(serde_json::json!({
-                    "jobs": {
-                        "pending": 2,
-                        "active": 1,
-                        "completed": 10,
-                        "failed": 0,
-                        "total": 13
-                    },
-                    "system": {
-                        "uptime_secs": 42,
-                        "active_pids": 1,
-                        "service_running": true
-                    }
-                }))
-            }),
-        )
-        .route(
-            "/diagnostics",
-            get(|| async {
-                Json(serde_json::json!({
-                    "service": {
-                        "name": "PlayoutTranscode",
-                        "api_version": "2.0.0"
-                    },
-                    "database": {
-                        "integrity": "ok"
-                    }
-                }))
-            }),
-        );
-
-    let app = Router::new().nest("/api/v2", api_v2);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("Failed to bind ephemeral test port");
-    let addr = listener.local_addr().expect("Failed to get local addr");
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-    let client = reqwest::Client::new();
-    let base = format!("http://127.0.0.1:{}/api/v2", addr.port());
+    let s = common::spawn_test_server().await;
 
     // 1. GET /api/v2/health
-    let res = client
-        .get(format!("{}/health", base))
-        .send()
-        .await
-        .expect("GET /api/v2/health failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let health: Value = serde_json::from_str(&text).unwrap();
+    let health = s.get_json("/api/v2/health").await;
     assert_eq!(health["status"], "ok");
+    assert_eq!(health["service"], "PlayoutTranscode");
     assert_eq!(health["api_version"], "2.0.0");
+    assert!(health["uptime_secs"].is_number());
 
     // 2. GET /api/v2/profiles
-    let res = client
-        .get(format!("{}/profiles", base))
-        .send()
-        .await
-        .expect("GET /api/v2/profiles failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let profiles: Value = serde_json::from_str(&text).unwrap();
+    let profiles = s.get_json("/api/v2/profiles").await;
     assert!(profiles.is_array());
-    assert_eq!(profiles[0]["name"], "playoutvue-h264-1080p25");
+    let names: Vec<&str> = profiles
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(
+        names.contains(&"playoutvue-h264-1080p25"),
+        "profile list must still advertise the 1080p25 mezzanine profile, got {:?}",
+        names
+    );
+    for p in profiles.as_array().unwrap() {
+        assert!(p["width"].is_number(), "profile width: {}", p);
+        assert!(p["height"].is_number(), "profile height: {}", p);
+        assert!(p["fps_num"].is_number(), "profile fps_num: {}", p);
+        assert!(p["fps_den"].is_number(), "profile fps_den: {}", p);
+    }
 
     // 3. GET /api/v2/metrics
-    let res = client
-        .get(format!("{}/metrics", base))
-        .send()
-        .await
-        .expect("GET /api/v2/metrics failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let metrics: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(metrics["jobs"]["total"], 13);
-    assert_eq!(metrics["system"]["service_running"], true);
+    let metrics = s.get_json("/api/v2/metrics").await;
+    for key in ["pending", "active", "completed", "failed", "total"] {
+        assert!(metrics["jobs"][key].is_number(), "metrics.jobs.{}", key);
+    }
+    assert_eq!(metrics["jobs"]["total"], 0);
+    assert!(metrics["system"]["uptime_secs"].is_number());
+    assert!(metrics["system"]["active_pids"].is_number());
+    assert_eq!(metrics["system"]["service_running"], false);
 
     // 4. GET /api/v2/diagnostics
-    let res = client
-        .get(format!("{}/diagnostics", base))
-        .send()
-        .await
-        .expect("GET /api/v2/diagnostics failed");
-    assert_eq!(res.status(), 200);
-    let text = res.text().await.unwrap();
-    let diag: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(diag["database"]["integrity"], "ok");
+    let diag = s.get_json("/api/v2/diagnostics").await;
+    assert_eq!(diag["service"]["name"], "PlayoutTranscode");
+    assert_eq!(diag["service"]["api_version"], "2.0.0");
+    assert_eq!(
+        diag["database"]["integrity"], "ok",
+        "a freshly created registry must pass its integrity check"
+    );
 }

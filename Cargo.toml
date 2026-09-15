@@ -7,6 +7,10 @@ repository = "https://github.com/Soranokuni/PlayoutTranscode"
 license = "MIT"
 description = "PlayoutTranscode - Automated broadcast media ingest, analysis, and mezzanine transcoding engine"
 
+[lib]
+name = "playout_transcode"
+path = "src/lib.rs"
+
 [[bin]]
 name = "PlayoutTranscode"
 path = "src/main.rs"
@@ -34,6 +38,11 @@ anyhow = "1"
 parking_lot = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "derive"] }
 fnv = "1.0"
+
+[dev-dependencies]
+# Async client for the integration harness in tests/common. The main crate only
+# uses reqwest's blocking client (bootstrap's FFmpeg download).
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

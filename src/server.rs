@@ -32,16 +32,51 @@ pub struct ServerState {
     pub started_at: std::time::Instant,
 }
 
+/// Everything `build_router` and `run_server` need, so the argument list stays
+/// one value instead of nine and the test harness can construct it directly.
+pub struct ServerDeps {
+    pub jobs: JobQueue,
+    pub config: AppConfig,
+    pub toolchain_status: ToolchainStatus,
+    pub service_handle: ServiceHandle,
+    pub web_ui_dir: std::path::PathBuf,
+    pub pool: Arc<SqlitePool>,
+}
+
 pub async fn run_server(
     port: u16,
     bind_address: &str,
-    jobs: JobQueue,
-    config: AppConfig,
-    toolchain_status: ToolchainStatus,
-    service_handle: ServiceHandle,
-    web_ui_dir: std::path::PathBuf,
-    pool: Arc<SqlitePool>,
+    deps: ServerDeps,
 ) -> Result<(), String> {
+    let addr = format!("{}:{}", bind_address, port);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
+
+    tracing::info!("PlayoutTranscode web UI listening on http://{}", addr);
+
+    let app = build_router(port, bind_address, deps);
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| format!("Server error: {}", e))
+}
+
+/// Build the whole application router.
+///
+/// Split out of `run_server` so tests can drive the real handlers, real
+/// middleware and real state instead of a hand-built stub router (F-31). `port`
+/// is the port the service is reachable on — it is what the CORS allow-list and
+/// the `Host` guard compare against, so a test serving on an ephemeral port
+/// must pass that same port here.
+pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
+    let ServerDeps {
+        jobs,
+        config,
+        toolchain_status,
+        service_handle,
+        web_ui_dir,
+        pool,
+    } = deps;
     let state = ServerState {
         jobs: jobs.clone(),
         config: Arc::new(Mutex::new(config)),
@@ -146,7 +181,7 @@ pub async fn run_server(
     let cors = build_cors(&allowed_origins);
     let loopback_only = crate::config::is_loopback_bind(bind_address);
 
-    let app = Router::new()
+    Router::new()
         .nest("/api/v2", api_v2)
         .nest("/api", api)
         .fallback(serve_spa)
@@ -154,18 +189,7 @@ pub async fn run_server(
         .layer(axum::middleware::from_fn(move |req, next| {
             host_guard(loopback_only, port, req, next)
         }))
-        .with_state(state);
-
-    let addr = format!("{}:{}", bind_address, port);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .map_err(|e| format!("Failed to bind to {}: {}", addr, e))?;
-
-    tracing::info!("PlayoutTranscode web UI listening on http://{}", addr);
-
-    axum::serve(listener, app)
-        .await
-        .map_err(|e| format!("Server error: {}", e))
+        .with_state(state)
 }
 
 /// Browser origins permitted by CORS.
