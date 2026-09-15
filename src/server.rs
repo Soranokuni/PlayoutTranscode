@@ -160,59 +160,106 @@ pub async fn run_server(
         .map_err(|e| format!("Server error: {}", e))
 }
 
+/// Resolve a request path against the SPA root without ever escaping it.
+///
+/// Axum does not normalise dot segments, and `PathBuf::join` with an absolute
+/// or drive-qualified component *replaces* the base on Windows. Both make the
+/// naive `root.join(uri.path())` an arbitrary file read (F-01). We therefore
+/// rebuild the path from scratch, accepting only plain, non-dot segments.
+fn safe_join(root: &std::path::Path, request_path: &str) -> Option<std::path::PathBuf> {
+    let mut out = root.to_path_buf();
+    let mut segments = 0usize;
+    for raw in request_path.split(['/', '\\']) {
+        if raw.is_empty() || raw == "." {
+            continue;
+        }
+        if raw == ".." {
+            return None;
+        }
+        // Reject anything that is not a single plain file/dir name: drive
+        // letters (`C:`), UNC fragments, NTFS alternate data streams, and any
+        // component the OS would interpret as a root or prefix.
+        if raw.contains(':') || raw.contains('\0') {
+            return None;
+        }
+        let mut comps = std::path::Path::new(raw).components();
+        match (comps.next(), comps.next()) {
+            (Some(std::path::Component::Normal(c)), None) => out.push(c),
+            _ => return None,
+        }
+        segments += 1;
+        if segments > 32 {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+fn content_type_for(path: &std::path::Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("js") | Some("mjs") => "application/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("html") => "text/html; charset=utf-8",
+        Some("json") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("map") => "application/json; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn serve_index(web_ui_dir: &std::path::Path) -> Response {
+    match tokio::fs::read(web_ui_dir.join("index.html")).await {
+        Ok(content) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            content,
+        )
+            .into_response(),
+        Err(_) => {
+            tracing::warn!(
+                "SPA index.html missing under {}; run `cd web-ui && npm install && npm run build`",
+                web_ui_dir.display()
+            );
+            (
+                StatusCode::NOT_FOUND,
+                [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+                b"web UI not built".to_vec(),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn serve_spa(uri: Uri, State(state): State<ServerState>) -> Response {
-    let path = uri.path().trim_start_matches('/');
-    let file_path = if path.is_empty() {
-        state.web_ui_dir.join("index.html")
-    } else {
-        state.web_ui_dir.join(path)
+    let Some(file_path) = safe_join(state.web_ui_dir.as_path(), uri.path()) else {
+        tracing::warn!("rejected SPA path traversal attempt: {}", uri.path());
+        return serve_index(state.web_ui_dir.as_path()).await;
     };
 
+    if file_path == *state.web_ui_dir.as_path() {
+        return serve_index(state.web_ui_dir.as_path()).await;
+    }
+
     match tokio::fs::read(&file_path).await {
-        Ok(content) => {
-            let fname = file_path.to_string_lossy();
-            let ct = if fname.ends_with(".js") || fname.ends_with(".mjs") {
-                "application/javascript; charset=utf-8"
-            } else if fname.ends_with(".css") {
-                "text/css; charset=utf-8"
-            } else if fname.ends_with(".html") {
-                "text/html; charset=utf-8"
-            } else if fname.ends_with(".svg") {
-                "image/svg+xml"
-            } else if fname.ends_with(".png") {
-                "image/png"
-            } else if fname.ends_with(".ico") {
-                "image/x-icon"
-            } else if fname.ends_with(".woff2") {
-                "font/woff2"
-            } else {
-                "application/octet-stream"
-            };
-            (StatusCode::OK, [(header::CONTENT_TYPE, ct)], content).into_response()
-        }
-        Err(_) => {
-            let index_path = state.web_ui_dir.join("index.html");
-            if let Ok(content) = tokio::fs::read(&index_path).await {
-                (
-                    StatusCode::OK,
-                    [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                    content,
-                )
-                    .into_response()
-            } else {
-                (
-                    StatusCode::NOT_FOUND,
-                    [(header::CONTENT_TYPE, "text/plain")],
-                    format!(
-                        "SPA not found at {}. Run: cd web-ui && npm install && npm run build",
-                        state.web_ui_dir.display()
-                    )
-                    .as_bytes()
-                    .to_vec(),
-                )
-                    .into_response()
-            }
-        }
+        Ok(content) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, content_type_for(&file_path))],
+            content,
+        )
+            .into_response(),
+        // Unknown path: hand the SPA router its index, as before.
+        Err(_) => serve_index(state.web_ui_dir.as_path()).await,
     }
 }
 
@@ -2147,5 +2194,74 @@ async fn get_db_schema_handler(State(state): State<ServerState>) -> impl IntoRes
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn root() -> &'static Path {
+        Path::new(if cfg!(windows) {
+            r"C:\app\web-ui\dist"
+        } else {
+            "/app/web-ui/dist"
+        })
+    }
+
+    #[test]
+    fn safe_join_allows_plain_assets() {
+        let p = safe_join(root(), "/assets/index-abc123.js").expect("allowed");
+        assert!(p.starts_with(root()));
+        assert!(p.ends_with("index-abc123.js"));
+    }
+
+    #[test]
+    fn safe_join_rejects_dot_dot_traversal() {
+        assert!(safe_join(root(), "/../config.toml").is_none());
+        assert!(safe_join(root(), "/assets/../../media_assets.db").is_none());
+        assert!(safe_join(root(), "/..%2fconfig.toml").is_some()); // not decoded => literal name
+        assert!(safe_join(root(), "/a/b/../../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn safe_join_rejects_absolute_and_drive_paths() {
+        assert!(safe_join(root(), "/C:/Windows/win.ini").is_none());
+        assert!(safe_join(root(), "/c:\\windows\\win.ini").is_none());
+        assert!(safe_join(root(), "/index.html:stream").is_none());
+    }
+
+    #[test]
+    fn safe_join_normalises_root_and_dot_segments() {
+        assert_eq!(safe_join(root(), "/").unwrap(), root().to_path_buf());
+        assert_eq!(safe_join(root(), "").unwrap(), root().to_path_buf());
+        assert_eq!(
+            safe_join(root(), "/./assets/./app.css").unwrap(),
+            root().join("assets").join("app.css")
+        );
+    }
+
+    #[test]
+    fn safe_join_rejects_absurd_depth() {
+        let deep = "/a".repeat(64);
+        assert!(safe_join(root(), &deep).is_none());
+    }
+
+    #[test]
+    fn content_type_is_derived_from_extension() {
+        assert_eq!(
+            content_type_for(Path::new("x/app.JS")),
+            "application/javascript; charset=utf-8"
+        );
+        assert_eq!(
+            content_type_for(Path::new("x/app.css")),
+            "text/css; charset=utf-8"
+        );
+        assert_eq!(content_type_for(Path::new("x/logo.svg")), "image/svg+xml");
+        assert_eq!(
+            content_type_for(Path::new("x/blob")),
+            "application/octet-stream"
+        );
     }
 }
