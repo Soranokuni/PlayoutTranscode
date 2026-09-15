@@ -4,6 +4,7 @@ use crate::db;
 use crate::jobs::JobQueue;
 use parking_lot::Mutex;
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 use tokio::sync::mpsc;
@@ -21,7 +22,7 @@ pub struct ServiceHandle {
     pub retry_tx: Arc<StdMutex<Option<mpsc::Sender<std::path::PathBuf>>>>,
     pub download_status: Arc<Mutex<Option<String>>>,
     pub log_lines: Arc<Mutex<Vec<String>>>,
-    pub active_pids: Arc<StdMutex<Vec<u32>>>,
+    pub active_pids: ActivePids,
 }
 
 impl ServiceHandle {
@@ -32,7 +33,7 @@ impl ServiceHandle {
             retry_tx: Arc::new(StdMutex::new(None)),
             download_status: Arc::new(Mutex::new(None)),
             log_lines: Arc::new(Mutex::new(Vec::new())),
-            active_pids: Arc::new(StdMutex::new(Vec::new())),
+            active_pids: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -74,12 +75,14 @@ impl ServiceHandle {
         self.active_pids.lock().map(|p| p.len()).unwrap_or(0)
     }
 
+    /// Kill every running FFmpeg. Used on service stop, not on job cancel —
+    /// see [`kill_ffmpeg_for_job`] for the per-job path.
     pub fn kill_active_ffmpeg(&self) {
         let pids: Vec<u32> = {
             match self.active_pids.lock() {
-                Ok(mut list) => {
-                    let snapshot = list.clone();
-                    list.clear();
+                Ok(mut map) => {
+                    let snapshot = map.values().copied().collect();
+                    map.clear();
                     snapshot
                 }
                 Err(e) => {
@@ -95,7 +98,34 @@ impl ServiceHandle {
     }
 }
 
-fn kill_process_tree(pid: u32) {
+/// FFmpeg process ids keyed by the job that owns them.
+///
+/// This used to be a flat `Vec<u32>` shared by the whole service, so a cancel
+/// on one job killed every concurrent encode (F-12).
+pub type ActivePids = Arc<StdMutex<HashMap<String, u32>>>;
+
+/// Kill the FFmpeg belonging to `job_id` and nothing else.
+///
+/// `killer` is injected so the selection logic is unit-testable without
+/// spawning processes.
+pub fn kill_ffmpeg_for_job(pids: &ActivePids, job_id: &str, mut killer: impl FnMut(u32)) -> bool {
+    let pid = match pids.lock() {
+        Ok(mut map) => map.remove(job_id),
+        Err(e) => {
+            tracing::error!("active_pids lock poisoned: {}", e);
+            return false;
+        }
+    };
+    match pid {
+        Some(pid) => {
+            killer(pid);
+            true
+        }
+        None => false,
+    }
+}
+
+pub fn kill_process_tree(pid: u32) {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -264,7 +294,7 @@ fn dispatch_one(
     target: &std::path::Path,
     sem: &Arc<tokio::sync::Semaphore>,
     pool: &SqlitePool,
-    active_pids: &Arc<StdMutex<Vec<u32>>>,
+    active_pids: &ActivePids,
     path: std::path::PathBuf,
     running: &Arc<parking_lot::Mutex<bool>>,
 ) {
@@ -349,4 +379,66 @@ pub fn poll_download_status(handle: &ServiceHandle) -> Option<String> {
         }
     }
     s.clone()
+}
+
+#[cfg(test)]
+mod pid_tests {
+    use super::*;
+
+    fn map_with(entries: &[(&str, u32)]) -> ActivePids {
+        let mut m = HashMap::new();
+        for (k, v) in entries {
+            m.insert((*k).to_string(), *v);
+        }
+        Arc::new(StdMutex::new(m))
+    }
+
+    #[test]
+    fn cancel_kills_only_the_requesting_job() {
+        let pids = map_with(&[("job-a", 1111), ("job-b", 2222), ("job-c", 3333)]);
+        let killed = Arc::new(StdMutex::new(Vec::new()));
+
+        let sink = killed.clone();
+        let found = kill_ffmpeg_for_job(&pids, "job-a", move |pid| {
+            sink.lock().unwrap().push(pid);
+        });
+
+        assert!(found);
+        assert_eq!(*killed.lock().unwrap(), vec![1111]);
+
+        // B and C keep running and stay registered.
+        let remaining = pids.lock().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.get("job-b"), Some(&2222));
+        assert_eq!(remaining.get("job-c"), Some(&3333));
+        assert!(remaining.get("job-a").is_none());
+    }
+
+    #[test]
+    fn cancel_of_unregistered_job_kills_nothing() {
+        let pids = map_with(&[("job-a", 1111)]);
+        let killed = Arc::new(StdMutex::new(Vec::new()));
+
+        let sink = killed.clone();
+        let found = kill_ffmpeg_for_job(&pids, "job-z", move |pid| {
+            sink.lock().unwrap().push(pid);
+        });
+
+        assert!(!found);
+        assert!(killed.lock().unwrap().is_empty());
+        assert_eq!(pids.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn service_stop_still_clears_every_pid() {
+        let handle = ServiceHandle::new();
+        {
+            let mut m = handle.active_pids.lock().unwrap();
+            m.insert("job-a".into(), 1111);
+            m.insert("job-b".into(), 2222);
+        }
+        assert_eq!(handle.active_pids_count(), 2);
+        handle.kill_active_ffmpeg();
+        assert_eq!(handle.active_pids_count(), 0);
+    }
 }

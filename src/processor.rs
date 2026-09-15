@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::{Arc, Mutex as StdMutex};
+
 use uuid::Uuid;
 
 pub trait Publisher {
@@ -397,7 +397,8 @@ pub trait TranscodeRunner {
         output_path: &Path,
         metadata_uuid: &str,
         progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
-        active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+        job_id: &str,
+        active_pids: Option<crate::service_handle::ActivePids>,
         audio_policy: &config::AudioPolicy,
         measured_loudness: Option<&probe::MeasuredLoudness>,
     ) -> encoder::EncodeResult;
@@ -416,7 +417,8 @@ impl TranscodeRunner for RealTranscodeRunner {
         output_path: &Path,
         metadata_uuid: &str,
         progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
-        active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+        job_id: &str,
+        active_pids: Option<crate::service_handle::ActivePids>,
         audio_policy: &config::AudioPolicy,
         measured_loudness: Option<&probe::MeasuredLoudness>,
     ) -> encoder::EncodeResult {
@@ -429,6 +431,7 @@ impl TranscodeRunner for RealTranscodeRunner {
             output_path,
             metadata_uuid,
             progress_tx,
+            job_id,
             active_pids,
             audio_policy,
             measured_loudness,
@@ -443,7 +446,7 @@ pub fn process_file_sync(
     input_path: &Path,
     config: &config::AppConfig,
     pool: &SqlitePool,
-    active_pids: Arc<StdMutex<Vec<u32>>>,
+    active_pids: crate::service_handle::ActivePids,
 ) {
     process_file_sync_with_runner(
         queue,
@@ -464,7 +467,7 @@ pub fn process_file_sync_with_runner(
     input_path: &Path,
     config: &config::AppConfig,
     pool: &SqlitePool,
-    active_pids: Arc<StdMutex<Vec<u32>>>,
+    active_pids: crate::service_handle::ActivePids,
     runner: &impl TranscodeRunner,
 ) {
     process_file_sync_with_runner_and_measurer(
@@ -487,7 +490,7 @@ pub fn process_file_sync_with_runner_and_measurer(
     input_path: &Path,
     config: &config::AppConfig,
     pool: &SqlitePool,
-    active_pids: Arc<StdMutex<Vec<u32>>>,
+    active_pids: crate::service_handle::ActivePids,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
@@ -536,7 +539,7 @@ fn process_file_inner(
     input_path: &Path,
     config: &config::AppConfig,
     pool: &SqlitePool,
-    active_pids: Arc<StdMutex<Vec<u32>>>,
+    active_pids: crate::service_handle::ActivePids,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
@@ -848,24 +851,18 @@ fn process_file_inner(
                             "Heartbeat detected cancel request for job {} — terminating FFmpeg",
                             hb_jid
                         );
-                        if let Ok(pids) = hb_pids.lock() {
-                            for pid in pids.iter() {
-                                #[cfg(target_os = "windows")]
-                                {
-                                    use std::os::windows::process::CommandExt;
-                                    const CREATE_NO_WINDOW: u32 = 0x08000000;
-                                    let _ = std::process::Command::new("taskkill")
-                                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                                        .creation_flags(CREATE_NO_WINDOW)
-                                        .output();
-                                }
-                                #[cfg(not(target_os = "windows"))]
-                                {
-                                    let _ = std::process::Command::new("kill")
-                                        .args(["-9", &pid.to_string()])
-                                        .output();
-                                }
-                            }
+                        // Kill only this job's FFmpeg. This used to iterate
+                        // the whole shared pid list, so cancelling one clip
+                        // killed every concurrent encode (F-12).
+                        if !crate::service_handle::kill_ffmpeg_for_job(
+                            &hb_pids,
+                            &hb_jid,
+                            crate::service_handle::kill_process_tree,
+                        ) {
+                            tracing::warn!(
+                                "Cancel requested for job {} but no FFmpeg pid was registered",
+                                hb_jid
+                            );
                         }
                         break;
                     }
@@ -882,6 +879,7 @@ fn process_file_inner(
             &staged_output_path,
             &metadata_uuid,
             ptx,
+            &job.id,
             Some(active_pids.clone()),
             &audio_policy,
             measured_loudness.as_ref(),
@@ -1855,7 +1853,8 @@ mod tests {
             output_path: &Path,
             _metadata_uuid: &str,
             _progress_tx: std::sync::mpsc::Sender<encoder::EncodeProgress>,
-            _active_pids: Option<Arc<StdMutex<Vec<u32>>>>,
+            _job_id: &str,
+            _active_pids: Option<crate::service_handle::ActivePids>,
             _audio_policy: &config::AudioPolicy,
             _measured_loudness: Option<&probe::MeasuredLoudness>,
         ) -> encoder::EncodeResult {
@@ -1983,6 +1982,7 @@ mod tests {
                 Path::new("staged.mp4"),
                 "uuid",
                 std::sync::mpsc::channel().0,
+                "job-1",
                 None,
                 &dummy_policy,
                 None,
