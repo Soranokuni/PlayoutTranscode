@@ -171,10 +171,18 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 
 ## Configuration (`config.toml`)
 
+> **Security warning.** The HTTP API is unauthenticated. `bind_address` must be a
+> loopback address (`127.0.0.1`, `::1` or `localhost`); any other value is
+> rejected at startup, because binding to `0.0.0.0` would expose every mutating
+> route — including config changes and library purge — to the whole LAN.
+
 ```toml
 [server]
-port = 4353
-bind_address = "0.0.0.0"
+web_port = 4353
+bind_address = "127.0.0.1"
+# Extra browser origins allowed by CORS. Loopback origins on web_port are
+# always allowed; this is only needed for the Vue dev server.
+allowed_origins = []
 
 [paths]
 watch_folder = "D:/Media/Ingest"

@@ -32,6 +32,26 @@ pub struct ServerConfig {
     pub web_port: u16,
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+    /// Extra browser origins allowed by CORS, e.g. the Vue dev server
+    /// (`http://localhost:5173`). Loopback origins on `web_port` are always
+    /// allowed; everything else is rejected.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+}
+
+/// True when `bind_address` only accepts connections from this machine.
+pub fn is_loopback_bind(bind_address: &str) -> bool {
+    let host = bind_address
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        Err(_) => false,
+    }
 }
 
 fn default_web_port() -> u16 {
@@ -492,6 +512,7 @@ impl Default for AppConfig {
             server: ServerConfig {
                 web_port: 4353,
                 bind_address: "127.0.0.1".into(),
+                allowed_origins: Vec::new(),
             },
             encoding: EncodingConfig {
                 preset: "medium".into(),
@@ -696,6 +717,29 @@ impl AppConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        // The HTTP API is unauthenticated (F-02). Binding it anywhere other
+        // than loopback exposes every mutating route to the LAN, so refuse.
+        // T1-1 will relax this once `server.api_token` exists.
+        if !is_loopback_bind(&self.server.bind_address) {
+            return Err(format!(
+                "server.bind_address '{}' is not a loopback address; the API is unauthenticated,                  so only 127.0.0.1, ::1 or localhost are allowed",
+                self.server.bind_address
+            ));
+        }
+        for origin in &self.server.allowed_origins {
+            if !origin.starts_with("http://") && !origin.starts_with("https://") {
+                return Err(format!(
+                    "server.allowed_origins entry '{}' must be a full origin, e.g. http://localhost:5173",
+                    origin
+                ));
+            }
+            if origin.ends_with('/') || origin.matches('/').count() != 2 {
+                return Err(format!(
+                    "server.allowed_origins entry '{}' must be scheme://host[:port] with no path",
+                    origin
+                ));
+            }
+        }
         if self.paths.watch_folder.trim().is_empty() {
             return Err("Watch folder is not configured".into());
         }
@@ -1022,5 +1066,68 @@ feature_x = true
             toml::from_str(future_toml).expect("Unknown future fields must be ignored");
         assert_eq!(cfg.version, 3);
         assert_eq!(cfg.paths.watch_folder, "C:/test/in");
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn loopback_detection() {
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("127.1.2.3"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("[::1]"));
+        assert!(is_loopback_bind("localhost"));
+        assert!(is_loopback_bind(" LocalHost "));
+
+        assert!(!is_loopback_bind("0.0.0.0"));
+        assert!(!is_loopback_bind("192.168.1.10"));
+        assert!(!is_loopback_bind("::"));
+        assert!(!is_loopback_bind(""));
+    }
+
+    fn base_config(dir: &std::path::Path) -> AppConfig {
+        let mut cfg = AppConfig::default();
+        cfg.paths.watch_folder = dir.join("watch").to_string_lossy().to_string();
+        cfg.paths.target_folder = dir.join("target").to_string_lossy().to_string();
+        fs::create_dir_all(&cfg.paths.watch_folder).unwrap();
+        cfg
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pt-bind-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn non_loopback_bind_is_rejected() {
+        let dir = tmp_dir("nonloop");
+        let mut cfg = base_config(&dir);
+        cfg.server.bind_address = "0.0.0.0".into();
+        let err = cfg.validate().expect_err("0.0.0.0 must not validate");
+        assert!(err.contains("loopback"), "unexpected message: {}", err);
+
+        cfg.server.bind_address = "127.0.0.1".into();
+        assert!(cfg.validate().is_ok(), "loopback bind must validate");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn allowed_origins_must_be_bare_origins() {
+        let dir = tmp_dir("origins");
+        let mut cfg = base_config(&dir);
+        cfg.server.allowed_origins = vec!["localhost:5173".into()];
+        assert!(cfg.validate().is_err());
+
+        cfg.server.allowed_origins = vec!["http://localhost:5173/admin".into()];
+        assert!(cfg.validate().is_err());
+
+        cfg.server.allowed_origins = vec!["http://localhost:5173".into()];
+        assert!(cfg.validate().is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

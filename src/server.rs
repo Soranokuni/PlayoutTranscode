@@ -141,11 +141,18 @@ pub async fn run_server(
         .route("/db/folders", get(get_db_folders_handler))
         .route("/db/schema", get(get_db_schema_handler));
 
+    let allowed_origins = allowed_origin_list(port, &state.config.lock().server.allowed_origins);
+    let cors = build_cors(&allowed_origins);
+    let loopback_only = crate::config::is_loopback_bind(bind_address);
+
     let app = Router::new()
         .nest("/api/v2", api_v2)
         .nest("/api", api)
         .fallback(serve_spa)
-        .layer(CorsLayer::permissive())
+        .layer(cors)
+        .layer(axum::middleware::from_fn(move |req, next| {
+            host_guard(loopback_only, port, req, next)
+        }))
         .with_state(state);
 
     let addr = format!("{}:{}", bind_address, port);
@@ -158,6 +165,112 @@ pub async fn run_server(
     axum::serve(listener, app)
         .await
         .map_err(|e| format!("Server error: {}", e))
+}
+
+/// Browser origins permitted by CORS.
+///
+/// The bundled SPA is same-origin and needs no CORS at all; PlayOut talks from
+/// a Rust `reqwest` client and sends no `Origin`. This list exists only for
+/// developers running the Vue dev server, so it stays as small as possible
+/// (F-02: `CorsLayer::permissive()` let any web page the operator opened drive
+/// every mutating route).
+fn allowed_origin_list(port: u16, extra: &[String]) -> Vec<String> {
+    let mut out = vec![
+        format!("http://127.0.0.1:{}", port),
+        format!("http://localhost:{}", port),
+        format!("http://[::1]:{}", port),
+    ];
+    for o in extra {
+        let o = o.trim().trim_end_matches('/').to_string();
+        if !o.is_empty() && !out.contains(&o) {
+            out.push(o);
+        }
+    }
+    out
+}
+
+fn build_cors(origins: &[String]) -> CorsLayer {
+    let parsed: Vec<header::HeaderValue> = origins
+        .iter()
+        .filter_map(|o| match o.parse::<header::HeaderValue>() {
+            Ok(v) => Some(v),
+            Err(_) => {
+                tracing::warn!("ignoring unparseable allowed origin '{}'", o);
+                None
+            }
+        })
+        .collect();
+    CorsLayer::new()
+        .allow_origin(parsed)
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::PUT,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("x-api-token"),
+            header::HeaderName::from_static("x-confirm-destructive"),
+        ])
+}
+
+/// True when `host` (a `Host` header value) names this machine on `port`.
+fn is_local_host_header(host: &str, port: u16) -> bool {
+    let host = host.trim();
+    // Split off the port, taking IPv6 literals (`[::1]:4353`) into account.
+    let (name, port_part) = if let Some(rest) = host.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, tail)) => (inner, tail.strip_prefix(':')),
+            None => return false,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((n, p)) => (n, Some(p)),
+            None => (host, None),
+        }
+    };
+    if let Some(p) = port_part {
+        if p.parse::<u16>() != Ok(port) {
+            return false;
+        }
+    }
+    if name.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    name.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+/// Reject DNS-rebinding against a loopback-bound service.
+///
+/// An attacker-controlled name that resolves to 127.0.0.1 would otherwise let a
+/// web page reach the API as a same-origin request, bypassing CORS entirely.
+async fn host_guard(
+    loopback_only: bool,
+    port: u16,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if loopback_only {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !host.is_empty() && !is_local_host_header(host, port) {
+            tracing::warn!("rejected request with unexpected Host header: {}", host);
+            return (
+                StatusCode::MISDIRECTED_REQUEST,
+                [(header::CONTENT_TYPE, "application/json")],
+                br#"{"error":"misdirected_request"}"#.to_vec(),
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Resolve a request path against the SPA root without ever escaping it.
@@ -2246,6 +2359,31 @@ mod tests {
     fn safe_join_rejects_absurd_depth() {
         let deep = "/a".repeat(64);
         assert!(safe_join(root(), &deep).is_none());
+    }
+
+    #[test]
+    fn allowed_origins_cover_loopback_and_extras() {
+        let list = allowed_origin_list(4353, &["http://localhost:5173/".to_string()]);
+        assert!(list.contains(&"http://127.0.0.1:4353".to_string()));
+        assert!(list.contains(&"http://localhost:4353".to_string()));
+        assert!(list.contains(&"http://[::1]:4353".to_string()));
+        assert!(list.contains(&"http://localhost:5173".to_string()));
+        assert!(!list.iter().any(|o| o.contains("evil")));
+    }
+
+    #[test]
+    fn host_header_guard_accepts_only_loopback_names() {
+        assert!(is_local_host_header("127.0.0.1:4353", 4353));
+        assert!(is_local_host_header("localhost:4353", 4353));
+        assert!(is_local_host_header("LOCALHOST", 4353));
+        assert!(is_local_host_header("[::1]:4353", 4353));
+        assert!(is_local_host_header("127.0.0.1", 4353));
+
+        assert!(!is_local_host_header("evil.example", 4353));
+        assert!(!is_local_host_header("evil.localtest.me:4353", 4353));
+        assert!(!is_local_host_header("127.0.0.1:9999", 4353));
+        assert!(!is_local_host_header("192.168.1.10:4353", 4353));
+        assert!(!is_local_host_header("[::1:4353", 4353));
     }
 
     #[test]
