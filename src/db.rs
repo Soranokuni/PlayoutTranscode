@@ -651,12 +651,12 @@ pub async fn trash_folder(pool: &SqlitePool, folder_path: &str) -> Result<u64, s
         .execute(pool)
         .await?
     } else {
-        let prefix = format!("{}/%", norm);
+        let prefix = like_prefix(norm);
         sqlx::query(
             "UPDATE media_assets 
              SET deleted_at = ?1, 
                  original_virtual_folder = COALESCE(original_virtual_folder, virtual_folder)
-             WHERE (virtual_folder = ?2 OR virtual_folder LIKE ?3) AND deleted_at IS NULL"
+             WHERE (virtual_folder = ?2 OR virtual_folder LIKE ?3 ESCAPE '\\') AND deleted_at IS NULL"
         )
         .bind(now)
         .bind(norm)
@@ -682,9 +682,13 @@ pub async fn restore_asset(
     }
 
     let effective_folder = if let Some(target) = target_folder {
+        // Callers must validate first (`post_restore_asset` returns 422);
+        // keep the defensive fallback so a bad internal caller cannot write
+        // an unvalidated folder string into the registry.
         if is_valid_virtual_folder(target) {
             target.to_string()
         } else {
+            tracing::warn!("restore_asset called with invalid target folder; using '/'");
             "/".to_string()
         }
     } else {
@@ -726,26 +730,26 @@ pub async fn restore_folder(
         .execute(pool)
         .await?
     } else if fallback_to_root {
-        let prefix = format!("{}/%", norm);
+        let prefix = like_prefix(norm);
         sqlx::query(
             "UPDATE media_assets 
              SET deleted_at = NULL, 
                  virtual_folder = '/',
                  original_virtual_folder = NULL
-             WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2) AND deleted_at IS NOT NULL"
+             WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2 ESCAPE '\\') AND deleted_at IS NOT NULL"
         )
         .bind(norm)
         .bind(prefix)
         .execute(pool)
         .await?
     } else {
-        let prefix = format!("{}/%", norm);
+        let prefix = like_prefix(norm);
         sqlx::query(
             "UPDATE media_assets 
              SET deleted_at = NULL, 
                  virtual_folder = COALESCE(original_virtual_folder, '/'),
                  original_virtual_folder = NULL
-             WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2) AND deleted_at IS NOT NULL"
+             WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2 ESCAPE '\\') AND deleted_at IS NOT NULL"
         )
         .bind(norm)
         .bind(prefix)
@@ -914,9 +918,9 @@ pub async fn purge_folder_with_context(
         );
         sqlx::query_as::<_, MediaAsset>(&sql).fetch_all(pool).await?
     } else {
-        let prefix = format!("{}/%", norm);
+        let prefix = like_prefix(norm);
         let sql = format!(
-            "SELECT {} FROM media_assets WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2 OR virtual_folder = ?1 OR virtual_folder LIKE ?2) AND deleted_at IS NOT NULL",
+            "SELECT {} FROM media_assets WHERE (original_virtual_folder = ?1 OR original_virtual_folder LIKE ?2 ESCAPE '\\' OR virtual_folder = ?1 OR virtual_folder LIKE ?2 ESCAPE '\\') AND deleted_at IS NOT NULL",
             SELECT_COLS
         );
         sqlx::query_as::<_, MediaAsset>(&sql)
@@ -1130,20 +1134,72 @@ pub async fn set_virtual_folder(
     Ok(result.rows_affected() > 0)
 }
 
+/// Characters allowed in a virtual-folder segment on top of alphanumerics.
+///
+/// `_` is included (it is common in real folder names) and is neutralised by
+/// [`like_prefix`]; `%` is not, because a folder whose name is a bare wildcard
+/// is an operator trap rather than a useful name.
+const VIRTUAL_FOLDER_PUNCT: &[char] = &[
+    ' ', '_', '-', '.', '(', ')', '[', ']', '&', '+', ',', '\'', '!',
+];
+
 pub fn is_valid_virtual_folder(path: &str) -> bool {
-    if path.is_empty() {
+    if path.is_empty() || !path.starts_with('/') {
         return false;
     }
-    if !path.starts_with('/') {
+    if path.len() > 512 {
         return false;
     }
-    if path.contains("..") {
+    if path == "/" {
+        return true;
+    }
+    if path.ends_with('/') {
         return false;
     }
-    if path != "/" && path.ends_with('/') {
-        return false;
+    for segment in path[1..].split('/') {
+        if segment.is_empty() {
+            return false;
+        }
+        if segment != segment.trim() {
+            return false;
+        }
+        if segment == "." || segment == ".." {
+            return false;
+        }
+        for ch in segment.chars() {
+            if ch.is_control() {
+                return false;
+            }
+            // `%` is a LIKE wildcard with no legitimate use in a folder name;
+            // reject the Windows separator too so a folder name can never be
+            // mistaken for a filesystem path.
+            if ch == '%' || ch == '\\' {
+                return false;
+            }
+            if !(ch.is_alphanumeric() || VIRTUAL_FOLDER_PUNCT.contains(&ch)) {
+                return false;
+            }
+        }
     }
     true
+}
+
+/// Build the `LIKE` pattern matching everything *under* `norm`.
+///
+/// Every folder query used `format!("{}/%", norm)` with no `ESCAPE` clause, so
+/// `folder_path = "/%"` matched every asset in any sub-folder and a legitimate
+/// folder named `/promo_2026` also matched `/promoX2026` (F-05). The returned
+/// pattern must always be used with `ESCAPE '\'`.
+pub fn like_prefix(norm: &str) -> String {
+    let mut out = String::with_capacity(norm.len() + 4);
+    for ch in norm.chars() {
+        if ch == '\\' || ch == '%' || ch == '_' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push_str("/%");
+    out
 }
 
 pub async fn find_all(
@@ -2690,6 +2746,74 @@ mod tests {
         assert_eq!(active_list_after.len(), 3);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_folder_ops_escape_like_wildcards() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        // Legacy rows can carry LIKE metacharacters even though the validator
+        // now rejects `%` at the API boundary, so the SQL must escape them.
+        insert_processing(&pool, "u1", 1, "D:/target/c1.mp4", "C1").await.unwrap();
+        set_virtual_folder(&pool, "u1", "/promo_2026").await.unwrap();
+        insert_processing(&pool, "u2", 2, "D:/target/c2.mp4", "C2").await.unwrap();
+        set_virtual_folder(&pool, "u2", "/promoX2026").await.unwrap();
+        insert_processing(&pool, "u3", 3, "D:/target/c3.mp4", "C3").await.unwrap();
+        set_virtual_folder(&pool, "u3", "/promo_2026/teasers").await.unwrap();
+        insert_processing(&pool, "u4", 4, "D:/target/c4.mp4", "C4").await.unwrap();
+        set_virtual_folder(&pool, "u4", "/a%b").await.unwrap();
+        insert_processing(&pool, "u5", 5, "D:/target/c5.mp4", "C5").await.unwrap();
+        set_virtual_folder(&pool, "u5", "/a%b/c").await.unwrap();
+        insert_processing(&pool, "u6", 6, "D:/target/c6.mp4", "C6").await.unwrap();
+        set_virtual_folder(&pool, "u6", "/aQb").await.unwrap();
+
+        // `_` must not act as a single-character wildcard.
+        let affected = trash_folder(&pool, "/promo_2026").await.unwrap();
+        assert_eq!(affected, 2, "/promoX2026 must not be trashed");
+        assert!(find_by_uuid(&pool, "u2").await.unwrap().is_some());
+
+        // `%` must not act as a multi-character wildcard.
+        let affected = trash_folder(&pool, "/a%b").await.unwrap();
+        assert_eq!(affected, 2, "/aQb must not be trashed");
+        assert!(find_by_uuid(&pool, "u6").await.unwrap().is_some());
+
+        let restored = restore_folder(&pool, "/a%b", false).await.unwrap();
+        assert_eq!(restored, 2);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_like_prefix_escapes_metacharacters() {
+        assert_eq!(like_prefix("/promo_2026"), "/promo\\_2026/%");
+        assert_eq!(like_prefix("/a%b"), "/a\\%b/%");
+        assert_eq!(like_prefix("/plain"), "/plain/%");
+    }
+
+    #[test]
+    fn test_is_valid_virtual_folder_rules() {
+        assert!(is_valid_virtual_folder("/"));
+        assert!(is_valid_virtual_folder("/Shows"));
+        assert!(is_valid_virtual_folder("/Shows/Season 1"));
+        assert!(is_valid_virtual_folder("/promo_2026"));
+        assert!(is_valid_virtual_folder("/Ειδήσεις"));
+        assert!(is_valid_virtual_folder("/Spots (2026)/A&B [HD]"));
+
+        // F-05: `/%` matched every asset in any sub-folder.
+        assert!(!is_valid_virtual_folder("/%"));
+        assert!(!is_valid_virtual_folder("/a%b"));
+        assert!(!is_valid_virtual_folder(""));
+        assert!(!is_valid_virtual_folder("Shows"));
+        assert!(!is_valid_virtual_folder("/Shows/"));
+        assert!(!is_valid_virtual_folder("/Shows//S1"));
+        assert!(!is_valid_virtual_folder("/.."));
+        assert!(!is_valid_virtual_folder("/a/../b"));
+        assert!(!is_valid_virtual_folder("/."));
+        assert!(!is_valid_virtual_folder("/ leading"));
+        assert!(!is_valid_virtual_folder("/trailing "));
+        assert!(!is_valid_virtual_folder("/bell\u{7}"));
+        assert!(!is_valid_virtual_folder("/back\\slash"));
+        assert!(!is_valid_virtual_folder(&format!("/{}", "x".repeat(600))));
     }
 
     #[tokio::test]

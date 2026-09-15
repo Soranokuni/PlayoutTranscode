@@ -1669,6 +1669,17 @@ async fn post_restore_asset(
     body: Option<Json<RestoreAssetRequest>>,
 ) -> impl IntoResponse {
     let target = body.and_then(|b| b.target_folder.clone());
+    // An invalid target used to be silently downgraded to "/", which moved the
+    // asset somewhere the caller never asked for (F-08).
+    if let Some(t) = target.as_deref() {
+        if !db::is_valid_virtual_folder(t) {
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({"error": "invalid target_folder"})),
+            )
+                .into_response();
+        }
+    }
     match db::restore_asset(&state.pool, &uuid, target.as_deref()).await {
         Ok(Some(asset)) => (
             StatusCode::OK,
