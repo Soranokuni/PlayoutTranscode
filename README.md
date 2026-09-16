@@ -171,6 +171,29 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 
 ## Configuration (`config.toml`)
 
+### Where the service keeps its data
+
+`config.toml`, the asset registry (`media_assets.db`), rotated logs and any
+downloaded FFmpeg toolchain all live in the **data directory**, resolved once at
+startup in this order:
+
+| Order | Source | Result |
+|---|---|---|
+| 1 | `--data-dir <PATH>` | that path |
+| 2 | `PLAYOUT_TRANSCODE_DATA` environment variable | that path |
+| 3 | exe is under a `Program Files` tree | `%ProgramData%\PlayoutTranscode` |
+| 4 | anything else | the executable's own directory (portable layout) |
+
+The service refuses to start if the directory cannot be created. The resolved
+path is logged at startup and reported as `system.data_dir` by
+`GET /api/diagnostics`.
+
+Rule 3 exists because the Windows service runs as `NT AUTHORITY\LocalService`,
+which has no write access under `Program Files`. A portable or development
+build is unaffected and keeps writing next to the executable, as before.
+
+The data directory may not be used as the watch or target folder.
+
 > **Security warning.** `bind_address` must be a loopback address (`127.0.0.1`,
 > `::1` or `localhost`) unless `server.api_token` is set. Binding to `0.0.0.0`
 > without a token would expose every mutating route — config changes, library
@@ -217,8 +240,9 @@ auto_purge_days = 30
 verified_source_cleanup = false
 
 [toolchain_policy]
-# Absolute paths to the toolchain. Leave unset to search <exe_dir>/bin and then
-# <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately NOT searched: a
+# Absolute paths to the toolchain. Leave unset to search <data_dir>/bin, then
+# <exe_dir>/bin, then <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately
+# NOT searched: a
 # writable directory earlier in PATH would let a local user supply the
 # ffmpeg.exe this service runs.
 # ffmpeg_path = "C:/PlayoutTranscode/bin/ffmpeg.exe"

@@ -3,12 +3,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// `config.toml` inside the resolved data directory (T2-2).
+///
+/// Before the data-directory split this was always `<exe_dir>/config.toml`;
+/// for a portable or dev build it still resolves there, because that is what
+/// [`crate::paths::data_dir`] falls back to.
 pub fn default_config_path() -> PathBuf {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join("config.toml")
+    crate::paths::config_path()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +140,10 @@ fn forbidden_roots() -> Vec<(String, bool)> {
             roots.push((normalize_dir(dir), false));
         }
     }
+    // The data directory holds the registry, config and toolchain. Using it as
+    // a watch or target folder would have the ingest loop walking over its own
+    // database (T2-2).
+    roots.push((normalize_dir(&crate::paths::data_dir()), false));
     if !cfg!(windows) {
         for r in ["/bin", "/boot", "/dev", "/etc", "/proc", "/sys", "/usr"] {
             roots.push((r.to_string(), false));

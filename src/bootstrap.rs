@@ -62,19 +62,29 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Where a downloaded toolchain is installed.
+///
+/// This is the data directory, not the exe directory: under the production
+/// layout the exe sits in `Program Files` and the service account cannot write
+/// there (T2-2).
 fn bin_dir() -> PathBuf {
-    exe_dir().join("bin")
+    crate::paths::toolchain_bin_dir()
 }
 
 /// Directories searched for the toolchain, in order, after any explicit path
 /// from `toolchain_policy`.
 fn search_dirs() -> Vec<PathBuf> {
     let exe = exe_dir();
-    vec![
-        exe.join("bin"),
-        // The installer's layout.
-        exe.join("Requirements").join("ffmpeg").join("bin"),
-    ]
+    let mut dirs = vec![bin_dir()];
+    // A portable build resolves the data directory to the exe directory, in
+    // which case the two entries coincide; keep both for the split layout, where
+    // an operator may still have dropped a toolchain next to the exe.
+    if !dirs.contains(&exe.join("bin")) {
+        dirs.push(exe.join("bin"));
+    }
+    // The installer's layout.
+    dirs.push(exe.join("Requirements").join("ffmpeg").join("bin"));
+    dirs
 }
 
 fn executable_name(base: &str) -> String {
