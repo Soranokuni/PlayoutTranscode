@@ -11,10 +11,13 @@
 
     What it does, in a throwaway directory, under a throwaway service name:
 
-      1. copies the built exe and SPA into a temp install directory
-      2. writes a config.toml on a free port with temp watch/target folders
-      3. registers the service against `service-run` as NT AUTHORITY\LocalService
-      4. grants that account Modify on the data, watch and target directories
+      1. copies the built exe and SPA into a throwaway install directory under
+         %ProgramData% -- NOT %TEMP%, which lives in the calling user's profile
+         and is unreachable by the service account
+      2. writes a config.toml on a free port with throwaway watch/target folders
+      3. grants NT AUTHORITY\LocalService read+execute on the install directory
+         and Modify on the data, watch and target directories
+      4. registers the service against `service-run` as that account
       5. starts it and polls /api/health until it answers or 30 s elapse
       6. checks the service reports RUNNING
       7. stops it and checks it reaches STOPPED within 30 s, with no orphaned
@@ -83,7 +86,11 @@ if (-not $ExePath -or -not (Test-Path -LiteralPath $ExePath)) {
 }
 $ExePath = (Resolve-Path -LiteralPath $ExePath).Path
 
-$root       = Join-Path $env:TEMP ("pt-verify-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
+# NOT %TEMP%: that is under the calling user's profile, which
+# NT AUTHORITY\LocalService cannot traverse, so `sc start` fails with error 5
+# (ACCESS_DENIED) before the service binary ever runs. %ProgramData% is where a
+# real install puts its data and is reachable by the service account.
+$root       = Join-Path $env:ProgramData ("PlayoutTranscodeVerify-" + [Guid]::NewGuid().ToString("N").Substring(0, 8))
 $installDir = Join-Path $root "install"
 $dataDir    = Join-Path $root "data"
 $watchDir   = Join-Path $root "watch"
@@ -162,9 +169,16 @@ target_folder = "$targetToml"
 level = "info"
 "@ | Set-Content -LiteralPath $configPath -Encoding UTF8
 
+    # The service account has to read and execute the binary, and write to the
+    # three data/media folders. Missing the first is error 5 at start time.
+    Step "Granting $svcAccount read+execute on the install folder"
+    & icacls.exe $installDir /grant "${svcAccount}:(OI)(CI)RX" /T /C | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "icacls on $installDir returned $LASTEXITCODE" }
+
     Step "Granting $svcAccount Modify on the data, watch and target folders"
     foreach ($d in @($dataDir, $watchDir, $targetDir)) {
         & icacls.exe $d /grant "${svcAccount}:(OI)(CI)M" /T /C | Out-Null
+        if ($LASTEXITCODE -ne 0) { Write-Warning "icacls on $d returned $LASTEXITCODE" }
     }
 
     Step "Registering $ServiceName against 'service-run' as $svcAccount"
@@ -176,7 +190,21 @@ level = "info"
     Step "Starting the service"
     & sc.exe start $ServiceName | Out-Null
     if ($LASTEXITCODE -ne 0) {
-        Fail "sc.exe start returned $LASTEXITCODE (1053 means the SCM entry point is still missing)"
+        $meaning = switch ($LASTEXITCODE) {
+            5    { "ACCESS_DENIED - the service account cannot reach the exe or its folders. This is a harness/ACL problem, not an SCM entry point problem." }
+            2    { "FILE_NOT_FOUND - the binPath is wrong." }
+            1053 { "the service did not report to the SCM in time: the entry point really is missing or wedged." }
+            1069 { "LOGON_FAILURE - the service account could not log on." }
+            default { "see 'net helpmsg $LASTEXITCODE'." }
+        }
+        Fail "sc.exe start returned $LASTEXITCODE - $meaning"
+        Write-Host "--- sc qc ---" -ForegroundColor DarkGray
+        & sc.exe qc $ServiceName | Write-Host
+        Write-Host "--- recent System event log for this service ---" -ForegroundColor DarkGray
+        Get-WinEvent -FilterHashtable @{LogName='System'; StartTime=(Get-Date).AddMinutes(-5)} -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -like "*$ServiceName*" } |
+            Select-Object -First 5 |
+            ForEach-Object { Write-Host "  [$($_.TimeCreated)] $($_.Message)" }
     }
 
     if (Wait-ServiceState $ServiceName "RUNNING" 30) {
