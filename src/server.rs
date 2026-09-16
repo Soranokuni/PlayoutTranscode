@@ -392,7 +392,13 @@ pub fn validate_retry_input_path(raw: &str, watch_folder: &str) -> Result<std::p
     if !canon.starts_with(&canon_watch) {
         return Err("input_path must be inside the watch folder");
     }
-    Ok(canon)
+    // Containment is checked on the canonical form, but the path handed back is
+    // the ordinary one. `canonicalize` yields a Windows verbatim path, and a
+    // retry dispatched with that spelling would store it as the job's
+    // input_path -- so the adopted record would no longer match the spelling
+    // the watcher uses, and `find_pending_by_input_path` would miss it (T2-4).
+    // It is also the spelling FFmpeg is then invoked with.
+    Ok(crate::paths::strip_verbatim_prefix(&canon))
 }
 
 /// Path extractor that accepts only a canonical UUID.
@@ -1653,7 +1659,9 @@ async fn post_retry_job(
                 .into_response();
         }
     };
-    match state.service_handle.submit_retry(validated) {
+    // Pass the job id so the dispatcher adopts this record rather than
+    // creating a second one and leaving this one Pending forever (F-13).
+    match state.service_handle.submit_retry(validated, Some(id.clone())) {
         Ok(_) => {
             let _ = state.jobs.transition(
                 &id,
@@ -1718,7 +1726,7 @@ async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoRes
             missing += 1;
             continue;
         }
-        match state.service_handle.submit_retry(path) {
+        match state.service_handle.submit_retry(path, Some(job.id.clone())) {
             Ok(_) => {
                 let _ = state.jobs.transition(
                     &job.id,

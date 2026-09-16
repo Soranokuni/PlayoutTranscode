@@ -1392,10 +1392,14 @@ impl DurableJobRow {
     }
 }
 
-pub async fn insert_durable_job(
-    pool: &SqlitePool,
-    job: &crate::jobs::JobRecord,
-) -> Result<(), sqlx::Error> {
+/// Upsert one job row through any executor -- the pool, or a transaction.
+///
+/// Executor-generic so `persist_jobs` can run a whole coalesced batch inside a
+/// single transaction (T2-4) without a second copy of this 31-column statement.
+async fn upsert_job<'e, E>(executor: E, job: &crate::jobs::JobRecord) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let stderr_json = job
         .stderr_log
         .as_ref()
@@ -1475,123 +1479,41 @@ pub async fn insert_durable_job(
     .bind(&job.encode_speed)
     .bind(job.current_time_ms)
     .bind(job.duration_ms)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn claim_next_job(
+/// Persist a single job immediately. Used by startup population and tests; the
+/// running service goes through the coalescing persister and `persist_jobs`.
+pub async fn insert_durable_job(
     pool: &SqlitePool,
-    worker_id: &str,
-    lease_secs: i64,
-) -> Result<Option<crate::jobs::JobRecord>, sqlx::Error> {
+    job: &crate::jobs::JobRecord,
+) -> Result<(), sqlx::Error> {
+    upsert_job(pool, job).await
+}
+
+/// Persist a coalesced batch of jobs in one transaction.
+///
+/// Before T2-4 every in-memory job mutation spawned its own independent upsert,
+/// so two rapid writes for the same job could land out of order and leave the
+/// database claiming "Encoding 97%" for a job that had already completed. The
+/// persister hands this the newest record per job id, and one transaction makes
+/// the batch atomic and cheap: an encode used to cause one commit per FFmpeg
+/// progress line.
+pub async fn persist_jobs(
+    pool: &SqlitePool,
+    jobs: &[crate::jobs::JobRecord],
+) -> Result<(), sqlx::Error> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
     let mut tx = pool.begin().await?;
-
-    let row: Option<DurableJobRow> = sqlx::query_as(
-        "SELECT * FROM transcode_jobs 
-         WHERE (state = 'Pending' AND phase = 'queued') 
-            OR (state = 'Processing' AND leased_until IS NOT NULL AND leased_until < datetime('now'))
-         ORDER BY created_at ASC 
-         LIMIT 1",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some(r) = row {
-        let now = chrono::Utc::now();
-        let leased_until = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
-        let heartbeat_at = now.to_rfc3339();
-        let started_at = r.started_at.clone().unwrap_or_else(|| now.to_rfc3339());
-
-        sqlx::query(
-            "UPDATE transcode_jobs SET
-                state = 'Processing',
-                phase = 'probing',
-                current_stage = 'Claimed by worker',
-                worker_id = ?1,
-                leased_until = ?2,
-                heartbeat_at = ?3,
-                started_at = ?4
-             WHERE id = ?5",
-        )
-        .bind(worker_id)
-        .bind(&leased_until)
-        .bind(&heartbeat_at)
-        .bind(&started_at)
-        .bind(&r.id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        let mut job = r.into_job_record();
-        job.state = crate::jobs::JobState::Processing;
-        job.phase = crate::jobs::JobPhase::Probing;
-        job.current_stage = "Claimed by worker".to_string();
-        job.worker_id = Some(worker_id.to_string());
-        job.leased_until = Some(leased_until);
-        job.heartbeat_at = Some(heartbeat_at);
-        job.started_at = Some(started_at);
-
-        Ok(Some(job))
-    } else {
-        tx.rollback().await?;
-        Ok(None)
+    for job in jobs {
+        upsert_job(&mut *tx, job).await?;
     }
-}
-
-#[allow(dead_code)]
-pub async fn heartbeat_job(
-    pool: &SqlitePool,
-    job_id: &str,
-    worker_id: &str,
-    extend_secs: i64,
-) -> Result<bool, sqlx::Error> {
-    let now = chrono::Utc::now();
-    let leased_until = (now + chrono::Duration::seconds(extend_secs)).to_rfc3339();
-    let heartbeat_at = now.to_rfc3339();
-
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT cancel_requested FROM transcode_jobs WHERE id = ?1 AND worker_id = ?2",
-    )
-    .bind(job_id)
-    .bind(worker_id)
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some((cancel_req,)) = row {
-        if !cancel_req {
-            let _ = sqlx::query(
-                "UPDATE transcode_jobs SET leased_until = ?1, heartbeat_at = ?2 WHERE id = ?3 AND worker_id = ?4",
-            )
-            .bind(&leased_until)
-            .bind(&heartbeat_at)
-            .bind(job_id)
-            .bind(worker_id)
-            .execute(pool)
-            .await;
-        }
-        Ok(cancel_req)
-    } else {
-        Ok(false)
-    }
-}
-
-#[allow(dead_code)]
-pub async fn request_job_cancellation(
-    pool: &SqlitePool,
-    job_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query(
-        "UPDATE transcode_jobs SET cancel_requested = 1, phase = CASE WHEN phase = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END, state = CASE WHEN phase = 'queued' THEN 'Cancelled' ELSE state END WHERE id = ?1 AND state IN ('Pending', 'Processing')",
-    )
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-
-    Ok(res.rows_affected() > 0)
+    tx.commit().await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1647,6 +1569,61 @@ pub async fn recover_stale_jobs(pool: &SqlitePool) -> Result<JobRecoveryReport, 
     }
 
     Ok(report)
+}
+
+/// Jobs still waiting to be picked up, oldest first.
+pub async fn load_pending_jobs(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::jobs::JobRecord>, sqlx::Error> {
+    let rows: Vec<DurableJobRow> = sqlx::query_as(
+        "SELECT * FROM transcode_jobs WHERE state = 'Pending' ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.into_job_record()).collect())
+}
+
+/// Mark the given jobs failed because their source file is gone.
+///
+/// `recover_stale_jobs` re-queues interrupted work to `Pending`, but nothing
+/// ever consumed those rows: only the filesystem watcher feeds the dispatcher,
+/// so a job whose source had since been moved or deleted stayed `Pending`
+/// forever and showed up in `/api/jobs` and `/api/stats` as permanently
+/// outstanding work (F-13). Failing them at startup makes the queue reflect
+/// reality; a job whose source *does* still exist is left alone, because the
+/// watcher will re-offer the file and the dispatcher now adopts the existing
+/// record rather than creating a second one.
+pub async fn fail_jobs_with_missing_source(
+    pool: &SqlitePool,
+    job_ids: &[String],
+) -> Result<usize, sqlx::Error> {
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let mut affected = 0usize;
+    for id in job_ids {
+        let res = sqlx::query(
+            "UPDATE transcode_jobs SET
+                state = 'Failed',
+                phase = 'failed',
+                current_stage = 'Failed',
+                error = 'Source file no longer exists',
+                error_category = 'source_missing_on_recovery',
+                worker_id = NULL,
+                leased_until = NULL,
+                finished_at = ?1
+             WHERE id = ?2 AND state = 'Pending'",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        affected += res.rows_affected() as usize;
+    }
+    tx.commit().await?;
+    Ok(affected)
 }
 
 pub async fn load_all_durable_jobs(
@@ -2610,27 +2587,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_atomic_claim_and_lease() {
+    async fn recovery_fails_pending_jobs_whose_source_is_gone() {
         let (pool, temp_dir) = setup_test_pool().await;
-        let job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
-        insert_durable_job(&pool, &job).await.unwrap();
+        let present_path = temp_dir.join("still-here.mov");
+        std::fs::write(&present_path, b"media").expect("write fixture");
 
-        // Worker 1 claims job
-        let claimed = claim_next_job(&pool, "worker-1", 60).await.unwrap();
-        assert!(claimed.is_some());
-        let claimed_job = claimed.unwrap();
-        assert_eq!(claimed_job.id, job.id);
-        assert_eq!(claimed_job.worker_id.as_deref(), Some("worker-1"));
-        assert_eq!(claimed_job.phase, crate::jobs::JobPhase::Probing);
-        assert_eq!(claimed_job.state, crate::jobs::JobState::Processing);
+        // Pending, source still on disk: left alone, because the watcher will
+        // re-offer it and the dispatcher adopts this record.
+        let mut keep = crate::jobs::JobRecord::new(&present_path.to_string_lossy(), "ProfileA");
+        keep.state = crate::jobs::JobState::Pending;
+        keep.phase = crate::jobs::JobPhase::Queued;
+        insert_durable_job(&pool, &keep).await.unwrap();
 
-        // Worker 2 attempts to claim while lease is active -> None
-        let second_claim = claim_next_job(&pool, "worker-2", 60).await.unwrap();
-        assert!(second_claim.is_none());
+        // Pending, source gone: would sit Pending forever (F-13).
+        let mut orphan = crate::jobs::JobRecord::new("D:/media/deleted-while-down.mov", "ProfileA");
+        orphan.state = crate::jobs::JobState::Pending;
+        orphan.phase = crate::jobs::JobPhase::Queued;
+        insert_durable_job(&pool, &orphan).await.unwrap();
 
-        // Worker 1 heartbeats
-        let cancel_req = heartbeat_job(&pool, &job.id, "worker-1", 60).await.unwrap();
-        assert!(!cancel_req);
+        // Completed, source gone: must not be touched.
+        let mut done = crate::jobs::JobRecord::new("D:/media/already-done.mov", "ProfileA");
+        done.state = crate::jobs::JobState::Completed;
+        done.phase = crate::jobs::JobPhase::Completed;
+        insert_durable_job(&pool, &done).await.unwrap();
+
+        let pending = load_pending_jobs(&pool).await.unwrap();
+        assert_eq!(pending.len(), 2, "only Pending rows are considered");
+
+        let missing: Vec<String> = pending
+            .iter()
+            .filter(|j| !std::path::Path::new(&j.input_path).exists())
+            .map(|j| j.id.clone())
+            .collect();
+        assert_eq!(missing, vec![orphan.id.clone()]);
+
+        let n = fail_jobs_with_missing_source(&pool, &missing).await.unwrap();
+        assert_eq!(n, 1);
+
+        let all = load_all_durable_jobs(&pool).await.unwrap();
+        let o = all.iter().find(|j| j.id == orphan.id).unwrap();
+        assert_eq!(o.state, crate::jobs::JobState::Failed);
+        assert_eq!(o.phase, crate::jobs::JobPhase::Failed);
+        assert_eq!(
+            o.error_category.as_deref(),
+            Some("source_missing_on_recovery")
+        );
+        assert!(o.finished_at.is_some());
+
+        let k = all.iter().find(|j| j.id == keep.id).unwrap();
+        assert_eq!(k.state, crate::jobs::JobState::Pending);
+        let d = all.iter().find(|j| j.id == done.id).unwrap();
+        assert_eq!(d.state, crate::jobs::JobState::Completed);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn persist_jobs_writes_a_whole_batch_in_one_transaction() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let batch: Vec<crate::jobs::JobRecord> = (0..25)
+            .map(|i| crate::jobs::JobRecord::new(&format!("D:/media/clip{}.mov", i), "ProfileA"))
+            .collect();
+
+        persist_jobs(&pool, &batch).await.unwrap();
+        assert_eq!(load_all_durable_jobs(&pool).await.unwrap().len(), 25);
+
+        // Re-persisting the same ids updates rather than duplicating.
+        let mut again = batch.clone();
+        for j in &mut again {
+            j.progress = 100.0;
+        }
+        persist_jobs(&pool, &again).await.unwrap();
+        let rows = load_all_durable_jobs(&pool).await.unwrap();
+        assert_eq!(rows.len(), 25);
+        assert!(rows.iter().all(|r| r.progress == 100.0));
+
+        // An empty batch is a no-op, not an empty transaction.
+        persist_jobs(&pool, &[]).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2673,7 +2706,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_cancellation_and_request_hash_dedup() {
+    async fn test_request_hash_dedup() {
         let (pool, temp_dir) = setup_test_pool().await;
         let mut job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
         job.request_hash = Some("hash-abc-123".into());
@@ -2684,14 +2717,6 @@ mod tests {
             .unwrap();
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, job.id);
-
-        let cancel_res = request_job_cancellation(&pool, &job.id).await.unwrap();
-        assert!(cancel_res);
-
-        let all = load_all_durable_jobs(&pool).await.unwrap();
-        let j = all.iter().find(|j| j.id == job.id).unwrap();
-        assert_eq!(j.phase, crate::jobs::JobPhase::Cancelled);
-        assert_eq!(j.state, crate::jobs::JobState::Cancelled);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
