@@ -196,7 +196,104 @@ based on the row disappearing, read `media_removed` from the response instead.
 
 ---
 
-## 5. Still coming (no action yet, listed for planning)
+## 5. Deployment changes — **no client code change, but read this**
+
+**Status in PlayoutTranscode:** shipped (T2-2, T2-1, T2-3).
+
+Nothing here changes the wire contract. It changes where the service lives and
+how it is started, which matters for support calls and for the upgrade.
+
+### 5.1 The service now works as a Windows service
+
+The documented production deployment mode did not work before. The installer
+registered `PlayoutTranscode run`, which is a console program: the Service
+Control Manager waited for a status report that never arrived and failed the
+start with **error 1053** after 30 seconds. The only way to keep ingest running
+was to leave someone logged in with a console window open, and a logoff killed
+it.
+
+The installer now registers a real SCM entry point (`service-run`) running as
+`NT AUTHORITY\LocalService`, with auto-restart on crash. A service stop drains
+in-flight HTTP requests, stops the watcher, kills any running FFmpeg child and
+closes the database before reporting `STOPPED`.
+
+**What this means for PlayOut:** the ingest service is now expected to be up
+whether or not anyone is logged in. If PlayOut's status light was previously
+red after a server reboot until someone logged in and started the app, that
+should stop happening. No client change.
+
+> The acceptance script `scripts\verify-service.ps1` must be run on an
+> elevated prompt before the release that ships this. Until it has been, treat
+> the SCM lifecycle as implemented but not yet proven on a real host.
+
+### 5.2 Config, database and logs moved out of the install directory
+
+`LocalService` cannot write under `Program Files`, so all mutable state moved
+to a **data directory**, resolved at startup as:
+
+| Order | Source | Result |
+|---|---|---|
+| 1 | `--data-dir <PATH>` | that path |
+| 2 | `PLAYOUT_TRANSCODE_DATA` | that path |
+| 3 | exe under a `Program Files` tree | `%ProgramData%\PlayoutTranscode` |
+| 4 | anything else | next to the exe (unchanged, portable/dev builds) |
+
+`config.toml`, `media_assets.db`, `logs\` and any downloaded FFmpeg all live
+there.
+
+**Upgrade note worth telling operators:** on an installed build, a `config.toml`
+that was previously edited next to the executable is **no longer read**. It must
+be moved to `%ProgramData%\PlayoutTranscode\config.toml`. A portable build is
+unaffected.
+
+`GET /api/diagnostics` gained an additive field so support can ask for the right
+files without guessing:
+
+```json
+{ "system": { "os": "windows", "arch": "x86_64", "logical_cores": 16,
+              "data_dir": "C:\\ProgramData\\PlayoutTranscode" } }
+```
+
+No existing field changed. If PlayOut surfaces a diagnostics panel, showing
+`system.data_dir` there would save a support round-trip.
+
+### 5.3 There are now real logs after an incident
+
+Previously a headless install discarded every log line. There are now four
+sinks:
+
+| Sink | Format | Contents |
+|---|---|---|
+| stdout | pretty | everything at `logging.level` (interactive runs only) |
+| `<data_dir>\logs\transcode.log.<date>` | JSON, rotated daily | everything at `logging.level` |
+| `<data_dir>\logs\audit.log.<date>` | JSON, rotated daily | destructive operations only |
+| the web UI log panel | plain text | `WARN`, `ERROR` and every audit record |
+
+`logging.retain_days` (default 14) prunes older files at startup.
+
+The audit log records every destructive call PlayOut makes — the ones listed in
+section 2 — with the method, path, **caller address** and resulting status:
+
+```json
+{"timestamp":"2026-09-16T18:21:41.252824Z","level":"WARN",
+ "fields":{"message":"destructive operation","op":"DELETE",
+ "path":"/api/recycle-bin/purge","remote_addr":"127.0.0.1:58051","status":200},
+ "target":"audit"}
+```
+
+Two consequences for PlayOut:
+
+1. **Purges are now attributable.** "Who emptied the recycle bin?" has an
+   answer. If several clients share one service, the address in that line is
+   PlayOut's.
+2. The web UI log panel now shows service-wide `WARN`/`ERROR`, not just the
+   handful of hand-written lines it used to. An operator looking at the UI will
+   see failures PlayOut reported as generic errors, which may change what they
+   report to you.
+
+---
+
+## 6. Still coming (no action yet, listed for planning)
 
 - **Paginated listings (T2-7).** `GET /api/assets` will default to
   `limit=1000` with `X-Total-Count`, and will omit `keyframe_offsets` unless
