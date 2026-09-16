@@ -222,9 +222,11 @@ whether or not anyone is logged in. If PlayOut's status light was previously
 red after a server reboot until someone logged in and started the app, that
 should stop happening. No client change.
 
-> The acceptance script `scripts\verify-service.ps1` must be run on an
-> elevated prompt before the release that ships this. Until it has been, treat
-> the SCM lifecycle as implemented but not yet proven on a real host.
+> **Verified on a real host**, 2026-09-16, via `scripts\verify-service.ps1`:
+> the SCM reports `RUNNING`, `/api/health` answers 200 while under the SCM,
+> `sc stop` reaches `STOPPED`, no `PlayoutTranscode.exe` or `ffmpeg.exe`
+> survives the stop, and `LocalService` successfully wrote the registry into
+> its data directory.
 
 ### 5.2 Config, database and logs moved out of the install directory
 
