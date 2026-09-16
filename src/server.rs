@@ -1021,6 +1021,9 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "logical_cores": crate::config::available_logical_cores(),
+            // Where config, the registry, logs and the toolchain actually live
+            // (T2-2). Support cannot ask for the right files without it.
+            "data_dir": crate::paths::data_dir().to_string_lossy(),
         },
         "metrics": {
             "pending_jobs": all_jobs.iter().filter(|j| j.state == JobState::Pending).count(),
@@ -1406,11 +1409,7 @@ async fn put_config(
         }
     };
 
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let config_path = exe_dir.join("config.toml");
+    let config_path = crate::paths::config_path();
     if let Err(e) = patched.save_to(&config_path) {
         tracing::error!("Failed to save config to {}: {}", config_path.display(), e);
         return (

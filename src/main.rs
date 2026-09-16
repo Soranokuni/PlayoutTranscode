@@ -1,4 +1,6 @@
-use playout_transcode::{bootstrap, config, db, jobs, logging, profiles, server, service_handle};
+use playout_transcode::{
+    bootstrap, config, db, jobs, logging, paths, profiles, server, service_handle,
+};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -12,6 +14,11 @@ use std::sync::Arc;
     about = "Broadcast media transcoding service"
 )]
 struct Cli {
+    /// Directory holding `config.toml`, the asset registry, logs and the
+    /// downloaded toolchain. Overrides `PLAYOUT_TRANSCODE_DATA`.
+    #[arg(long, value_name = "PATH", global = true)]
+    data_dir: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -42,6 +49,19 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Must happen before anything reads `config.toml`, opens the registry or
+    // audits the toolchain: every one of those resolves through
+    // `paths::data_dir()` and re-resolving mid-run would split the service's
+    // state across two directories (T2-2).
+    let data_dir = paths::resolve_data_dir_from_env(cli.data_dir.as_deref());
+    let data_dir = match paths::set_data_dir(data_dir.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{} ({})", e, data_dir.display());
+            std::process::exit(1);
+        }
+    };
+
     match cli.command {
         None => {
             run_headless(None);
@@ -69,6 +89,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Status) => {
+            println!("Data dir: {}", data_dir.display());
             let (_, status) = bootstrap::audit_toolchain();
             println!("FFmpeg found: {}", status.ffmpeg_found);
             println!("FFprobe found: {}", status.ffprobe_found);
@@ -140,12 +161,10 @@ async fn run_service(config_path_override: Option<String>) -> Result<()> {
     println!("\n  PlayoutTranscode web UI starting at {}\n", url);
     tracing::info!("PlayoutTranscode starting on {}", url);
 
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
+    let exe_dir = paths::exe_dir();
+    tracing::info!("Data directory: {}", paths::data_dir().display());
 
-    let pool = db::init_pool(&exe_dir.join("media_assets.db"))
+    let pool = db::init_pool(&paths::database_path())
         .await
         .map_err(|e| anyhow::anyhow!("Database init failed: {}", e))?;
     let pool = Arc::new(pool);

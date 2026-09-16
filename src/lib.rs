@@ -14,6 +14,7 @@ pub mod fingerprint;
 pub mod identity;
 pub mod jobs;
 pub mod logging;
+pub mod paths;
 pub mod probe;
 pub mod processor;
 pub mod profiles;
