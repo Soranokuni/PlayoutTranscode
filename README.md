@@ -252,6 +252,35 @@ verify_on_startup = true
 # DISABLED until this is set - an unpinned executable download is not
 # acceptable on a broadcast host. Install manually if you prefer.
 download_sha256 = ""
+
+[logging]
+# Console level, and the level written to the rotated JSON files.
+# RUST_LOG overrides this for a support session without editing config.toml.
+level = "info"
+# Base name inside <data_dir>/logs; the appender adds a .YYYY-MM-DD suffix.
+log_file = "transcode.log"
+# Rotated files older than this are deleted at startup. 0 disables pruning.
+retain_days = 14
+```
+
+### Logs
+
+A headless install used to discard every log line, so after an incident there
+was nothing to read. There are now four sinks:
+
+| Sink | Format | Contents |
+|---|---|---|
+| stdout | pretty | everything at `logging.level` (interactive runs) |
+| `<data_dir>/logs/transcode.log.<date>` | JSON, rotated daily | everything at `logging.level` |
+| `<data_dir>/logs/audit.log.<date>` | JSON, rotated daily | destructive operations only |
+| the web UI log panel | plain text | `WARN`, `ERROR` and every audit record |
+
+The audit log is the record of destructive API calls — purge, trash, empty
+recycle bin, retry-all, config write, service stop — with the method, path,
+caller address and resulting status:
+
+```json
+{"timestamp":"2026-09-16T18:21:41.252824Z","level":"WARN","fields":{"message":"destructive operation","op":"DELETE","path":"/api/recycle-bin/purge","remote_addr":"127.0.0.1:58051","status":200},"target":"audit"}
 ```
 
 ---
