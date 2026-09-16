@@ -313,7 +313,7 @@ sc.exe failure PlayoutTranscode reset= 86400 actions= restart/5000/restart/30000
 A service stop drains in-flight HTTP requests, stops the watcher, kills any
 running FFmpeg child and closes the database before reporting `STOPPED`.
 
-`scriptserify-service.ps1` proves all of this against a real SCM, under a
+`scripts\verify-service.ps1` proves all of this against a real SCM, under a
 throwaway service name in a temp directory. Run it from an elevated prompt
 before a release.
 
