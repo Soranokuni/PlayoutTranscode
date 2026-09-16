@@ -70,9 +70,14 @@ pub async fn run_server_with_shutdown(
     tracing::info!("PlayoutTranscode web UI listening on http://{}", addr);
 
     let app = build_router(port, bind_address, deps);
+    // `into_make_service_with_connect_info` so the peer address reaches the
+    // handlers. Without it the `ConnectInfo` extractor the T1-5 audit
+    // middleware uses is never populated and every destructive operation was
+    // recorded with `remote_addr=unknown` (T2-3).
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     // Ctrl-C used to drop the process with in-flight DB writes and the SQLite
     // pool mid-write (F-30). Stop accepting, let open requests finish.
-    axum::serve(listener, app)
+    axum::serve(listener, service)
         .with_graceful_shutdown(shutdown_signal(shutdown))
         .await
         .map_err(|e| format!("Server error: {}", e))

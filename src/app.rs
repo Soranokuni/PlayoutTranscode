@@ -83,7 +83,18 @@ pub async fn run_service(
     let (app_config, _config_path) = config::AppConfig::load(config_path_override.as_deref())
         .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
 
-    logging::init_logging(&app_config.logging.level);
+    // The UI log panel is one of the four sinks, so the handle has to exist
+    // before the subscriber is installed (T2-3).
+    let service_handle = ServiceHandle::new();
+    let _log_guards = logging::init_service_logging(
+        &app_config.logging.level,
+        logging::FileLogging {
+            dir: paths::log_dir(),
+            file: app_config.logging.log_file.clone(),
+            retain_days: app_config.logging.retain_days,
+        },
+        service_handle.clone(),
+    );
 
     profiles::validate_color_constants()
         .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
@@ -124,7 +135,6 @@ pub async fn run_service(
     if let Ok(existing_jobs) = db::load_all_durable_jobs(&pool).await {
         job_queue.populate(existing_jobs);
     }
-    let service_handle = ServiceHandle::new();
 
     let watch_root = PathBuf::from(&app_config.paths.watch_folder);
     let target_root = PathBuf::from(&app_config.paths.target_folder);

@@ -504,8 +504,15 @@ impl Default for IngestionConfig {
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Base name of the rotated log inside `<data_dir>/logs`. The date suffix
+    /// is appended by the appender.
     #[serde(default = "default_log_file")]
     pub log_file: String,
+    /// Rotated log files older than this are deleted at startup. 0 disables
+    /// pruning, which on a long-running service means unbounded growth -- so
+    /// it is opt-in, not the default.
+    #[serde(default = "default_log_retain_days")]
+    pub retain_days: u16,
 }
 
 fn default_log_level() -> String {
@@ -514,12 +521,16 @@ fn default_log_level() -> String {
 fn default_log_file() -> String {
     "transcode.log".into()
 }
+fn default_log_retain_days() -> u16 {
+    14
+}
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".into(),
             log_file: "transcode.log".into(),
+            retain_days: default_log_retain_days(),
         }
     }
 }

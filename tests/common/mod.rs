@@ -156,9 +156,12 @@ pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
     // what the CORS allow-list and the Host guard compare against.
     let app = server::build_router(port, "127.0.0.1", deps);
 
+    // Same make-service as production, so `ConnectInfo` is populated and the
+    // audit middleware records a real peer address rather than "unknown".
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        let _ = axum::serve(listener, service)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
