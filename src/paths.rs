@@ -96,11 +96,31 @@ pub fn set_data_dir(dir: PathBuf) -> Result<PathBuf, String> {
     std::fs::create_dir_all(&dir).map_err(|e| format!("Failed to create data directory: {}", e))?;
     // Resolve symlinks/8.3 names so comparisons elsewhere (media-root
     // validation) see the same spelling the filesystem uses.
-    let dir = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let dir = std::fs::canonicalize(&dir)
+        .map(|c| strip_verbatim_prefix(&c))
+        .unwrap_or(dir);
     if let Ok(mut slot) = DATA_DIR.write() {
         *slot = Some(dir.clone());
     }
     Ok(dir)
+}
+
+/// Drop the `\\?\` extended-length prefix Windows' `canonicalize` adds.
+///
+/// Not cosmetic: sqlx builds the SQLite connection string from this path, and
+/// its URL parser reads `\\?\C:\...\media_assets.db?mode=rwc` as having a
+/// query string starting at the `?` in the prefix, so the pool fails to open.
+/// Plenty of other tools mishandle verbatim paths too, so the service keeps
+/// ordinary paths everywhere and only canonicalizes to settle the spelling.
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    let s = path.to_string_lossy();
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{}", rest));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(rest);
+    }
+    path.to_path_buf()
 }
 
 /// The resolved data directory, falling back to the executable's directory when
@@ -197,6 +217,25 @@ mod tests {
         let exe = PathBuf::from(r"C:\PROGRAM FILES\PlayoutTranscode");
         let got = resolve_data_dir(None, None, &exe, Some(r"C:\ProgramData"));
         assert_eq!(got, PathBuf::from(r"C:\ProgramData\PlayoutTranscode"));
+    }
+
+    #[test]
+    fn the_verbatim_prefix_is_stripped() {
+        // sqlx's SQLite URL parser treats the `?` in `\\?\` as a query string
+        // and refuses to open the database, so this must never survive.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\ProgramData\PlayoutTranscode")),
+            PathBuf::from(r"C:\ProgramData\PlayoutTranscode")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\nas01\media\ingest")),
+            PathBuf::from(r"\\nas01\media\ingest")
+        );
+        // An ordinary path is returned untouched.
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"D:\PlayoutTranscode")),
+            PathBuf::from(r"D:\PlayoutTranscode")
+        );
     }
 
     #[test]

@@ -1,0 +1,285 @@
+//! The service's startup sequence, shared by the interactive `run` command and
+//! the Windows service entry point (T2-1).
+//!
+//! This used to live in `main.rs`, which meant the SCM entry point could not
+//! reach it: `win_service` is a library module and `main` is the binary. The
+//! only behavioural addition is [`ShutdownToken`] — an explicit, triggerable
+//! stop, because the Service Control Manager delivers `Stop` through a callback
+//! and not as Ctrl-C.
+
+use crate::{bootstrap, config, db, jobs, logging, paths, profiles, server, service_handle};
+
+use anyhow::Result;
+use service_handle::ServiceHandle;
+use std::sync::Arc;
+
+/// A stop request that can be raised from anywhere, including a non-Tokio
+/// thread such as the SCM control handler.
+///
+/// `tokio::sync::Notify` alone is not enough: the handler can fire before
+/// [`ShutdownToken::wait`] is polled, and a `Notify` permit raised with no
+/// waiter present is kept but a second `trigger` would be lost. The flag makes
+/// the token latching, so a stop delivered during startup is still observed.
+#[derive(Clone, Default)]
+pub struct ShutdownToken {
+    inner: Arc<Inner>,
+}
+
+#[derive(Default)]
+struct Inner {
+    notify: tokio::sync::Notify,
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl ShutdownToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Request shutdown. Safe to call from any thread, any number of times.
+    pub fn trigger(&self) {
+        self.inner
+            .stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        self.inner.notify.notify_waiters();
+    }
+
+    pub fn is_triggered(&self) -> bool {
+        self.inner.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Resolve once shutdown has been requested, now or earlier.
+    pub async fn wait(&self) {
+        loop {
+            if self.is_triggered() {
+                return;
+            }
+            // Register interest before re-checking, so a `trigger` racing this
+            // loop cannot slip between the check and the await.
+            let notified = self.inner.notify.notified();
+            if self.is_triggered() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// How long shutdown waits for the HTTP server to drain. Shorter than the SCM's
+/// 30 s wait hint, so a wedged connection cannot make the stop look hung.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Boot the whole service and run until `shutdown` fires or Ctrl-C arrives.
+///
+/// Returns once the HTTP server has drained and the processing loop has been
+/// asked to stop. The caller owns the Tokio runtime: `main` builds one for the
+/// interactive path, `win_service` builds one inside `service_main`.
+pub async fn run_service(
+    config_path_override: Option<String>,
+    shutdown: ShutdownToken,
+) -> Result<()> {
+    use std::path::PathBuf;
+
+    let (app_config, _config_path) = config::AppConfig::load(config_path_override.as_deref())
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
+
+    logging::init_logging(&app_config.logging.level);
+
+    profiles::validate_color_constants()
+        .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
+
+    // Must happen before any `audit_toolchain()` call so configured paths and
+    // the download digest pin are honoured (T1-2).
+    bootstrap::set_toolchain_policy(app_config.effective_toolchain_policy());
+
+    let port = app_config.server.web_port;
+    let bind_addr = app_config.server.bind_address.clone();
+    let url = format!("http://{}:{}", bind_addr, port);
+    println!("\n  PlayoutTranscode web UI starting at {}\n", url);
+    tracing::info!("PlayoutTranscode starting on {}", url);
+
+    let exe_dir = paths::exe_dir();
+    tracing::info!("Data directory: {}", paths::data_dir().display());
+
+    let pool = db::init_pool(&paths::database_path())
+        .await
+        .map_err(|e| anyhow::anyhow!("Database init failed: {}", e))?;
+    let pool = Arc::new(pool);
+    tracing::info!("Asset database ready");
+
+    let (_, toolchain_status) = bootstrap::audit_toolchain();
+    tracing::info!("FFmpeg: {:?}", toolchain_status.ffmpeg_version);
+
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
+    let job_queue = jobs::JobQueue::new(event_tx, Some(pool.clone()));
+    if let Ok(report) = db::recover_stale_jobs(&pool).await {
+        if report.requeued > 0 || report.failed_exhausted > 0 {
+            tracing::info!(
+                "Startup crash recovery: {} job(s) re-queued, {} job(s) marked failed",
+                report.requeued,
+                report.failed_exhausted
+            );
+        }
+    }
+    if let Ok(existing_jobs) = db::load_all_durable_jobs(&pool).await {
+        job_queue.populate(existing_jobs);
+    }
+    let service_handle = ServiceHandle::new();
+
+    let watch_root = PathBuf::from(&app_config.paths.watch_folder);
+    let target_root = PathBuf::from(&app_config.paths.target_folder);
+    let _ = std::fs::create_dir_all(&target_root);
+
+    let config_initialized = app_config.initialized;
+
+    let server_cfg = app_config.clone();
+    let bind_addr = server_cfg.server.bind_address.clone();
+    let port = server_cfg.server.web_port;
+    let sh = service_handle.clone();
+    let jq = job_queue.clone();
+    let server_pool = pool.clone();
+    let server_shutdown = shutdown.clone();
+
+    let web_ui_dir = resolve_web_ui_dir(&exe_dir);
+
+    let mut server_task = tokio::spawn(async move {
+        server::run_server_with_shutdown(
+            port,
+            &bind_addr,
+            server::ServerDeps {
+                jobs: jq,
+                config: server_cfg,
+                toolchain_status: toolchain_status.clone(),
+                service_handle: sh,
+                web_ui_dir,
+                pool: server_pool,
+            },
+            async move { server_shutdown.wait().await },
+        )
+        .await
+    });
+
+    if config_initialized
+        && !watch_root.to_string_lossy().is_empty()
+        && !target_root.to_string_lossy().is_empty()
+        && app_config.validate().is_ok()
+    {
+        service_handle.add_log("info", "Auto-starting service with configured watch folder");
+        if let Ok(tools) = bootstrap::ensure_toolchain() {
+            let _ = service_handle::start_processing_loop(
+                &service_handle,
+                &app_config,
+                &job_queue,
+                &tools,
+                pool.clone(),
+            );
+        } else {
+            service_handle.add_log("warn", "FFmpeg not found. Download from the web UI.");
+        }
+    }
+
+    // `&mut` so the handle survives the select: on the stop paths the server is
+    // still draining and has to be awaited below.
+    let mut server_already_exited = false;
+    tokio::select! {
+        result = &mut server_task => {
+            server_already_exited = true;
+            match result {
+                Err(e) => tracing::error!("Server task failed: {}", e),
+                Ok(Err(e)) => tracing::error!("Server exited with an error: {}", e),
+                Ok(Ok(())) => {}
+            }
+        }
+        _ = shutdown.wait() => {
+            tracing::info!("Stop requested; shutting down");
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Shutting down...");
+        }
+    }
+
+    // Reached on every exit path, including the SCM `Stop` control: stop the
+    // watcher, kill in-flight FFmpeg children (T0-4 tracks their PIDs) and let
+    // the pool close. Without this a service stop left orphaned encoders
+    // holding handles on the target folder.
+    service_handle::stop_processing(&service_handle);
+    shutdown.trigger();
+
+    // The token is what tells the server to drain, so it has to be triggered
+    // first. Wait for the drain rather than closing the pool underneath a
+    // request that is still being served; bounded, because a wedged SSE client
+    // must not hold a service stop open past the SCM's wait hint.
+    if !server_already_exited {
+        match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, server_task).await {
+            Ok(Ok(Err(e))) => tracing::error!("Server exited with an error: {}", e),
+            Ok(Err(e)) => tracing::error!("Server task failed: {}", e),
+            Ok(Ok(Ok(()))) => {}
+            Err(_) => tracing::warn!(
+                "HTTP server did not drain within {}s; closing the database anyway",
+                SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
+    pool.close().await;
+    tracing::info!("Shutdown complete");
+
+    Ok(())
+}
+
+/// The bundled SPA: next to the exe for an installed build, under the working
+/// directory for `cargo run`.
+fn resolve_web_ui_dir(exe_dir: &std::path::Path) -> std::path::PathBuf {
+    let installed = exe_dir.join("web-ui").join("dist");
+    if installed.join("index.html").exists() {
+        return installed;
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let local = cwd.join("web-ui").join("dist");
+        if local.join("index.html").exists() {
+            return local;
+        }
+    }
+    installed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_already_triggered() {
+        let token = ShutdownToken::new();
+        token.trigger();
+        // Would hang if the token were not latching.
+        tokio::time::timeout(std::time::Duration::from_secs(5), token.wait())
+            .await
+            .expect("wait resolved");
+    }
+
+    #[tokio::test]
+    async fn wait_resolves_when_triggered_from_another_thread() {
+        let token = ShutdownToken::new();
+        let t = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            t.trigger();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), token.wait())
+            .await
+            .expect("wait resolved");
+        assert!(token.is_triggered());
+    }
+
+    #[tokio::test]
+    async fn trigger_is_idempotent_and_every_clone_observes_it() {
+        let token = ShutdownToken::new();
+        let other = token.clone();
+        token.trigger();
+        token.trigger();
+        assert!(other.is_triggered());
+        tokio::time::timeout(std::time::Duration::from_secs(5), other.wait())
+            .await
+            .expect("wait resolved");
+    }
+}
