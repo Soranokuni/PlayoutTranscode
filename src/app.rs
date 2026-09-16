@@ -123,6 +123,9 @@ pub async fn run_service(
 
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
     let job_queue = jobs::JobQueue::new(event_tx, Some(pool.clone()));
+    // One writer for the whole service. Every job mutation is queued to it and
+    // coalesced by job id, instead of each one spawning its own upsert (T2-4).
+    let persister = job_queue.spawn_persister();
     if let Ok(report) = db::recover_stale_jobs(&pool).await {
         if report.requeued > 0 || report.failed_exhausted > 0 {
             tracing::info!(
@@ -132,6 +135,7 @@ pub async fn run_service(
             );
         }
     }
+    reconcile_pending_jobs(&pool).await;
     if let Ok(existing_jobs) = db::load_all_durable_jobs(&pool).await {
         job_queue.populate(existing_jobs);
     }
@@ -231,10 +235,71 @@ pub async fn run_service(
         }
     }
 
+    // Drain the coalescing persister before the pool goes away, so a stop does
+    // not discard the final state of the jobs it just stopped (T2-4).
+    job_queue.flush_persister().await;
+    if let Some(handle) = persister {
+        handle.abort();
+    }
+
     pool.close().await;
     tracing::info!("Shutdown complete");
 
     Ok(())
+}
+
+/// Fail recovered jobs whose source file has since disappeared.
+///
+/// `recover_stale_jobs` re-queues interrupted work to `Pending`, but only the
+/// filesystem watcher feeds the dispatcher, so a row whose source was moved or
+/// deleted while the service was down stayed `Pending` forever and showed up in
+/// `/api/jobs` and `/api/stats` as outstanding work that would never run
+/// (F-13). Rows whose source still exists are deliberately left `Pending`: the
+/// watcher re-offers the file and the dispatcher now adopts the existing record
+/// rather than creating a second one for it.
+async fn reconcile_pending_jobs(pool: &sqlx::SqlitePool) {
+    let pending = match db::load_pending_jobs(pool).await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!("Could not read pending jobs for reconciliation: {}", e);
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    let paths: Vec<(String, String)> = pending
+        .iter()
+        .map(|j| (j.id.clone(), j.input_path.clone()))
+        .collect();
+    let missing = match tokio::task::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter(|(_, path)| !std::path::Path::new(path).exists())
+            .map(|(id, _)| id)
+            .collect::<Vec<String>>()
+    })
+    .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::error!("Pending-job reconciliation task failed: {}", e);
+            return;
+        }
+    };
+
+    if missing.is_empty() {
+        return;
+    }
+    match db::fail_jobs_with_missing_source(pool, &missing).await {
+        Ok(n) if n > 0 => tracing::warn!(
+            "Startup reconciliation: {} pending job(s) failed, source file no longer exists",
+            n
+        ),
+        Ok(_) => {}
+        Err(e) => tracing::error!("Could not fail pending jobs with a missing source: {}", e),
+    }
 }
 
 /// The bundled SPA: next to the exe for an installed build, under the working

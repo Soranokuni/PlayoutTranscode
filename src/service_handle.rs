@@ -14,12 +14,20 @@ pub enum ServiceCmd {
     Stop,
 }
 
+/// A manual retry, with the job record it should reuse.
+#[derive(Debug, Clone)]
+pub struct RetryRequest {
+    pub path: std::path::PathBuf,
+    /// The existing job to adopt. `None` dispatches as a fresh ingest.
+    pub job_id: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ServiceHandle {
     pub running: Arc<Mutex<bool>>,
     pub cmd_tx: Arc<Mutex<Option<mpsc::Sender<ServiceCmd>>>>,
     /// Optional channel for the API to inject manual retries into the processing loop.
-    pub retry_tx: Arc<StdMutex<Option<mpsc::Sender<std::path::PathBuf>>>>,
+    pub retry_tx: Arc<StdMutex<Option<mpsc::Sender<RetryRequest>>>>,
     pub download_status: Arc<Mutex<Option<String>>>,
     pub log_lines: Arc<Mutex<Vec<String>>>,
     pub active_pids: ActivePids,
@@ -38,7 +46,16 @@ impl ServiceHandle {
     }
 
     /// Submit a manual retry for an input file. Fails if the service is not running.
-    pub fn submit_retry(&self, path: std::path::PathBuf) -> Result<(), String> {
+    ///
+    /// `job_id` names the existing record to reuse. Passing it is what stops a
+    /// retry from leaving the old job behind as a permanent ghost: the
+    /// dispatcher adopts that record instead of creating a second one for the
+    /// same file (F-13). `None` means "treat this as a fresh ingest".
+    pub fn submit_retry(
+        &self,
+        path: std::path::PathBuf,
+        job_id: Option<String>,
+    ) -> Result<(), String> {
         if !self.is_running() {
             return Err("Service is not running".into());
         }
@@ -48,7 +65,7 @@ impl ServiceHandle {
             .map_err(|e| format!("retry channel lock: {}", e))?;
         match guard.as_ref() {
             Some(tx) => tx
-                .try_send(path)
+                .try_send(RetryRequest { path, job_id })
                 .map_err(|e| format!("retry queue full or closed: {}", e)),
             None => Err("retry channel not established".into()),
         }
@@ -240,7 +257,7 @@ pub fn start_processing_loop(
             }
 
             let (file_tx, mut file_rx) = mpsc::channel::<PathBuf>(256);
-            let (retry_tx, mut retry_rx) = mpsc::channel::<PathBuf>(256);
+            let (retry_tx, mut retry_rx) = mpsc::channel::<RetryRequest>(256);
             if let Ok(mut slot) = handle_for_thread.retry_tx.lock() {
                 *slot = Some(retry_tx);
             }
@@ -267,14 +284,20 @@ pub fn start_processing_loop(
             loop {
                 tokio::select! {
                     Some(path) = file_rx.recv() => {
-                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path, &running_flag);
+                        // A file the watcher offered may already have a pending
+                        // record -- one recovered at startup, or one a retry
+                        // re-queued. Adopt it rather than creating a duplicate.
+                        let existing = jobs
+                            .find_pending_by_input_path(&path.to_string_lossy())
+                            .map(|j| j.id);
+                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path, existing, &running_flag);
                     }
-                    Some(retry_path) = retry_rx.recv() => {
+                    Some(retry) = retry_rx.recv() => {
                         handle_for_thread.add_log(
                             "info",
-                            &format!("Manual retry submitted for {}", retry_path.display()),
+                            &format!("Manual retry submitted for {}", retry.path.display()),
                         );
-                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry_path, &running_flag);
+                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry.path, retry.job_id, &running_flag);
                     }
                     cmd = cmd_rx.recv() => {
                         if let Some(ServiceCmd::Stop) = cmd {
@@ -307,6 +330,8 @@ fn dispatch_one(
     pool: &SqlitePool,
     active_pids: &ActivePids,
     path: std::path::PathBuf,
+    // The existing job record to reuse, if this file already has one.
+    existing_job_id: Option<String>,
     running: &Arc<parking_lot::Mutex<bool>>,
 ) {
     let t = tools.clone();
@@ -317,6 +342,7 @@ fn dispatch_one(
     let p = pool.clone();
     let apids = active_pids.clone();
     let r = running.clone();
+    let existing = existing_job_id.and_then(|id| jobs.get(&id));
 
     tokio::spawn(async move {
         // Wait for an available concurrency slot without blocking the main event loop
@@ -332,7 +358,7 @@ fn dispatch_one(
         let _ = tokio::task::spawn_blocking(move || {
             // Permit is moved here and kept alive for the full duration of processing
             let _held_permit = permit;
-            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p, apids);
+            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p, apids, existing);
         })
         .await;
     });

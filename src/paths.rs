@@ -112,7 +112,11 @@ pub fn set_data_dir(dir: PathBuf) -> Result<PathBuf, String> {
 /// query string starting at the `?` in the prefix, so the pool fails to open.
 /// Plenty of other tools mishandle verbatim paths too, so the service keeps
 /// ordinary paths everywhere and only canonicalizes to settle the spelling.
-fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+/// Comparing a canonicalized path against a non-canonicalized one -- which
+/// happens whenever one side is a file that no longer exists -- also fails
+/// silently, because only one of them carries the prefix. `processor` relies
+/// on this for its watch-folder containment check.
+pub fn strip_verbatim_prefix(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         return PathBuf::from(format!(r"\\{}", rest));

@@ -447,6 +447,7 @@ pub fn process_file_sync(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
 ) {
     process_file_sync_with_runner(
         queue,
@@ -456,6 +457,7 @@ pub fn process_file_sync(
         config,
         pool,
         active_pids,
+        existing_job,
         &RealTranscodeRunner,
     );
 }
@@ -468,6 +470,7 @@ pub fn process_file_sync_with_runner(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
 ) {
     process_file_sync_with_runner_and_measurer(
@@ -478,6 +481,7 @@ pub fn process_file_sync_with_runner(
         config,
         pool,
         active_pids,
+        existing_job,
         runner,
         &probe::RealLoudnessMeasurer,
     );
@@ -491,6 +495,7 @@ pub fn process_file_sync_with_runner_and_measurer(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
@@ -503,6 +508,7 @@ pub fn process_file_sync_with_runner_and_measurer(
             config,
             pool,
             active_pids,
+            existing_job.clone(),
             runner,
             measurer,
         );
@@ -540,18 +546,43 @@ fn process_file_inner(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
+    // Every early return below happens before a job record would normally be
+    // created. When we have adopted an existing record we must close it out, or
+    // it stays Pending forever -- which is the ghost F-13 is about.
+    let close_adopted = |category: &str, message: &str| {
+        if let Some(j) = existing_job.as_ref() {
+            let msg = message.to_string();
+            let cat = category.to_string();
+            let _ = queue.transition(&j.id, jobs::JobPhase::Failed, Some("Failed".into()), |job| {
+                job.error = Some(msg);
+                job.error_category = Some(cat);
+            });
+        }
+    };
+
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
-    let canonical_input = input_path
-        .canonicalize()
-        .unwrap_or_else(|_| input_path.to_path_buf());
-    let canonical_watch = watch_root
-        .canonicalize()
-        .unwrap_or_else(|_| watch_root.to_path_buf());
+    // Both sides go through `strip_verbatim_prefix`, because only a path
+    // that canonicalizes successfully picks up the Windows \\?\ prefix. A
+    // file deleted between the watcher seeing it and this worker picking it
+    // up does not, so the comparison used to fail: every vanished file was
+    // logged as a path-traversal attempt and given the wrong error category.
+    let canonical_input = crate::paths::strip_verbatim_prefix(
+        &input_path
+            .canonicalize()
+            .unwrap_or_else(|_| input_path.to_path_buf()),
+    );
+    let canonical_watch = crate::paths::strip_verbatim_prefix(
+        &watch_root
+            .canonicalize()
+            .unwrap_or_else(|_| watch_root.to_path_buf()),
+    );
     if !canonical_input.starts_with(&canonical_watch) {
         tracing::warn!("Rejected path traversal attempt: {}", input_path.display());
+        close_adopted("path_outside_watch_folder", "Input is outside the watch folder");
         return;
     }
 
@@ -569,6 +600,7 @@ fn process_file_inner(
         Ok(fp) => fp,
         Err(e) => {
             tracing::error!("Fingerprint failed for {}: {}", input_path.display(), e);
+            close_adopted("fingerprint_failure", "Could not read the source file");
             return;
         }
     };
@@ -584,6 +616,15 @@ fn process_file_inner(
                 existing.uuid,
                 existing.current_path,
                 fingerprint,
+            );
+            // Reported as Failed rather than Completed because the phase machine
+            // has no non-error terminal reachable from Queued. The distinct
+            // category is what the UI and PlayOut should key on: the retry did
+            // not run because the asset is already ingested. A visible terminal
+            // state beats a row that sits Pending forever.
+            close_adopted(
+                "duplicate_skipped",
+                "Skipped: an identical asset is already ingested",
             );
             return;
         }
@@ -627,11 +668,35 @@ fn process_file_inner(
         );
     }
 
-    let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
-    job.uuid = Some(metadata_uuid.clone());
-    job.fingerprint = Some(fingerprint);
-    let _ = job.transition_to(jobs::JobPhase::Probing, Some("Probing".to_string()));
-    queue.push(job.clone());
+    // Reuse the adopted record where there is one. Creating a fresh JobRecord
+    // for a retry is what left the old one behind as a permanent ghost (F-13);
+    // the id, created_at and attempt count all carry over.
+    let job = match existing_job.as_ref() {
+        Some(prior) => {
+            let uuid = metadata_uuid.clone();
+            let _ = queue.transition(
+                &prior.id,
+                jobs::JobPhase::Probing,
+                Some("Probing".to_string()),
+                |j| {
+                    j.uuid = Some(uuid);
+                    j.fingerprint = Some(fingerprint);
+                    j.error = None;
+                    j.error_category = None;
+                    j.finished_at = None;
+                },
+            );
+            queue.get(&prior.id).unwrap_or_else(|| prior.clone())
+        }
+        None => {
+            let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
+            job.uuid = Some(metadata_uuid.clone());
+            job.fingerprint = Some(fingerprint);
+            let _ = job.transition_to(jobs::JobPhase::Probing, Some("Probing".to_string()));
+            queue.push(job.clone());
+            job
+        }
+    };
     queue.broadcast(
         "job_update",
         &serde_json::json!({"id": job.id, "stage": "Probing", "phase": "probing"}).to_string(),
@@ -794,7 +859,12 @@ fn process_file_inner(
             const THROTTLE_MS: u64 = 250;
             while let Ok(p) = prx.recv() {
                 let pct = p.percent;
-                qc.update(&jid, |j| {
+                // In-memory only: FFmpeg emits a progress line every few
+                // frames and each one used to spawn its own upsert -- from
+                // this std thread, that meant a new OS thread and a new Tokio
+                // runtime per line (F-13). The row is written below, at the
+                // same 250 ms throttle as the SSE broadcast.
+                qc.update_local(&jid, |j| {
                     j.progress = pct;
                     j.current_frame = p.frame;
                     j.encode_fps = p.fps;
@@ -813,6 +883,7 @@ fn process_file_inner(
                     || pct >= 100.0
                 {
                     last_broadcast = now;
+                    qc.persist_now(&jid);
                     let determinate = p.duration_ms > 0 || p.total_frames > 0;
                     let _ = qc.broadcast(
                         "progress",
@@ -1917,6 +1988,149 @@ mod tests {
         assert_eq!(policy.max_attempts, 1);
         let max_att = (policy.max_attempts as usize).max(1);
         assert_eq!(max_att, 1);
+    }
+
+    /// A queue, pool and watch/target tree for driving `process_file_sync`.
+    async fn adoption_fixture(
+        tag: &str,
+    ) -> (
+        jobs::JobQueue,
+        SqlitePool,
+        config::AppConfig,
+        std::path::PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "pt-adopt-{}-{}-{}",
+            std::process::id(),
+            tag,
+            Uuid::new_v4()
+        ));
+        let watch = root.join("watch");
+        let target = root.join("target");
+        std::fs::create_dir_all(&watch).expect("watch dir");
+        std::fs::create_dir_all(&target).expect("target dir");
+
+        let pool = crate::db::init_pool(&root.join("jobs.db"))
+            .await
+            .expect("init pool");
+        let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let queue = jobs::JobQueue::new(event_tx, None);
+
+        let mut cfg = config::AppConfig::default();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = target.to_string_lossy().to_string();
+
+        (queue, pool, cfg, root)
+    }
+
+    /// A job in the state a manual retry leaves behind: re-queued and pending.
+    fn requeued_job(input: &std::path::Path) -> jobs::JobRecord {
+        let mut job = jobs::JobRecord::new(&input.to_string_lossy(), "pending");
+        job.transition_to(jobs::JobPhase::Probing, None).unwrap();
+        job.transition_to(jobs::JobPhase::Failed, Some("Failed".into()))
+            .unwrap();
+        job.transition_to(jobs::JobPhase::Queued, Some("Re-queued (manual retry)".into()))
+            .unwrap();
+        job.attempt = 2;
+        job
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_source_vanished_closes_its_own_job() {
+        // The ghost F-13 describes: the retry cannot run, and before T2-4
+        // nothing ever moved the re-queued record off Pending, so it sat in
+        // /api/jobs forever as outstanding work.
+        let (queue, pool, cfg, root) = adoption_fixture("gone").await;
+        let missing = std::path::Path::new(&cfg.paths.watch_folder).join("vanished.mov");
+
+        let job = requeued_job(&missing);
+        let id = job.id.clone();
+        queue.push(job.clone());
+
+        process_file_sync(
+            &queue,
+            &bootstrap::ToolPaths {
+                ffmpeg: std::path::PathBuf::new(),
+                ffprobe: std::path::PathBuf::new(),
+            },
+            std::path::Path::new(&cfg.paths.target_folder),
+            &missing,
+            &cfg,
+            &pool,
+            crate::service_handle::ActivePids::default(),
+            Some(job),
+        );
+
+        let all = queue.all();
+        assert_eq!(all.len(), 1, "a second, ghost job record was created");
+        let after = queue.get(&id).expect("the adopted job is still there");
+        assert_eq!(after.phase, jobs::JobPhase::Failed);
+        assert_eq!(after.state, jobs::JobState::Failed);
+        assert_eq!(after.error_category.as_deref(), Some("fingerprint_failure"));
+        assert_eq!(after.attempt, 2, "the attempt count was reset");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_input_outside_the_watch_folder_closes_an_adopted_job() {
+        let (queue, pool, cfg, root) = adoption_fixture("outside").await;
+        // Real file, but not under the watch folder: the traversal guard trips.
+        let outside = root.join("elsewhere.mov");
+        std::fs::write(&outside, b"not media").expect("write fixture");
+
+        let job = requeued_job(&outside);
+        let id = job.id.clone();
+        queue.push(job.clone());
+
+        process_file_sync(
+            &queue,
+            &bootstrap::ToolPaths {
+                ffmpeg: std::path::PathBuf::new(),
+                ffprobe: std::path::PathBuf::new(),
+            },
+            std::path::Path::new(&cfg.paths.target_folder),
+            &outside,
+            &cfg,
+            &pool,
+            crate::service_handle::ActivePids::default(),
+            Some(job),
+        );
+
+        let after = queue.get(&id).expect("job still present");
+        assert_eq!(after.phase, jobs::JobPhase::Failed);
+        assert_eq!(
+            after.error_category.as_deref(),
+            Some("path_outside_watch_folder")
+        );
+        assert_eq!(queue.all().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_ingest_with_no_adopted_job_creates_nothing_on_early_return() {
+        // The other half of the contract: without an adopted record, an early
+        // return must not invent a job either.
+        let (queue, pool, cfg, root) = adoption_fixture("fresh").await;
+        let missing = std::path::Path::new(&cfg.paths.watch_folder).join("nope.mov");
+
+        process_file_sync(
+            &queue,
+            &bootstrap::ToolPaths {
+                ffmpeg: std::path::PathBuf::new(),
+                ffprobe: std::path::PathBuf::new(),
+            },
+            std::path::Path::new(&cfg.paths.target_folder),
+            &missing,
+            &cfg,
+            &pool,
+            crate::service_handle::ActivePids::default(),
+            None,
+        );
+
+        assert!(queue.all().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
