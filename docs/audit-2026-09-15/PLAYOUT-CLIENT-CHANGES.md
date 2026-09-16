@@ -295,7 +295,93 @@ Two consequences for PlayOut:
 
 ---
 
-## 6. Still coming (no action yet, listed for planning)
+## 6. Job records: retries no longer leave ghosts — **check your job handling**
+
+**Status in PlayoutTranscode:** shipped (T2-4).
+
+Nothing renamed, nothing removed. But what `GET /api/jobs`, `/api/jobs/active`,
+`/api/jobs/pending` and `/api/stats` return has changed in ways a client can
+notice.
+
+### 6.1 A retry reuses the job id instead of creating a second job
+
+Before: `POST /api/jobs/{id}/retry` marked the old record re-queued and the
+service then created a **brand-new** job for the same file. The old record
+stayed `Pending` forever. Every retry permanently added one phantom pending job
+to the list, and `/api/stats` counted it.
+
+Now: the retry reuses the same record. The `id` you retried is the `id` that
+runs, and `created_at` is preserved.
+
+**What PlayOut should check:**
+
+- If anything keys off "a retry produces a new job id", it will now see the
+  same id transition `Pending → Processing → …` again. This is the intended
+  behaviour and simpler to follow, but it is a change.
+- If PlayOut has been filtering or de-duplicating the job list to hide the
+  phantom pending entries, that workaround can go — and if it de-duplicates by
+  `input_path`, it may now be hiding the real job.
+- Pending counts will drop on upgrade for any installation that has been
+  retrying jobs. That is the phantom work disappearing, not lost work.
+
+### 6.2 Startup can now move a Pending job to Failed
+
+At startup, a job left `Pending` whose source file no longer exists is failed
+with:
+
+```json
+{ "state": "Failed", "phase": "failed",
+  "error_category": "source_missing_on_recovery",
+  "error": "Source file no longer exists" }
+```
+
+Previously those sat `Pending` forever. A job whose source still exists is left
+`Pending` and picked up normally.
+
+### 6.3 A retry that hits an already-ingested asset reports Failed
+
+If a retry turns out to be a duplicate of an asset already ingested and valid,
+the job ends as:
+
+```json
+{ "state": "Failed", "phase": "failed",
+  "error_category": "duplicate_skipped",
+  "error": "Skipped: an identical asset is already ingested" }
+```
+
+This is **not** an error condition — nothing went wrong and no work was needed.
+It is reported as `Failed` because the job phase machine has no non-error
+terminal state reachable from a queued job.
+
+**Please key on `error_category`, not on `state`,** if you surface this to an
+operator. Showing "duplicate_skipped" as a red failure would be misleading. Say
+"already ingested" or similar. Tell us if you would prefer a dedicated phase and
+we will look at widening the state machine.
+
+### 6.4 Two new `error_category` values
+
+Add these to whatever mapping PlayOut uses for failure reasons:
+
+| `error_category` | Meaning | Operator-facing wording |
+|---|---|---|
+| `source_missing_on_recovery` | Job was pending across a restart; source file is gone | "Source file no longer available" |
+| `duplicate_skipped` | Retry matched an asset already ingested | "Already ingested — nothing to do" |
+| `fingerprint_failure` | Source could not be read | "Could not read the source file" |
+| `path_outside_watch_folder` | Input resolved outside the watch folder | "File is not in the watch folder" |
+
+The last two existed as behaviour but previously produced no job record at all
+on a retry; now they close the job out visibly.
+
+### 6.5 Progress updates are unchanged for you
+
+SSE `progress` events still arrive at the same 250 ms throttle and carry the
+same fields. What changed is only how often the *database* is written, which
+PlayOut never sees. `GET /api/jobs` still serves the live in-memory record, so
+percentages are as current as they ever were.
+
+---
+
+## 7. Still coming (no action yet, listed for planning)
 
 - **Paginated listings (T2-7).** `GET /api/assets` will default to
   `limit=1000` with `X-Total-Count`, and will omit `keyframe_offsets` unless
