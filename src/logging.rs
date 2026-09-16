@@ -10,8 +10,11 @@ pub fn init_logging(level: &str) {
         .with_thread_names(false)
         .with_level(true);
 
-    tracing_subscriber::registry()
+    // `try_init` rather than `init`: the Windows service path may reach this
+    // after an earlier subcommand has already installed a subscriber, and a
+    // second `init` panics. A duplicate call is a no-op, not a crash.
+    let _ = tracing_subscriber::registry()
         .with(filter)
         .with(fmt_layer)
-        .init();
+        .try_init();
 }

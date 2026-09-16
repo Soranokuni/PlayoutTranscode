@@ -48,6 +48,20 @@ pub struct ServerDeps {
 }
 
 pub async fn run_server(port: u16, bind_address: &str, deps: ServerDeps) -> Result<(), String> {
+    run_server_with_shutdown(port, bind_address, deps, std::future::pending()).await
+}
+
+/// `run_server`, but draining when `shutdown` resolves as well as on Ctrl-C.
+///
+/// The Service Control Manager delivers `Stop` through a callback on its own
+/// thread, not as a console signal, so the Windows service path (T2-1) needs a
+/// second way to ask the server to drain.
+pub async fn run_server_with_shutdown(
+    port: u16,
+    bind_address: &str,
+    deps: ServerDeps,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
     let addr = format!("{}:{}", bind_address, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -59,15 +73,18 @@ pub async fn run_server(port: u16, bind_address: &str, deps: ServerDeps) -> Resu
     // Ctrl-C used to drop the process with in-flight DB writes and the SQLite
     // pool mid-write (F-30). Stop accepting, let open requests finish.
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(shutdown))
         .await
         .map_err(|e| format!("Server error: {}", e))
 }
 
-async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("Shutdown signal received; draining HTTP requests"),
-        Err(e) => tracing::error!("Failed to install Ctrl-C handler: {}", e),
+async fn shutdown_signal(external: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => match r {
+            Ok(()) => tracing::info!("Shutdown signal received; draining HTTP requests"),
+            Err(e) => tracing::error!("Failed to install Ctrl-C handler: {}", e),
+        },
+        _ = external => tracing::info!("Stop requested; draining HTTP requests"),
     }
 }
 

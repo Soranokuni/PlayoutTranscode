@@ -256,6 +256,40 @@ download_sha256 = ""
 
 ---
 
+## Running as a Windows Service
+
+The installer registers the service against the `service-run` subcommand, which
+is the Service Control Manager entry point:
+
+```
+sc.exe create PlayoutTranscode ^
+  binPath= "\"C:\Program Files\PlayoutTranscode\PlayoutTranscode.exe\" service-run --data-dir \"C:\ProgramData\PlayoutTranscode\" --config \"C:\ProgramData\PlayoutTranscode\config.toml\"" ^
+  start= auto obj= "NT AUTHORITY\LocalService"
+sc.exe failure PlayoutTranscode reset= 86400 actions= restart/5000/restart/30000/restart/60000
+```
+
+- `service-run` is **only** for the SCM. From a console it exits immediately
+  and tells you to use `run` instead. Registering `run` as the `binPath` is
+  what made the service fail to start with error 1053.
+- The account is `NT AUTHORITY\LocalService`, not LocalSystem. The service
+  needs filesystem access to the media folders and nothing else.
+- That account must be granted **Modify** on the data directory (the installer
+  does this) and on the watch and target folders (the operator must):
+
+  ```
+  icacls "<watch folder>"  /grant "NT AUTHORITY\LocalService:(OI)(CI)M" /T
+  icacls "<target folder>" /grant "NT AUTHORITY\LocalService:(OI)(CI)M" /T
+  ```
+
+A service stop drains in-flight HTTP requests, stops the watcher, kills any
+running FFmpeg child and closes the database before reporting `STOPPED`.
+
+`scriptserify-service.ps1` proves all of this against a real SCM, under a
+throwaway service name in a temp directory. Run it from an elevated prompt
+before a release.
+
+---
+
 ## Build & Run
 
 ### 1. Build from Source
