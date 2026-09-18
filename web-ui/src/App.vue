@@ -8,10 +8,26 @@
       :link="linkState"
       :dl="downloading"
       :uptime="uptimeMs"
+      :busy="serviceBusy"
       @start="onStart"
-      @stop="stopService"
+      @stop="askStop"
       @download="downloadFFmpeg"
     />
+
+    <!-- F-23 was fixed server-side: after a save the running loop keeps its old
+         clone and /api/service/status reports restart_required. Nothing in the
+         UI ever said so, so an operator who lowered max_concurrency saw
+         "saved successfully" and nothing happened (UX-01). -->
+    <div v-if="serviceStatus?.restart_required" class="restart-banner" role="status">
+      <span class="restart-glyph" aria-hidden="true">⚠</span>
+      <span>
+        Configuration saved, but the running ingest loop is still using the
+        previous values. Restart processing to apply them.
+      </span>
+      <button class="btn restart-btn" :disabled="serviceBusy" @click="askRestart">
+        Restart processing
+      </button>
+    </div>
 
     <nav class="tab-bar">
       <button v-for="t in tabs" :key="t.id" :class="['tab-btn', { active: activeTab === t.id }]" @click="activeTab = t.id">
@@ -113,7 +129,7 @@
             :jobs="jobs"
             @retry="onRetryJob"
             @cancel="onCancelJob"
-            @retry-all="onRetryAll"
+            @retry-all="askRetryAll"
           />
           <AssetRegistryGrid :assets="assets" />
 
@@ -285,6 +301,17 @@
         </div>
       </template>
     </main>
+
+    <ConfirmDialog
+      :open="confirm.kind !== null"
+      :title="confirm.title"
+      :body="confirm.body"
+      :detail="confirm.detail"
+      :confirm-label="confirm.label"
+      :busy="serviceBusy"
+      @confirm="runConfirmed"
+      @cancel="closeConfirm"
+    />
   </div>
 </template>
 
@@ -294,6 +321,7 @@ import { useEventStream, type ConfigPayload } from './composables/useEventStream
 import BroadcastTopBar from './components/BroadcastTopBar.vue'
 import IngestQueuePanel from './components/IngestQueuePanel.vue'
 import AssetRegistryGrid from './components/AssetRegistryGrid.vue'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 // The largest component in the UI by a wide margin, and the Database tab is
 // almost never the first screen an operator opens. Loading it on demand keeps
 // it out of the dashboard's bundle.
@@ -317,6 +345,7 @@ const {
   serviceRunning, serviceStatus, downloading, logs, logLines, linkState, uptimeMs,
   fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
   setLogPolling, clearLogs, retryJob, cancelJob, retryAllFailed,
+  fetchServiceStatus,
   authRequired, applyApiToken,
 } = useEventStream()
 
@@ -417,6 +446,97 @@ async function onCancelJob(id: string) {
   const ok = !!r?.success
   const msg = ok ? 'Cancelling job…' : (r?.error || 'Cancel failed')
   ingestPanelRef.value?.showRetryMsg(msg, ok)
+}
+
+type ConfirmKind = 'stop' | 'restart' | 'retryAll'
+
+const serviceBusy = ref(false)
+const confirm = ref<{
+  kind: ConfirmKind | null
+  title: string
+  body: string
+  detail?: string
+  label: string
+}>({ kind: null, title: '', body: '', label: '' })
+
+function closeConfirm() {
+  confirm.value = { kind: null, title: '', body: '', label: '' }
+}
+
+const runningCount = computed(
+  () => Array.from(jobs.value.values()).filter((j) => j.state === 'Processing').length,
+)
+const failedCount = computed(
+  () => Array.from(jobs.value.values()).filter((j) => j.state === 'Failed').length,
+)
+
+function askStop() {
+  const n = runningCount.value
+  confirm.value = {
+    kind: 'stop',
+    title: 'Stop ingest?',
+    body: n
+      ? `${n} encode${n === 1 ? '' : 's'} in progress will be cancelled and restarted from scratch on the next start.`
+      : 'Nothing is encoding right now, so no work will be lost.',
+    detail: 'The web UI and the API stay up; only the ingest loop stops.',
+    label: 'Stop ingest',
+  }
+}
+
+function askRestart() {
+  const n = runningCount.value
+  confirm.value = {
+    kind: 'restart',
+    title: 'Restart processing?',
+    body: n
+      ? `${n} encode${n === 1 ? '' : 's'} in progress will be cancelled and restarted from scratch.`
+      : 'Nothing is encoding right now, so no work will be lost.',
+    detail: 'The loop restarts with the configuration you just saved.',
+    label: 'Restart processing',
+  }
+}
+
+function askRetryAll() {
+  const n = failedCount.value
+  confirm.value = {
+    kind: 'retryAll',
+    title: 'Retry all failed jobs?',
+    body: `${n} failed job${n === 1 ? '' : 's'} will be re-queued.`,
+    detail: 'Jobs whose source file is no longer in the watch folder are reported as source-missing rather than retried.',
+    label: 'Retry all',
+  }
+}
+
+async function runConfirmed() {
+  const kind = confirm.value.kind
+  if (!kind || serviceBusy.value) return
+  serviceBusy.value = true
+  try {
+    if (kind === 'stop') {
+      const r = await stopService()
+      const err = (r as { error?: string } | null)?.error
+      // A 409/503 refusal (T2-5) carries a reason; it used to reach only the
+      // console.
+      if (err) ingestPanelRef.value?.showRetryMsg(err, false)
+    } else if (kind === 'restart') {
+      const stopped = await stopService()
+      const stopErr = (stopped as { error?: string } | null)?.error
+      if (stopErr) {
+        ingestPanelRef.value?.showRetryMsg(stopErr, false)
+      } else {
+        const started = await startService()
+        if (started && !started.success) {
+          ingestPanelRef.value?.showRetryMsg(started.error || 'Failed to start service', false)
+        }
+      }
+      await fetchServiceStatus()
+    } else {
+      await onRetryAll()
+    }
+  } finally {
+    serviceBusy.value = false
+    closeConfirm()
+  }
 }
 
 async function onRetryAll() {
@@ -545,8 +665,18 @@ async function saveConfigAndStart() {
 }
 
 async function onStart() {
-  const r = await startService()
-  if (r && !r.success) alert(r.error || 'Failed to start service')
+  if (serviceBusy.value) return
+  serviceBusy.value = true
+  try {
+    const r = await startService()
+    // The server's refusal reason (T2-5) belongs on screen, not in an alert
+    // that discards it as soon as it is dismissed.
+    if (r && !r.success) {
+      ingestPanelRef.value?.showRetryMsg(r.error || 'Failed to start service', false)
+    }
+  } finally {
+    serviceBusy.value = false
+  }
 }
 
 onMounted(loadAndDecideWizard)
@@ -573,6 +703,32 @@ watch(logs, async (newLogs) => {
 </script>
 
 <style scoped>
+.restart-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 16px 12px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: var(--accent-amber);
+  background: rgba(245, 166, 35, 0.08);
+  border: 1px solid rgba(245, 166, 35, 0.35);
+  border-radius: var(--radius-base);
+}
+
+.restart-glyph {
+  font-size: 14px;
+}
+
+.restart-btn {
+  margin-left: auto;
+  padding: 4px 14px;
+  font-size: 12px;
+  border-color: var(--accent-amber);
+  color: var(--accent-amber);
+  white-space: nowrap;
+}
+
 .token-error {
   color: var(--accent-crimson);
   font-size: 12px;
