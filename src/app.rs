@@ -136,7 +136,12 @@ pub async fn run_service(
     let (_, toolchain_status) = bootstrap::audit_toolchain();
     tracing::info!("FFmpeg: {:?}", toolchain_status.ffmpeg_version);
 
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
+    // 1024, raised from 256 (T2-10). A single busy encode emits a progress
+    // event every 250 ms, so with max_concurrency at 8 the old buffer held
+    // about eight seconds of traffic -- less than a browser tab spends
+    // throttled in the background. Capacity does not prevent a lag, it only
+    // makes one rare; the `resync` event is what makes it survivable.
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(1024);
     let job_queue = jobs::JobQueue::new(event_tx, Some(pool.clone()));
     // One writer for the whole service. Every job mutation is queued to it and
     // coalesced by job id, instead of each one spawning its own upsert (T2-4).

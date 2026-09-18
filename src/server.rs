@@ -1462,20 +1462,56 @@ struct EventEnvelope {
     data: serde_json::Value,
 }
 
+/// `GET /api/events` — the SSE stream (T2-10).
+///
+/// Two guarantees a client can rely on:
+///
+/// * the **first** event is always `connected`, carrying `server_time`. A
+///   client uses it to (re)synchronise after the stream is established, and the
+///   timestamp lets it tell a fresh connection from a replayed one.
+/// * a `resync` event is emitted whenever this subscriber fell behind and the
+///   broadcast channel dropped messages for it, carrying how many.
+///
+/// The second is the one that matters. A slow consumer — a laptop that slept, a
+/// browser tab throttled in the background — silently lost events and then went
+/// on displaying a stale job list forever, because nothing told it to refetch
+/// (F-20). `BroadcastStream` surfaces this as `Lagged(n)`, and the old
+/// `.ok()?` discarded it along with the information.
 async fn sse_events(
     State(state): State<ServerState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.jobs.event_sender().subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg: Result<String, _>| {
-        let msg = msg.ok()?;
-        let envelope: EventEnvelope = serde_json::from_str(&msg).ok()?;
-        let event = Event::default()
-            .event(envelope.event)
-            .data(envelope.data.to_string());
-        Some(Ok(event))
+
+    let hello = Event::default().event("connected").data(
+        serde_json::json!({
+            "server_time": chrono::Utc::now().to_rfc3339(),
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string(),
+    );
+    let head = tokio_stream::once(Ok::<Event, std::convert::Infallible>(hello));
+
+    let tail = BroadcastStream::new(rx).filter_map(|msg: Result<String, _>| match msg {
+        Ok(msg) => {
+            let envelope: EventEnvelope = serde_json::from_str(&msg).ok()?;
+            Some(Ok(Event::default()
+                .event(envelope.event)
+                .data(envelope.data.to_string())))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
+            // Not fatal: the subscription is still live and will keep
+            // delivering. The client just has to assume its view is stale.
+            tracing::warn!(
+                "SSE subscriber fell behind and dropped {} event(s); sending resync",
+                dropped
+            );
+            Some(Ok(Event::default().event("resync").data(
+                serde_json::json!({ "dropped": dropped }).to_string(),
+            )))
+        }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(head.chain(tail)).keep_alive(KeepAlive::default())
 }
 
 #[derive(Serialize)]
@@ -1535,6 +1571,11 @@ async fn get_service_status(State(state): State<ServerState>) -> Json<serde_json
         // `state` distinguishes the two transitional states it collapsed.
         "state": state.service_handle.state().as_str(),
         "generation": state.service_handle.generation(),
+        // Additive (T2-12). True when config.toml has been changed since the
+        // processing loop started, so the running loop is using the old values.
+        "restart_required": state
+            .service_handle
+            .restart_required(&state.config.lock()),
     }))
 }
 

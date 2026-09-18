@@ -400,13 +400,24 @@ export function useEventStream() {
         break
       }
       case 'completed':
-      case 'failed': {
+      case 'failed':
+      case 'skipped': {
         fetchAll()
         fetchAssets()
         break
       }
       case 'connected': {
         fetchAll()
+        break
+      }
+      // The server dropped events for this subscriber -- a throttled background
+      // tab, a laptop that slept (T2-10). Whatever is on screen is stale, so
+      // refetch rather than keep applying deltas to a wrong baseline.
+      case 'resync': {
+        const r = data as { dropped?: number }
+        console.warn('[useEventStream] missed', r?.dropped ?? '?', 'event(s); resynchronising')
+        fetchAll()
+        fetchAssets()
         break
       }
     }
@@ -427,6 +438,16 @@ export function useEventStream() {
     })
     sseConnection.addEventListener('connected', () => {
       handleSSEEvent('connected', {})
+    })
+    // T2-10. Without this the UI keeps applying progress deltas to a job list
+    // it has already lost events for, and silently shows a stale queue.
+    sseConnection.addEventListener('resync', (e) => {
+      try { handleSSEEvent('resync', JSON.parse(e.data)) } catch { handleSSEEvent('resync', {}) }
+    })
+    // Emitted when an ingest was skipped as a confirmed duplicate (T2-6). It is
+    // a terminal outcome, so the queue and the library both need refreshing.
+    sseConnection.addEventListener('skipped', (e) => {
+      try { handleSSEEvent('skipped', JSON.parse(e.data)) } catch { handleSSEEvent('skipped', {}) }
     })
 
     sseConnection.onopen = () => {

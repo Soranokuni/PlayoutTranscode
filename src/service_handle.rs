@@ -116,6 +116,9 @@ pub struct ServiceHandle {
     pub cmd_tx: Arc<Mutex<Option<mpsc::Sender<ServiceCmd>>>>,
     /// Optional channel for the API to inject manual retries into the processing loop.
     pub retry_tx: Arc<StdMutex<Option<mpsc::Sender<RetryRequest>>>>,
+    /// Hash of the config the processing loop was started with (T2-12).
+    /// `None` when it has never been started.
+    started_config_hash: Arc<Mutex<Option<u64>>>,
     pub download_status: Arc<Mutex<Option<String>>>,
     pub log_lines: Arc<Mutex<Vec<String>>>,
     pub active_pids: ActivePids,
@@ -129,6 +132,7 @@ impl ServiceHandle {
             worker_exit: Arc::new(Mutex::new(Arc::new(WorkerExit::default()))),
             cmd_tx: Arc::new(Mutex::new(None)),
             retry_tx: Arc::new(StdMutex::new(None)),
+            started_config_hash: Arc::new(Mutex::new(None)),
             download_status: Arc::new(Mutex::new(None)),
             log_lines: Arc::new(Mutex::new(Vec::new())),
             active_pids: Arc::new(StdMutex::new(HashMap::new())),
@@ -186,6 +190,27 @@ impl ServiceHandle {
     /// The full lifecycle state, for `/api/service/status` and diagnostics.
     pub fn state(&self) -> ServiceState {
         self.run_state.lock().state
+    }
+
+    /// Does the running processing loop predate the current configuration?
+    ///
+    /// `PUT /api/config` writes the file and updates the in-memory config, but
+    /// the watcher, the concurrency semaphore and the CPU budget were all
+    /// captured by value when the loop started (F-23). An operator who changed
+    /// `max_concurrency` or the watch folder and saw the UI accept it had no
+    /// way to learn that nothing had actually changed until the next restart.
+    ///
+    /// False when the service is not running: there is nothing to restart.
+    pub fn restart_required(&self, current: &AppConfig) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        match *self.started_config_hash.lock() {
+            Some(started) => started != runtime_config_hash(current),
+            // Running, but started before this field existed or by a path that
+            // did not record it. Claiming a restart is needed would nag; say no.
+            None => false,
+        }
     }
 
     /// The current run's generation. Bumped once per successful start.
@@ -343,6 +368,31 @@ pub fn kill_process_tree(pid: u32) {
     }
 }
 
+/// Hash of the configuration fields the processing loop captures at start.
+///
+/// Deliberately not the whole `AppConfig`: most of it is read per request or
+/// per job and takes effect immediately, and hashing those would report a
+/// restart as needed for a change that has already applied. These are the ones
+/// the loop copies by value and then never re-reads.
+pub fn runtime_config_hash(config: &AppConfig) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = fnv::FnvHasher::default();
+
+    config.paths.watch_folder.hash(&mut h);
+    config.paths.target_folder.hash(&mut h);
+    config.ingestion.max_concurrency.hash(&mut h);
+    config.ingestion.settle_secs.hash(&mut h);
+    config.ingestion.poll_secs.hash(&mut h);
+    config.ingestion.stable_polls_min.hash(&mut h);
+    config.ingestion.include_extensions.hash(&mut h);
+    config.ingestion.exclude_extensions.hash(&mut h);
+    config.ingestion.auto_retry_on_start.hash(&mut h);
+    config.encoding.cpu_cores.hash(&mut h);
+    config.encoding.ffmpeg_threads.hash(&mut h);
+
+    h.finish()
+}
+
 pub fn start_processing_loop(
     handle: &ServiceHandle,
     config: &AppConfig,
@@ -353,6 +403,7 @@ pub fn start_processing_loop(
     // Claims the state machine before anything else, so two concurrent
     // `POST /api/service/start` calls cannot both get past this point.
     let generation = handle.begin_start()?;
+    *handle.started_config_hash.lock() = Some(runtime_config_hash(config));
 
     // Creating the target folder used to be a side effect of
     // `AppConfig::validate()`, which meant an unauthenticated `PUT /api/config`

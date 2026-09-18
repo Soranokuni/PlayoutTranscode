@@ -538,6 +538,75 @@ pub fn process_file_sync_with_runner_and_measurer(
     }
 }
 
+/// The floor for the disk preflight, whatever the job's own estimate says.
+///
+/// Even a thirty-second ident needs room for the staged file, the sidecar and
+/// FFmpeg's own scratch, and a volume this close to full is about to cause
+/// other problems anyway.
+pub const MIN_FREE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Headroom over the arithmetic estimate: VBR overshoot, container overhead and
+/// whatever else lands on the volume while the encode runs.
+const DISK_ESTIMATE_MARGIN: f64 = 1.2;
+
+/// Slack for the sidecar, FFmpeg's temp files and filesystem rounding.
+const DISK_FIXED_SLACK: u64 = 64 * 1024 * 1024;
+
+/// Parse an FFmpeg rate string — `15M`, `320k`, `4500000` — into bits/second.
+///
+/// Returns `None` for anything it does not understand, which the caller treats
+/// as "fall back to the floor" rather than as an error: refusing to encode
+/// because a bitrate string was unfamiliar would be worse than a preflight that
+/// is occasionally too optimistic.
+pub fn parse_ffmpeg_rate_bps(rate: &str) -> Option<u64> {
+    let t = rate.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match t.chars().last() {
+        Some('k') | Some('K') => (&t[..t.len() - 1], 1_000u64),
+        Some('m') | Some('M') => (&t[..t.len() - 1], 1_000_000u64),
+        Some('g') | Some('G') => (&t[..t.len() - 1], 1_000_000_000u64),
+        _ => (t, 1u64),
+    };
+    digits.trim().parse::<f64>().ok().and_then(|n| {
+        if n < 0.0 || !n.is_finite() {
+            None
+        } else {
+            Some((n * multiplier as f64) as u64)
+        }
+    })
+}
+
+/// How much free space this particular job needs.
+///
+/// The preflight used to be a flat 500 MB for every job (F-22), so a two-hour
+/// feature at 15 Mbit/s — about 13 GB — passed a check made against 500 MB,
+/// encoded for an hour and then died on `No space left on device` with the
+/// staged file abandoned. Sizing it from the job means the failure happens in
+/// the first second instead, and says what it actually needs.
+pub fn required_bytes_for(duration_secs: f64, video_rate: &str, audio_rate: &str) -> u64 {
+    let video_bps = parse_ffmpeg_rate_bps(video_rate).unwrap_or(0);
+    let audio_bps = parse_ffmpeg_rate_bps(audio_rate).unwrap_or(0);
+    let total_bps = video_bps.saturating_add(audio_bps);
+
+    if duration_secs <= 0.0 || total_bps == 0 {
+        // An unprobeable duration or an unparseable rate. The floor is the only
+        // honest answer; guessing high would refuse work that would have run.
+        return MIN_FREE_BYTES;
+    }
+
+    let bytes = (duration_secs * total_bps as f64 / 8.0) * DISK_ESTIMATE_MARGIN;
+    let estimate = if bytes.is_finite() && bytes >= 0.0 {
+        bytes as u64
+    } else {
+        0
+    };
+    estimate
+        .saturating_add(DISK_FIXED_SLACK)
+        .max(MIN_FREE_BYTES)
+}
+
 /// Where a mezzanine goes when the registry will not accept it (T2-8).
 ///
 /// Not a temp directory and not the bin: an operator has to be able to find it
@@ -1067,9 +1136,15 @@ fn process_file_inner(
         },
     );
 
-    // Preflight disk space check on target directory (require at least 500MB)
-    let min_free_space_bytes: u64 = 500 * 1024 * 1024;
-    if let Err(e) = check_disk_space(Path::new(&config.paths.target_folder), min_free_space_bytes) {
+    // Sized from this job, not a flat 500 MB (T2-9). `profile` is the encoding
+    // profile chosen from the source probe a few lines above, so its maxrate is
+    // the rate this encode will actually be capped at.
+    let required_bytes = required_bytes_for(
+        probe_data.duration_secs,
+        &profile.config_for(config).maxrate,
+        &config.encoding.audio_bitrate,
+    );
+    if let Err(e) = check_disk_space(Path::new(&config.paths.target_folder), required_bytes) {
         tracing::error!("Disk preflight failed for {}: {}", input_path.display(), e);
         let _ = queue.transition(
             &job.id,
@@ -1408,6 +1483,37 @@ fn process_file_inner(
 
             let sha256 = compute_file_sha256(&staged_output_path).ok();
             let file_size_bytes = std::fs::metadata(&staged_output_path).ok().map(|m| m.len());
+
+            // Checked again here (T2-9). The publish itself is a same-volume
+            // rename and needs nothing, but the sidecar write does, and a
+            // concurrent job may have filled the volume during this encode.
+            // Failing now leaves a staged file to clean up; failing after a
+            // half-written sidecar leaves a `ready` asset PlayOut cannot use.
+            if let Err(e) = check_disk_space(target_root, DISK_FIXED_SLACK) {
+                tracing::error!(
+                    "Disk space ran out during the encode of {}: {}",
+                    input_path.display(),
+                    e
+                );
+                let _ = queue.transition(
+                    &job.id,
+                    jobs::JobPhase::Failed,
+                    Some("Failed".into()),
+                    |j| {
+                        j.error = Some(e.clone());
+                        j.error_category = Some("io_disk_full".into());
+                    },
+                );
+                queue.broadcast(
+                    "failed",
+                    &serde_json::json!({"id": job.id, "error": e, "error_category": "io_disk_full"})
+                        .to_string(),
+                );
+                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                publisher.cleanup_staging(&staged_output_path);
+                queue.prune_old(500);
+                return;
+            }
 
             if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
                 tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
@@ -2498,6 +2604,85 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- T2-9: the preflight has to know how big this job is ----
+
+    #[test]
+    fn ffmpeg_rate_strings_parse_to_bits_per_second() {
+        assert_eq!(parse_ffmpeg_rate_bps("15M"), Some(15_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("15m"), Some(15_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("320k"), Some(320_000));
+        assert_eq!(parse_ffmpeg_rate_bps("320K"), Some(320_000));
+        assert_eq!(parse_ffmpeg_rate_bps("1G"), Some(1_000_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("4500000"), Some(4_500_000));
+        assert_eq!(parse_ffmpeg_rate_bps(" 8M "), Some(8_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("1.5M"), Some(1_500_000));
+
+        // Unparseable, which must be `None` rather than 0 -- the caller
+        // distinguishes them.
+        assert_eq!(parse_ffmpeg_rate_bps(""), None);
+        assert_eq!(parse_ffmpeg_rate_bps("fast"), None);
+        assert_eq!(parse_ffmpeg_rate_bps("-5M"), None);
+    }
+
+    #[test]
+    fn a_two_hour_feature_needs_far_more_than_the_old_flat_500mb() {
+        // The case from F-22: 2 h at 15 Mbit/s video + 320 kbit/s audio.
+        // 7200 s x 15.32 Mbit/s / 8 = ~13.8 GB, x1.2 margin = ~16.5 GB.
+        let required = required_bytes_for(7200.0, "15M", "320k");
+        let gb = required as f64 / 1_000_000_000.0;
+        assert!(
+            (16.0..17.5).contains(&gb),
+            "expected about 16.5 GB, got {:.2} GB",
+            gb
+        );
+        assert!(
+            required > 30 * MIN_FREE_BYTES,
+            "the old flat floor was off by more than an order of magnitude"
+        );
+    }
+
+    #[test]
+    fn an_hour_at_profile_a_rates_sizes_correctly() {
+        // 3600 s x (15 Mbit/s + 320 kbit/s) / 8 = 6.894 GB, x1.2 = 8.273 GB,
+        // + 64 MiB = 8.34 GB.
+        //
+        // REMEDIATION-PLAN.md quotes "~7.1 GB" for this case. That figure is a
+        // slip -- no combination of the margin, the slack and GB-vs-GiB
+        // produces it -- so the arithmetic above is what this asserts. Sizing
+        // it *lower* than reality is the one direction that reintroduces F-22.
+        let bytes = required_bytes_for(3600.0, "15M", "320k");
+        let gb = bytes as f64 / 1_000_000_000.0;
+        assert!((8.2..8.5).contains(&gb), "expected ~8.34 GB, got {:.2} GB", gb);
+        assert_eq!(bytes, (3600.0 * 15_320_000.0 / 8.0 * 1.2) as u64 + DISK_FIXED_SLACK);
+    }
+
+    #[test]
+    fn a_short_clip_never_falls_below_the_floor() {
+        // 10 s at 15 Mbit/s is ~22 MB, well under the floor -- but the staged
+        // file, the sidecar and FFmpeg's scratch still need room.
+        assert_eq!(required_bytes_for(10.0, "15M", "320k"), MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn an_unknown_duration_or_rate_falls_back_to_the_floor() {
+        // Refusing to encode because a bitrate string was unfamiliar would be
+        // worse than a preflight that is occasionally optimistic.
+        assert_eq!(required_bytes_for(0.0, "15M", "320k"), MIN_FREE_BYTES);
+        assert_eq!(required_bytes_for(-1.0, "15M", "320k"), MIN_FREE_BYTES);
+        assert_eq!(required_bytes_for(3600.0, "", ""), MIN_FREE_BYTES);
+        assert_eq!(required_bytes_for(3600.0, "veryfast", "nope"), MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn an_absurd_duration_does_not_overflow() {
+        // A corrupt probe reporting a nonsense duration must produce a large
+        // number, not a wrapped-around small one that passes the check.
+        let huge = required_bytes_for(f64::MAX, "15M", "320k");
+        assert!(huge >= MIN_FREE_BYTES);
+        let nan = required_bytes_for(f64::NAN, "15M", "320k");
+        assert!(nan >= MIN_FREE_BYTES);
     }
 
     // ---- T2-8: a publish that the registry refuses must not leave the file ----
