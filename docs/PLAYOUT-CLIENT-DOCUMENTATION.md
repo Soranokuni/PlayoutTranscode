@@ -473,6 +473,14 @@ PlayOut already sends JSON there, so this should be a no-op.
 found it while checking what §8.7 would affect. It is not caused by anything on
 the server side; the server stores faithfully whatever it is given.
 
+> **On the line numbers below.** They come from the copy of PlayOut we hold for
+> reference, which is **older than your tree** — it still builds a `reqwest`
+> client per call and has no pagination in `list_ingestor_assets`, both of which
+> we understand you have since fixed. Grep for the symbol names rather than
+> trusting the line numbers, and confirm the bug is still present before
+> changing anything. If it is already fixed on your side, tell us and we will
+> strike this section.
+
 The rating column holds four `|`-separated fields:
 
 ```
