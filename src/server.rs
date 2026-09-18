@@ -48,6 +48,20 @@ pub struct ServerDeps {
 }
 
 pub async fn run_server(port: u16, bind_address: &str, deps: ServerDeps) -> Result<(), String> {
+    run_server_with_shutdown(port, bind_address, deps, std::future::pending()).await
+}
+
+/// `run_server`, but draining when `shutdown` resolves as well as on Ctrl-C.
+///
+/// The Service Control Manager delivers `Stop` through a callback on its own
+/// thread, not as a console signal, so the Windows service path (T2-1) needs a
+/// second way to ask the server to drain.
+pub async fn run_server_with_shutdown(
+    port: u16,
+    bind_address: &str,
+    deps: ServerDeps,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Result<(), String> {
     let addr = format!("{}:{}", bind_address, port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -56,18 +70,26 @@ pub async fn run_server(port: u16, bind_address: &str, deps: ServerDeps) -> Resu
     tracing::info!("PlayoutTranscode web UI listening on http://{}", addr);
 
     let app = build_router(port, bind_address, deps);
+    // `into_make_service_with_connect_info` so the peer address reaches the
+    // handlers. Without it the `ConnectInfo` extractor the T1-5 audit
+    // middleware uses is never populated and every destructive operation was
+    // recorded with `remote_addr=unknown` (T2-3).
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     // Ctrl-C used to drop the process with in-flight DB writes and the SQLite
     // pool mid-write (F-30). Stop accepting, let open requests finish.
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+    axum::serve(listener, service)
+        .with_graceful_shutdown(shutdown_signal(shutdown))
         .await
         .map_err(|e| format!("Server error: {}", e))
 }
 
-async fn shutdown_signal() {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => tracing::info!("Shutdown signal received; draining HTTP requests"),
-        Err(e) => tracing::error!("Failed to install Ctrl-C handler: {}", e),
+async fn shutdown_signal(external: impl std::future::Future<Output = ()> + Send + 'static) {
+    tokio::select! {
+        r = tokio::signal::ctrl_c() => match r {
+            Ok(()) => tracing::info!("Shutdown signal received; draining HTTP requests"),
+            Err(e) => tracing::error!("Failed to install Ctrl-C handler: {}", e),
+        },
+        _ = external => tracing::info!("Stop requested; draining HTTP requests"),
     }
 }
 
@@ -167,7 +189,8 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/db/jobs", get(get_db_jobs_handler))
         .route("/db/jobs/{id}", get(get_db_job_detail_handler))
         .route("/db/folders", get(get_db_folders_handler))
-        .route("/db/schema", get(get_db_schema_handler));
+        .route("/db/schema", get(get_db_schema_handler))
+        .route("/db/backup", post(post_db_backup));
 
     let api_v2 = Router::new()
         .route("/health", get(health_v2))
@@ -199,7 +222,8 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/db/jobs", get(get_db_jobs_handler))
         .route("/db/jobs/{id}", get(get_db_job_detail_handler))
         .route("/db/folders", get(get_db_folders_handler))
-        .route("/db/schema", get(get_db_schema_handler));
+        .route("/db/schema", get(get_db_schema_handler))
+        .route("/db/backup", post(post_db_backup));
 
     let (allowed_origins, api_token) = {
         let cfg = state.config.lock();
@@ -370,7 +394,13 @@ pub fn validate_retry_input_path(raw: &str, watch_folder: &str) -> Result<std::p
     if !canon.starts_with(&canon_watch) {
         return Err("input_path must be inside the watch folder");
     }
-    Ok(canon)
+    // Containment is checked on the canonical form, but the path handed back is
+    // the ordinary one. `canonicalize` yields a Windows verbatim path, and a
+    // retry dispatched with that spelling would store it as the job's
+    // input_path -- so the adopted record would no longer match the spelling
+    // the watcher uses, and `find_pending_by_input_path` would miss it (T2-4).
+    // It is also the spelling FFmpeg is then invoked with.
+    Ok(crate::paths::strip_verbatim_prefix(&canon))
 }
 
 /// Path extractor that accepts only a canonical UUID.
@@ -1010,6 +1040,7 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             "version": env!("CARGO_PKG_VERSION"),
             "api_version": "2.0.0",
             "running": state.service_handle.is_running(),
+            "state": state.service_handle.state().as_str(),
             "uptime_secs": uptime_secs,
             "active_pids": state.service_handle.active_pids_count(),
         },
@@ -1021,6 +1052,9 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "logical_cores": crate::config::available_logical_cores(),
+            // Where config, the registry, logs and the toolchain actually live
+            // (T2-2). Support cannot ask for the right files without it.
+            "data_dir": crate::paths::data_dir().to_string_lossy(),
         },
         "metrics": {
             "pending_jobs": all_jobs.iter().filter(|j| j.state == JobState::Pending).count(),
@@ -1406,11 +1440,7 @@ async fn put_config(
         }
     };
 
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let config_path = exe_dir.join("config.toml");
+    let config_path = crate::paths::config_path();
     if let Err(e) = patched.save_to(&config_path) {
         tracing::error!("Failed to save config to {}: {}", config_path.display(), e);
         return (
@@ -1434,20 +1464,56 @@ struct EventEnvelope {
     data: serde_json::Value,
 }
 
+/// `GET /api/events` — the SSE stream (T2-10).
+///
+/// Two guarantees a client can rely on:
+///
+/// * the **first** event is always `connected`, carrying `server_time`. A
+///   client uses it to (re)synchronise after the stream is established, and the
+///   timestamp lets it tell a fresh connection from a replayed one.
+/// * a `resync` event is emitted whenever this subscriber fell behind and the
+///   broadcast channel dropped messages for it, carrying how many.
+///
+/// The second is the one that matters. A slow consumer — a laptop that slept, a
+/// browser tab throttled in the background — silently lost events and then went
+/// on displaying a stale job list forever, because nothing told it to refetch
+/// (F-20). `BroadcastStream` surfaces this as `Lagged(n)`, and the old
+/// `.ok()?` discarded it along with the information.
 async fn sse_events(
     State(state): State<ServerState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let rx = state.jobs.event_sender().subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|msg: Result<String, _>| {
-        let msg = msg.ok()?;
-        let envelope: EventEnvelope = serde_json::from_str(&msg).ok()?;
-        let event = Event::default()
-            .event(envelope.event)
-            .data(envelope.data.to_string());
-        Some(Ok(event))
+
+    let hello = Event::default().event("connected").data(
+        serde_json::json!({
+            "server_time": chrono::Utc::now().to_rfc3339(),
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+        .to_string(),
+    );
+    let head = tokio_stream::once(Ok::<Event, std::convert::Infallible>(hello));
+
+    let tail = BroadcastStream::new(rx).filter_map(|msg: Result<String, _>| match msg {
+        Ok(msg) => {
+            let envelope: EventEnvelope = serde_json::from_str(&msg).ok()?;
+            Some(Ok(Event::default()
+                .event(envelope.event)
+                .data(envelope.data.to_string())))
+        }
+        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
+            // Not fatal: the subscription is still live and will keep
+            // delivering. The client just has to assume its view is stale.
+            tracing::warn!(
+                "SSE subscriber fell behind and dropped {} event(s); sending resync",
+                dropped
+            );
+            Some(Ok(Event::default().event("resync").data(
+                serde_json::json!({ "dropped": dropped }).to_string(),
+            )))
+        }
     });
 
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(head.chain(tail)).keep_alive(KeepAlive::default())
 }
 
 #[derive(Serialize)]
@@ -1485,6 +1551,14 @@ struct WatchfolderInfo {
     stable_polls_min: u32,
     retry_policy: String,
     max_concurrency: usize,
+    /// Additive (T3-7).
+    include_extensions: Vec<String>,
+    exclude_extensions: Vec<String>,
+    /// How often the watcher does a full reconciliation walk, in seconds. Not
+    /// the same as `poll_secs` since T3-7: with a healthy filesystem watcher
+    /// the walk backs off, because `notify` already reports changes in
+    /// milliseconds and the walk is O(files in the watch folder).
+    reconcile_secs: u64,
 }
 
 async fn get_watchfolder(State(state): State<ServerState>) -> Json<WatchfolderInfo> {
@@ -1497,24 +1571,59 @@ async fn get_watchfolder(State(state): State<ServerState>) -> Json<WatchfolderIn
         stable_polls_min: config.ingestion.stable_polls_min,
         retry_policy: config.ingestion.retry_policy.clone(),
         max_concurrency: config.ingestion.max_concurrency,
+        // Additive (T3-7). "Why was my .avi never picked up?" is a support call
+        // that these three answer without anyone opening config.toml.
+        include_extensions: config.ingestion.include_extensions.clone(),
+        exclude_extensions: config.ingestion.exclude_extensions.clone(),
+        reconcile_secs: crate::watcher::effective_poll_interval_secs(
+            config.ingestion.poll_secs,
+            true,
+        ),
     })
 }
 
 async fn get_service_status(State(state): State<ServerState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "running": state.service_handle.is_running(),
+        // Additive (T2-5). `running` is unchanged and still means "Running";
+        // `state` distinguishes the two transitional states it collapsed.
+        "state": state.service_handle.state().as_str(),
+        "generation": state.service_handle.generation(),
+        // Additive (T2-12). True when config.toml has been changed since the
+        // processing loop started, so the running loop is using the old values.
+        "restart_required": state
+            .service_handle
+            .restart_required(&state.config.lock()),
     }))
 }
 
-async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json::Value> {
-    if state.service_handle.is_running() {
-        return Json(serde_json::json!({ "success": false, "error": "Service already running" }));
-    }
-
+async fn post_start_service(State(state): State<ServerState>) -> impl IntoResponse {
     let config = state.config.lock().clone();
     if config.paths.watch_folder.trim().is_empty() || config.paths.target_folder.trim().is_empty() {
-        return Json(
-            serde_json::json!({ "success": false, "error": "Watch and target folders must be configured first" }),
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Watch and target folders must be configured first",
+            })),
+        );
+    }
+
+    // Asked before the toolchain check so an already-running service answers
+    // immediately instead of hashing 170 MB of FFmpeg to then refuse (T2-5).
+    if state.service_handle.state() != crate::service_handle::ServiceState::Stopped {
+        let current = state.service_handle.state();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "error": match current {
+                    crate::service_handle::ServiceState::Stopping => "Service is stopping",
+                    crate::service_handle::ServiceState::Starting => "Service is starting",
+                    _ => "Service already running",
+                },
+                "state": current.as_str(),
+            })),
         );
     }
 
@@ -1522,13 +1631,20 @@ async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json
     let tools = match tokio::task::spawn_blocking(crate::bootstrap::ensure_toolchain).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
-            return Json(
-                serde_json::json!({ "success": false, "error": format!("FFmpeg toolchain: {}", e) }),
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("FFmpeg toolchain: {}", e),
+                })),
             )
         }
         Err(e) => {
             tracing::error!("toolchain check task failed: {}", e);
-            return Json(serde_json::json!({ "success": false, "error": "internal_error" }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": "internal_error" })),
+            );
         }
     };
 
@@ -1539,14 +1655,38 @@ async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json
         &tools,
         state.pool.clone(),
     ) {
-        Ok(()) => Json(serde_json::json!({ "success": true })),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "state": state.service_handle.state().as_str(),
+            })),
+        ),
+        // The state machine lost a race with another start, or the target
+        // folder could not be created. The former is a conflict; both are
+        // reported the same way the guard above is, so a client has one shape
+        // to handle.
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "error": e,
+                "state": state.service_handle.state().as_str(),
+            })),
+        ),
     }
 }
 
 async fn post_stop_service(State(state): State<ServerState>) -> Json<serde_json::Value> {
     crate::service_handle::stop_processing(&state.service_handle);
-    Json(serde_json::json!({ "success": true }))
+    // Returns while the state is still `Stopping`: the worker thread has to
+    // unwind before the service is really stopped, and holding this request
+    // open for it would put a 60 s teardown inside an HTTP round-trip. Poll
+    // `GET /api/service/status` for `state == "stopped"`.
+    Json(serde_json::json!({
+        "success": true,
+        "state": state.service_handle.state().as_str(),
+    }))
 }
 
 /// Starts the FFmpeg download worker.
@@ -1632,7 +1772,9 @@ async fn post_retry_job(
                 .into_response();
         }
     };
-    match state.service_handle.submit_retry(validated) {
+    // Pass the job id so the dispatcher adopts this record rather than
+    // creating a second one and leaving this one Pending forever (F-13).
+    match state.service_handle.submit_retry(validated, Some(id.clone())) {
         Ok(_) => {
             let _ = state.jobs.transition(
                 &id,
@@ -1697,7 +1839,7 @@ async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoRes
             missing += 1;
             continue;
         }
-        match state.service_handle.submit_retry(path) {
+        match state.service_handle.submit_retry(path, Some(job.id.clone())) {
             Ok(_) => {
                 let _ = state.jobs.transition(
                     &job.id,
@@ -1781,16 +1923,57 @@ struct SubclipRequest {
 
 const MAX_BATCH_UUIDS: usize = 500;
 
+/// `GET /api/assets` — a bounded page of the library (T2-7).
+///
+/// Three things changed and all three are about response size (F-06):
+///
+/// * `?limit=` / `?offset=`, defaulting to 1 000 and clamped to 5 000. There is
+///   no way to ask for the whole library in one response any more.
+/// * `keyframe_offsets` is `[]` unless `?fields=full`. It is the single largest
+///   field on a row — tens of kilobytes for a feature — and a listing never
+///   needs it. `GET /assets/{uuid}` and `POST /assets/batch` still send the
+///   real array, which is what PlayOut's per-asset hydration reads.
+/// * `X-Total-Count` says how many rows match, so a client knows whether there
+///   is another page without asking for one.
+///
+/// The body is still a bare JSON array, so a client that ignores all of this
+/// keeps parsing the response — it just stops at 1 000 rows.
 async fn list_assets(
     State(state): State<ServerState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let status_filter = params.get("status").map(|s| s.as_str());
-    match db::find_all(&state.pool, status_filter).await {
-        Ok(assets) => {
-            let response: Vec<AssetResponse> =
-                assets.into_iter().map(AssetResponse::from).collect();
-            (StatusCode::OK, Json(response)).into_response()
+    let limit = db::clamp_asset_limit(params.get("limit").and_then(|v| v.parse::<i64>().ok()));
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    let full = params.get("fields").map(|f| f == "full").unwrap_or(false);
+
+    match db::find_page(&state.pool, status_filter, limit, offset).await {
+        Ok(page) => {
+            let response: Vec<AssetResponse> = page
+                .assets
+                .into_iter()
+                .map(|a| {
+                    let mut r = AssetResponse::from(a);
+                    if !full {
+                        r.keyframe_offsets = Vec::new();
+                    }
+                    r
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                [
+                    ("X-Total-Count", page.total.to_string()),
+                    ("X-Limit", limit.to_string()),
+                    ("X-Offset", offset.to_string()),
+                ],
+                Json(response),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::error!("DB error on list_assets: {}", e);
@@ -2380,16 +2563,16 @@ async fn post_regenerate_sidecar(
                 )
                     .into_response();
             }
-            // `exists()` and the sidecar write both block; PlayOut writes
-            // error bodies verbatim into its diagnostics log, so internal
-            // paths and OS error strings stay in `tracing` (F-07, F-09).
+            // ffprobe, `exists()` and the sidecar write all block; PlayOut
+            // writes error bodies verbatim into its diagnostics log, so
+            // internal paths and OS error strings stay in `tracing`
+            // (F-07, F-09).
             let asset_for_task = asset.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let media_path = std::path::Path::new(&asset_for_task.current_path);
-                if !media_path.exists() {
-                    return Err(None);
-                }
-                crate::identity::build_sidecar_from_db_asset(&asset_for_task).map_err(Some)
+                // Re-probes the mezzanine rather than filling the payload from
+                // the registry row and hard-coding the rest (T3-5, F-27).
+                let (tools, _) = crate::bootstrap::audit_toolchain();
+                crate::identity::rebuild_sidecar_from_media(&asset_for_task, &tools)
             })
             .await;
 
@@ -2405,7 +2588,7 @@ async fn post_regenerate_sidecar(
                     )
                         .into_response()
                 }
-                Ok(Err(None)) => {
+                Ok(Err(crate::identity::SidecarRebuildError::MezzanineMissing)) => {
                     tracing::warn!(
                         "Sidecar regen for '{}': mezzanine missing at {}",
                         uuid,
@@ -2417,7 +2600,24 @@ async fn post_regenerate_sidecar(
                     )
                         .into_response()
                 }
-                Ok(Err(Some(e))) => {
+                Ok(Err(crate::identity::SidecarRebuildError::ProbeUnavailable(e))) => {
+                    // 503, not 500: the request is fine and will work once
+                    // ffprobe is available. The alternative -- writing the
+                    // sidecar with fabricated stream properties -- is what T3-5
+                    // removed, and a plausible wrong sidecar is worse than a
+                    // missing one because nothing downstream can tell.
+                    tracing::error!(
+                        "Sidecar regen for '{}' could not probe the mezzanine: {}",
+                        uuid,
+                        e
+                    );
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "probe_unavailable"})),
+                    )
+                        .into_response()
+                }
+                Ok(Err(crate::identity::SidecarRebuildError::WriteFailed(e))) => {
                     tracing::error!("Failed to rebuild sidecar for '{}': {}", uuid, e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -2801,9 +3001,62 @@ async fn put_folder_color(
 
 // ── DB Viewer API Handlers ───────────────────────────────────────────────────
 
+/// `POST /api/db/backup` — take a registry snapshot now (T2-13).
+///
+/// Token-protected like every other `/api/**` route, but deliberately **not**
+/// behind `X-Confirm-Destructive`: it creates a file and deletes nothing except
+/// snapshots past the retention window. Making an operator jump through a
+/// confirmation to take a backup is the wrong incentive.
+async fn post_db_backup(State(state): State<ServerState>) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    let data_dir = crate::paths::data_dir();
+
+    match db::backup_now(&pool, &data_dir).await {
+        Ok(path) => {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            tracing::info!("Registry backup written: {} ({} bytes)", file_name, size);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    // The name, not the path: error bodies and success bodies
+                    // alike stay free of filesystem paths (T1-4).
+                    "file_name": file_name,
+                    "size_bytes": size,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Registry backup failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": "backup_failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn get_db_overview_handler(State(state): State<ServerState>) -> impl IntoResponse {
     match db::get_db_overview(&state.pool).await {
-        Ok(overview) => (StatusCode::OK, Json(overview)).into_response(),
+        Ok(overview) => {
+            // Additive: an operator asking "when was this last backed up?" has
+            // nowhere else to look.
+            let backups = db::list_backups(&crate::paths::data_dir());
+            let mut body = serde_json::to_value(&overview).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "backups".to_string(),
+                    serde_json::to_value(&backups).unwrap_or(serde_json::json!([])),
+                );
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Err(e) => {
             tracing::error!("DB error on get_db_overview: {}", e);
             (

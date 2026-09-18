@@ -21,6 +21,23 @@ use std::sync::Arc;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
+/// Per-test-binary data directory, installed once.
+///
+/// `paths::data_dir()` otherwise falls back to the executable's directory,
+/// which for a test binary is `target/debug/deps/` — so `PUT /api/config`
+/// used to drop a `config.toml` in there. It is process-global by design
+/// (see `paths`), so it is set once rather than per test.
+static SHARED_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn shared_data_dir() -> PathBuf {
+    SHARED_DATA_DIR
+        .get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("pt-it-data-{}", std::process::id()));
+            playout_transcode::paths::set_data_dir(dir.clone()).unwrap_or(dir)
+        })
+        .clone()
+}
+
 /// A live server on an ephemeral loopback port, plus the temp tree it uses.
 ///
 /// Dropping it shuts the server task down and removes the temp tree.
@@ -70,6 +87,7 @@ pub async fn spawn_test_server() -> TestServer {
 }
 
 pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
+    let _ = shared_data_dir();
     let n = COUNTER.fetch_add(1, Ordering::SeqCst);
     let root = std::env::temp_dir().join(format!("pt-it-{}-{}", std::process::id(), n));
     let _ = std::fs::remove_dir_all(&root);
@@ -105,7 +123,8 @@ pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
         .expect("init test pool");
     let pool = Arc::new(pool);
 
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
+    // Matches production (T2-10).
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(1024);
     let jobs = JobQueue::new(event_tx, Some(pool.clone()));
     let service_handle = ServiceHandle::new();
 
@@ -138,9 +157,12 @@ pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
     // what the CORS allow-list and the Host guard compare against.
     let app = server::build_router(port, "127.0.0.1", deps);
 
+    // Same make-service as production, so `ConnectInfo` is populated and the
+    // audit middleware records a real peer address rather than "unknown".
+    let service = app.into_make_service_with_connect_info::<SocketAddr>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        let _ = axum::serve(listener, app)
+        let _ = axum::serve(listener, service)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
@@ -311,6 +333,7 @@ pub async fn insert_ready_asset(
         pool,
         uuid,
         fingerprint,
+        None,
         &path.to_string_lossy(),
         display_name,
     )

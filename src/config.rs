@@ -3,12 +3,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// `config.toml` inside the resolved data directory (T2-2).
+///
+/// Before the data-directory split this was always `<exe_dir>/config.toml`;
+/// for a portable or dev build it still resolves there, because that is what
+/// [`crate::paths::data_dir`] falls back to.
 pub fn default_config_path() -> PathBuf {
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    exe_dir.join("config.toml")
+    crate::paths::config_path()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +27,7 @@ fn default_target() -> String {
     String::new()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_web_port")]
     pub web_port: u16,
@@ -119,7 +120,14 @@ fn forbidden_roots() -> Vec<(String, bool)> {
             }
         }
     }
-    for var in ["ProgramData", "USERPROFILE", "PUBLIC"] {
+    // `HOME` is here for the same reason as `USERPROFILE`: `watch_folder=/home`
+    // with `clean_source_after_success` is the same mass-deletion primitive as
+    // `watch_folder=C:\Users`. This list was Windows-only, which left the rule
+    // inert on any non-Windows host even though `forbidden_roots` already
+    // carries a `/bin`, `/etc`, `/usr` branch -- inconsistent with its own
+    // intent, and the reason `config_patch_pointing_at_a_system_root_is_rejected`
+    // returned 200 on Linux CI.
+    for var in ["ProgramData", "USERPROFILE", "PUBLIC", "HOME"] {
         if let Ok(v) = std::env::var(var) {
             if !v.trim().is_empty() {
                 let norm = normalize_dir(Path::new(&v));
@@ -139,6 +147,10 @@ fn forbidden_roots() -> Vec<(String, bool)> {
             roots.push((normalize_dir(dir), false));
         }
     }
+    // The data directory holds the registry, config and toolchain. Using it as
+    // a watch or target folder would have the ingest loop walking over its own
+    // database (T2-2).
+    roots.push((normalize_dir(&crate::paths::data_dir()), false));
     if !cfg!(windows) {
         for r in ["/bin", "/boot", "/dev", "/etc", "/proc", "/sys", "/usr"] {
             roots.push((r.to_string(), false));
@@ -287,7 +299,49 @@ fn default_bind_address() -> String {
     "127.0.0.1".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Hand-written so it agrees with the `#[serde(default = "...")]` on each field.
+///
+/// `#[derive(Default)]` is a trap here, and it bit for real. `AppConfig` marks
+/// this field `#[serde(default)]`, so a `config.toml` with **no `[server]`
+/// section** builds the struct through `Default` — and a derived `Default`
+/// ignores the per-field serde defaults entirely, yielding `web_port: 0` and an
+/// empty `bind_address`. `validate()` then rejects the config ("web_port must
+/// not be 0"), and because the auto-start path only runs when `validate()`
+/// succeeds, the service came up, served its API, and silently never started
+/// ingesting. The operator saw a stopped service after every restart with
+/// nothing in the log to explain it.
+///
+/// If you add a field here with a serde default, add it below too.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            web_port: default_web_port(),
+            bind_address: default_bind_address(),
+            allowed_origins: Vec::new(),
+            api_token: String::new(),
+        }
+    }
+}
+
+/// Hand-written for the same reason as [`ServerConfig::default`]: a
+/// `config.toml` with no `[encoding]` section would otherwise get an empty
+/// `preset`, which `validate()` rejects.
+impl Default for EncodingConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_preset(),
+            ffmpeg_threads: default_threads(),
+            cpu_cores: default_cpu_cores(),
+            audio_codec: default_audio_codec(),
+            audio_bitrate: default_audio_bitrate(),
+            tune: default_tune(),
+            probesize: default_probesize(),
+            analyzeduration: default_analyzeduration(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncodingConfig {
     #[serde(default = "default_preset")]
     pub preset: String,
@@ -499,8 +553,15 @@ impl Default for IngestionConfig {
 pub struct LoggingConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
+    /// Base name of the rotated log inside `<data_dir>/logs`. The date suffix
+    /// is appended by the appender.
     #[serde(default = "default_log_file")]
     pub log_file: String,
+    /// Rotated log files older than this are deleted at startup. 0 disables
+    /// pruning, which on a long-running service means unbounded growth -- so
+    /// it is opt-in, not the default.
+    #[serde(default = "default_log_retain_days")]
+    pub retain_days: u16,
 }
 
 fn default_log_level() -> String {
@@ -509,12 +570,16 @@ fn default_log_level() -> String {
 fn default_log_file() -> String {
     "transcode.log".into()
 }
+fn default_log_retain_days() -> u16 {
+    14
+}
 
 impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".into(),
             log_file: "transcode.log".into(),
+            retain_days: default_log_retain_days(),
         }
     }
 }
@@ -626,6 +691,15 @@ impl Default for ValidationPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoragePolicy {
     #[serde(default)]
+    /// Always true, and not settable (T3-3, F-29).
+    ///
+    /// Publication is a write to `.tmp_<uuid>_<name>` followed by a rename onto
+    /// the final path — there is no non-atomic code path to fall back to, and
+    /// there should not be: a half-written mezzanine appearing in the library is
+    /// the thing this design exists to prevent. The field defaulted to `false`
+    /// and `GET /api/config` reported it as `false`, so the API told operators
+    /// that publication was *not* atomic while it always was. Retained so an
+    /// existing `config.toml` still parses, and forced true on read.
     pub atomic_publication: bool,
     #[serde(default = "default_true")]
     pub preserve_subclips_on_purge: bool,
@@ -636,7 +710,7 @@ pub struct StoragePolicy {
 impl Default for StoragePolicy {
     fn default() -> Self {
         Self {
-            atomic_publication: false,
+            atomic_publication: true,
             preserve_subclips_on_purge: true,
             clean_source_after_success: false,
         }
@@ -669,6 +743,15 @@ pub struct ToolchainPolicy {
     pub ffmpeg_path: Option<String>,
     #[serde(default)]
     pub ffprobe_path: Option<String>,
+    /// Run the toolchain audit at startup (T1-2).
+    ///
+    /// The audit resolves ffmpeg/ffprobe, runs each with `-version` and
+    /// SHA-256s both binaries. On a ~170 MB pair that costs around 25 s before
+    /// the HTTP server binds, which on a broadcast host that has just rebooted
+    /// is 25 s of PlayOut showing a red light. Setting this false skips the
+    /// audit; the toolchain is still resolved and still verified lazily the
+    /// first time an encode needs it, so nothing runs unverified — the check
+    /// just stops blocking startup.
     #[serde(default = "default_true")]
     pub verify_on_startup: bool,
     /// Expected SHA-256 (64 hex chars) of the FFmpeg release archive.
@@ -808,8 +891,11 @@ impl AppConfig {
     }
 
     /// Returns effective StoragePolicy derived in-memory or from explicit V2 settings.
+    ///
+    /// `atomic_publication` is forced true regardless of what is stored: the
+    /// publisher stages to a temp name and renames, unconditionally (T3-3).
     pub fn effective_storage_policy(&self) -> StoragePolicy {
-        if let Some(ref sp) = self.storage_policy {
+        let mut policy = if let Some(ref sp) = self.storage_policy {
             if sp.clean_source_after_success != self.ingestion.clean_source_after_success {
                 tracing::warn!(
                     "Storage policy configuration conflict: explicit storage_policy.clean_source_after_success ({}) differs from legacy ingestion setting ({})",
@@ -819,11 +905,13 @@ impl AppConfig {
             sp.clone()
         } else {
             StoragePolicy {
-                atomic_publication: false,
+                atomic_publication: true,
                 preserve_subclips_on_purge: true,
                 clean_source_after_success: self.ingestion.clean_source_after_success,
             }
-        }
+        };
+        policy.atomic_publication = true;
+        policy
     }
 
     /// Returns effective RetryPolicyV2 derived in-memory or from explicit V2 settings.
@@ -844,6 +932,160 @@ impl AppConfig {
         self.toolchain_policy.clone().unwrap_or_default()
     }
 
+    /// Every `[section]` and key this schema accepts.
+    ///
+    /// Maintained by hand next to the struct because serde gives no runtime
+    /// reflection. The `config_docs` test walks the README's TOML block against
+    /// it, so a section added to the struct and forgotten here shows up as a
+    /// documentation failure rather than silently at an operator's site.
+    pub fn known_keys() -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("", &["version", "initialized"]),
+            ("paths", &["watch_folder", "target_folder"]),
+            (
+                "server",
+                &["web_port", "bind_address", "allowed_origins", "api_token"],
+            ),
+            (
+                "encoding",
+                &[
+                    "preset",
+                    "ffmpeg_threads",
+                    "cpu_cores",
+                    "audio_codec",
+                    "audio_bitrate",
+                    "tune",
+                    "probesize",
+                    "analyzeduration",
+                ],
+            ),
+            ("profile_a", &["enabled", "crf", "maxrate", "bufsize"]),
+            ("profile_b", &["enabled", "crf", "maxrate", "bufsize"]),
+            ("profile_c", &["enabled", "crf", "maxrate", "bufsize"]),
+            (
+                "ingestion",
+                &[
+                    "settle_secs",
+                    "poll_secs",
+                    "max_concurrency",
+                    "stable_polls_min",
+                    "retry_policy",
+                    "auto_retry_on_start",
+                    "max_attempts",
+                    "retry_delay_ms",
+                    "clean_source_after_success",
+                    "include_extensions",
+                    "exclude_extensions",
+                ],
+            ),
+            ("logging", &["level", "log_file", "retain_days"]),
+            (
+                "audio_policy",
+                &[
+                    "mode",
+                    "codec",
+                    "bitrate",
+                    "sample_rate_hz",
+                    "channels",
+                    "channel_layout",
+                    "target_lufs",
+                    "true_peak_dbtp",
+                    "lra_target",
+                    "dual_mono",
+                    "preserve_original_track",
+                ],
+            ),
+            (
+                "validation_policy",
+                &[
+                    "enforce_closed_gop",
+                    "enforce_faststart",
+                    "enforce_48k_audio",
+                    "max_duration_delta_ms",
+                    "strict_ready_blocking",
+                ],
+            ),
+            (
+                "storage_policy",
+                &[
+                    "atomic_publication",
+                    "preserve_subclips_on_purge",
+                    "clean_source_after_success",
+                ],
+            ),
+            (
+                "retry_policy_v2",
+                &["max_attempts", "retry_delay_ms", "auto_retry_on_start"],
+            ),
+            (
+                "toolchain_policy",
+                &[
+                    "ffmpeg_path",
+                    "ffprobe_path",
+                    "verify_on_startup",
+                    "download_sha256",
+                ],
+            ),
+        ]
+    }
+
+    /// Report keys in `value` that this schema does not recognise.
+    ///
+    /// serde silently ignores unknown fields, so a typo — `[transcode]` instead
+    /// of `[encoding]`, `max_concurrency` at the top level instead of under
+    /// `[ingestion]` — left the operator with a config file that looked applied
+    /// and was not. That is F-25 from the operator's side: the README described
+    /// sections that never existed, and nothing told anyone who copied them.
+    ///
+    /// Returns dotted paths, e.g. `transcode.max_concurrency`.
+    pub fn unknown_keys(value: &toml::Value) -> Vec<String> {
+        let known = Self::known_keys();
+        let mut out = Vec::new();
+
+        let Some(table) = value.as_table() else {
+            return out;
+        };
+
+        let root_scalars: &[&str] = known
+            .iter()
+            .find(|(s, _)| s.is_empty())
+            .map(|(_, k)| *k)
+            .unwrap_or(&[]);
+
+        for (key, val) in table {
+            if val.is_table() {
+                match known.iter().find(|(section, _)| section == key) {
+                    Some((_, allowed)) => {
+                        if let Some(inner) = val.as_table() {
+                            for k in inner.keys() {
+                                if !allowed.contains(&k.as_str()) {
+                                    out.push(format!("{}.{}", key, k));
+                                }
+                            }
+                        }
+                    }
+                    None => out.push(key.clone()),
+                }
+            } else if !root_scalars.contains(&key.as_str()) {
+                out.push(key.clone());
+            }
+        }
+
+        out.sort();
+        out
+    }
+
+    /// Log a warning for every unrecognised key. Called from [`Self::load`].
+    pub fn warn_unknown_keys(value: &toml::Value) {
+        for key in Self::unknown_keys(value) {
+            tracing::warn!(
+                "Unknown config key '{}' -- it is ignored. Check the spelling \
+                 against the Configuration section of the README.",
+                key
+            );
+        }
+    }
+
     pub fn load(path: Option<&str>) -> Result<(Self, PathBuf), String> {
         let config_path = path.map(PathBuf::from).unwrap_or_else(default_config_path);
 
@@ -859,6 +1101,14 @@ impl AppConfig {
 
         let config: AppConfig = toml::from_str(&content)
             .map_err(|e| format!("Failed to parse config '{}': {}", config_path.display(), e))?;
+
+        // serde ignores unknown fields silently, so a typo or a section copied
+        // from out-of-date documentation left an operator with a config file
+        // that looked applied and was not (T3-4, F-25). Warn, do not fail: an
+        // extra key is not worth refusing to start a broadcast service over.
+        if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
+            Self::warn_unknown_keys(&raw);
+        }
 
         Ok((config, config_path))
     }
@@ -1309,7 +1559,10 @@ clean_source_after_success = true
 
         let effective_storage = cfg.effective_storage_policy();
         assert_eq!(effective_storage.clean_source_after_success, true);
-        assert_eq!(effective_storage.atomic_publication, false);
+        // Forced true since T3-3: the publisher stages and renames
+        // unconditionally, so reporting `false` told operators publication was
+        // not atomic when it always was (F-29).
+        assert_eq!(effective_storage.atomic_publication, true);
 
         let effective_retry = cfg.effective_retry_policy();
         assert_eq!(effective_retry.auto_retry_on_start, true);
@@ -1541,6 +1794,52 @@ mod validation_tests {
         let dir = tmp_dir("baseline");
         assert_eq!(good_config(&dir).validate(), Ok(()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The profile container must be refused on every platform.
+    ///
+    /// `PUT /api/config` reaches `validate_media_root`, and
+    /// `clean_source_after_success` deletes sources after a successful encode,
+    /// so `watch_folder` pointed at the directory that holds every user's home
+    /// is a remote-driven mass-deletion primitive (F-03). The rule existed but
+    /// consulted only Windows environment variables, so it did nothing on a
+    /// non-Windows host -- caught by CI, not by any local run.
+    #[test]
+    fn the_profile_container_is_refused_on_this_platform() {
+        let profile = std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok());
+        let Some(profile) = profile else {
+            // Neither variable set (a bare container). Nothing to assert.
+            return;
+        };
+        let Some(container) = Path::new(&profile).parent() else {
+            return;
+        };
+        let container = container.to_string_lossy().to_string();
+        if container.trim().is_empty() {
+            return;
+        }
+
+        assert!(
+            validate_media_root("watch_folder", &container).is_err(),
+            "the profile container ({}) must be refused as a media root",
+            container
+        );
+        assert!(
+            validate_media_root("watch_folder", &profile).is_err(),
+            "the profile directory itself ({}) must be refused too",
+            profile
+        );
+
+        // ...but an ordinary folder inside the profile is fine. That is where
+        // most people actually keep media, and refusing it would be useless.
+        let inside = Path::new(&profile).join("Media").join("Ingest");
+        assert!(
+            validate_media_root("watch_folder", &inside.to_string_lossy()).is_ok(),
+            "a folder inside the profile must still be allowed: {}",
+            inside.display()
+        );
     }
 
     #[test]

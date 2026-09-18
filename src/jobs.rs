@@ -56,13 +56,24 @@ pub enum JobPhase {
     CancelRequested,
     Cancelled,
     Recoverable,
+    /// Terminal, and **not** an error: the file was already ingested, confirmed
+    /// byte-identical to an existing asset, so no work was needed (T2-6).
+    ///
+    /// Before this existed the only terminal state reachable from a queued job
+    /// was `Failed`, so a duplicate was reported as a failure and PlayOut had
+    /// to key on `error_category` to avoid showing it as one. It maps to the
+    /// v1 `Completed` state, so the wire contract does not change.
+    Skipped,
 }
 
 impl JobPhase {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobPhase::Completed | JobPhase::Cancelled | JobPhase::Failed
+            JobPhase::Completed
+                | JobPhase::Cancelled
+                | JobPhase::Failed
+                | JobPhase::Skipped
         )
     }
 
@@ -80,6 +91,7 @@ impl JobPhase {
             JobPhase::CancelRequested => "cancel_requested",
             JobPhase::Cancelled => "cancelled",
             JobPhase::Recoverable => "recoverable",
+            JobPhase::Skipped => "skipped",
         }
     }
 
@@ -94,7 +106,9 @@ impl JobPhase {
             | JobPhase::Publishing
             | JobPhase::CancelRequested
             | JobPhase::Recoverable => JobState::Processing,
-            JobPhase::Completed => JobState::Completed,
+            // Deliberately `Completed`: no work was needed and nothing went
+            // wrong. A client that only reads `state` sees a job that finished.
+            JobPhase::Completed | JobPhase::Skipped => JobState::Completed,
             JobPhase::Failed => JobState::Failed,
             JobPhase::Cancelled => JobState::Cancelled,
         }
@@ -111,6 +125,7 @@ impl JobPhase {
                     | JobPhase::CancelRequested
                     | JobPhase::Cancelled
                     | JobPhase::Failed
+                    | JobPhase::Skipped
             ),
             JobPhase::Probing => matches!(
                 next,
@@ -119,6 +134,7 @@ impl JobPhase {
                     | JobPhase::Failed
                     | JobPhase::CancelRequested
                     | JobPhase::Cancelled
+                    | JobPhase::Skipped
             ),
             JobPhase::NormalizingAudio => matches!(
                 next,
@@ -162,6 +178,9 @@ impl JobPhase {
             ),
             JobPhase::CancelRequested => matches!(next, JobPhase::Cancelled | JobPhase::Failed),
             JobPhase::Failed => matches!(next, JobPhase::Queued),
+            // A skip is re-triable: the operator may have purged the asset that
+            // caused it, and then the file genuinely does need ingesting.
+            JobPhase::Skipped => matches!(next, JobPhase::Queued),
             JobPhase::Completed | JobPhase::Cancelled => false,
         }
     }
@@ -183,6 +202,7 @@ impl std::str::FromStr for JobPhase {
             "cancel_requested" => Ok(JobPhase::CancelRequested),
             "cancelled" => Ok(JobPhase::Cancelled),
             "recoverable" => Ok(JobPhase::Recoverable),
+            "skipped" => Ok(JobPhase::Skipped),
             other => Err(format!("Unknown JobPhase: {}", other)),
         }
     }
@@ -304,41 +324,117 @@ impl JobRecord {
     }
 }
 
-fn persist_job(pool: &Option<Arc<SqlitePool>>, job: JobRecord) {
-    if let Some(pool) = pool.clone() {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let _ = crate::db::insert_durable_job(&pool, &job).await;
-            });
-        } else {
-            std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    rt.block_on(async {
-                        let _ = crate::db::insert_durable_job(&pool, &job).await;
-                    });
-                }
-            });
-        }
-    }
+/// How many records may be queued for persistence before writes are coalesced
+/// in memory instead. Sized so a burst of FFmpeg progress lines across every
+/// concurrent encode fits without ever blocking a worker thread.
+const PERSIST_CHANNEL_CAPACITY: usize = 1024;
+
+/// The persister flushes at least this often.
+const PERSIST_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// ...or as soon as this many distinct jobs are waiting, whichever comes first.
+const PERSIST_FLUSH_BATCH: usize = 100;
+
+/// What the persister task receives.
+enum PersistMsg {
+    /// A snapshot of a job. Newer snapshots for the same id supersede older
+    /// ones, which is what makes coalescing safe.
+    Record(Box<JobRecord>),
+    /// Flush everything outstanding and acknowledge. Used on shutdown, and by
+    /// tests that need a deterministic point to assert after.
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// Channel, dirty set and pool behind the coalescing persister.
+struct Persistence {
+    tx: tokio::sync::mpsc::Sender<PersistMsg>,
+    /// Taken by `spawn_persister`. Held here so `JobQueue::new` keeps its
+    /// signature and the caller decides when the task starts.
+    rx: parking_lot::Mutex<Option<tokio::sync::mpsc::Receiver<PersistMsg>>>,
+    /// Jobs whose latest snapshot was dropped because the channel was full.
+    /// The persister re-reads these from memory on its next tick, so a full
+    /// channel costs freshness, never correctness.
+    dirty: parking_lot::Mutex<std::collections::HashSet<String>>,
+    pool: Arc<SqlitePool>,
 }
 
 #[derive(Clone)]
 pub struct JobQueue {
     jobs: Arc<RwLock<Vec<JobRecord>>>,
     event_tx: broadcast::Sender<String>,
-    pool: Option<Arc<SqlitePool>>,
+    persist: Option<Arc<Persistence>>,
 }
 
 impl JobQueue {
     pub fn new(event_tx: broadcast::Sender<String>, pool: Option<Arc<SqlitePool>>) -> Self {
+        let persist = pool.map(|pool| {
+            let (tx, rx) = tokio::sync::mpsc::channel(PERSIST_CHANNEL_CAPACITY);
+            Arc::new(Persistence {
+                tx,
+                rx: parking_lot::Mutex::new(Some(rx)),
+                dirty: parking_lot::Mutex::new(std::collections::HashSet::new()),
+                pool,
+            })
+        });
         Self {
             jobs: Arc::new(RwLock::new(Vec::new())),
             event_tx,
-            pool,
+            persist,
         }
+    }
+
+    /// Queue a snapshot for persistence. Never blocks and never fails loudly.
+    ///
+    /// Before T2-4 this spawned an independent upsert per call -- and from the
+    /// std progress thread, which has no Tokio handle, that meant a brand new
+    /// OS thread *and* a new current-thread runtime per FFmpeg progress line.
+    /// Writes also raced: two rapid updates could land out of order and leave
+    /// the row claiming "Encoding 97%" after the job had completed (F-13).
+    fn enqueue_persist(&self, job: JobRecord) {
+        let Some(p) = self.persist.as_ref() else {
+            return;
+        };
+        let id = job.id.clone();
+        match p.tx.try_send(PersistMsg::Record(Box::new(job))) {
+            Ok(()) => {
+                // This snapshot supersedes anything previously dropped.
+                let mut dirty = p.dirty.lock();
+                if !dirty.is_empty() {
+                    dirty.remove(&id);
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                p.dirty.lock().insert(id);
+            }
+            // The persister is gone (shutdown). Dropping is correct.
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
+    }
+
+    /// Start the persister. Call once, on the main runtime, after `new`.
+    ///
+    /// Returns `None` when the queue has no pool (in-memory tests) or the task
+    /// has already been started.
+    pub fn spawn_persister(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let p = self.persist.clone()?;
+        let rx = p.rx.lock().take()?;
+        let jobs = self.jobs.clone();
+        Some(tokio::spawn(persister_loop(p, rx, jobs)))
+    }
+
+    /// Flush every outstanding write and wait for it to hit the database.
+    ///
+    /// Called on shutdown before the pool is closed, so a stop does not discard
+    /// the final state of the jobs it just stopped.
+    pub async fn flush_persister(&self) {
+        let Some(p) = self.persist.as_ref() else {
+            return;
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        if p.tx.send(PersistMsg::Flush(ack_tx)).await.is_err() {
+            return;
+        }
+        let _ = ack_rx.await;
     }
 
     #[allow(dead_code)]
@@ -361,7 +457,7 @@ impl JobQueue {
 
     pub fn push(&self, job: JobRecord) {
         self.jobs.write().push(job.clone());
-        persist_job(&self.pool, job);
+        self.enqueue_persist(job);
     }
 
     pub fn update(&self, id: &str, f: impl FnOnce(&mut JobRecord)) {
@@ -370,8 +466,43 @@ impl JobQueue {
             f(job);
             let job_clone = job.clone();
             drop(jobs);
-            persist_job(&self.pool, job_clone);
+            self.enqueue_persist(job_clone);
         }
+    }
+
+    /// Mutate a job in memory without queueing a write.
+    ///
+    /// For the FFmpeg progress path, which produces a line every few frames.
+    /// The UI reads the in-memory record, so it stays live; the row is written
+    /// by the throttled `persist_now` alongside the progress broadcast.
+    pub fn update_local(&self, id: &str, f: impl FnOnce(&mut JobRecord)) {
+        let mut jobs = self.jobs.write();
+        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
+            f(job);
+        }
+    }
+
+    /// Queue the current snapshot of one job for persistence.
+    pub fn persist_now(&self, id: &str) {
+        let snapshot = self.jobs.read().iter().find(|j| j.id == id).cloned();
+        if let Some(job) = snapshot {
+            self.enqueue_persist(job);
+        }
+    }
+
+    /// The oldest pending job for this input path, if any.
+    ///
+    /// The dispatcher uses this to adopt a record recovered at startup instead
+    /// of creating a second one for the same file, which is how retries and
+    /// crash recovery used to leave permanent ghosts (F-13).
+    pub fn find_pending_by_input_path(&self, path: &str) -> Option<JobRecord> {
+        let jobs = self.jobs.read();
+        let mut matches: Vec<&JobRecord> = jobs
+            .iter()
+            .filter(|j| j.state == JobState::Pending && j.input_path == path)
+            .collect();
+        matches.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        matches.first().map(|j| (*j).clone())
     }
 
     pub fn transition(
@@ -387,7 +518,7 @@ impl JobQueue {
             f(job);
             let job_clone = job.clone();
             drop(jobs);
-            persist_job(&self.pool, job_clone);
+            self.enqueue_persist(job_clone);
             Ok(())
         } else {
             Err(format!("Job {} not found", id))
@@ -404,7 +535,7 @@ impl JobQueue {
             let cancel_req = job.cancel_requested || job.phase == JobPhase::CancelRequested;
             let job_clone = job.clone();
             drop(jobs);
-            persist_job(&self.pool, job_clone);
+            self.enqueue_persist(job_clone);
             Ok(cancel_req)
         } else {
             Err(format!("Job {} not found", id))
@@ -423,7 +554,7 @@ impl JobQueue {
             }
             let job_clone = job.clone();
             drop(jobs);
-            persist_job(&self.pool, job_clone);
+            self.enqueue_persist(job_clone);
             Ok(())
         } else {
             Err(format!("Job {} not found", id))
@@ -517,9 +648,271 @@ impl JobQueue {
     }
 }
 
+/// Drains the persist channel, coalescing by job id, and writes each batch in
+/// one transaction.
+///
+/// Coalescing is the whole point: during an encode the same job is updated many
+/// times a second, and only the newest snapshot is worth writing. Ordering
+/// follows from there -- one writer, one transaction per batch, newest wins --
+/// so the row can no longer end up behind the in-memory record.
+async fn persister_loop(
+    p: Arc<Persistence>,
+    mut rx: tokio::sync::mpsc::Receiver<PersistMsg>,
+    jobs: Arc<RwLock<Vec<JobRecord>>>,
+) {
+    use std::collections::HashMap;
+
+    // Keyed by job id: many snapshots of the same job collapse to one write.
+    let mut pending: HashMap<String, JobRecord> = HashMap::new();
+    let mut ticker = tokio::time::interval(PERSIST_FLUSH_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            msg = rx.recv() => match msg {
+                Some(PersistMsg::Record(job)) => {
+                    pending.insert(job.id.clone(), *job);
+                    if pending.len() >= PERSIST_FLUSH_BATCH {
+                        flush(&p, &jobs, &mut pending).await;
+                    }
+                }
+                Some(PersistMsg::Flush(ack)) => {
+                    adopt_dirty(&p, &jobs, &mut pending);
+                    flush(&p, &jobs, &mut pending).await;
+                    let _ = ack.send(());
+                }
+                // Every sender is gone: the queue itself has been dropped.
+                None => {
+                    adopt_dirty(&p, &jobs, &mut pending);
+                    flush(&p, &jobs, &mut pending).await;
+                    return;
+                }
+            },
+            _ = ticker.tick() => {
+                adopt_dirty(&p, &jobs, &mut pending);
+                flush(&p, &jobs, &mut pending).await;
+            }
+        }
+    }
+}
+
+/// Pull snapshots for jobs whose write was dropped by a full channel.
+fn adopt_dirty(
+    p: &Persistence,
+    jobs: &RwLock<Vec<JobRecord>>,
+    pending: &mut std::collections::HashMap<String, JobRecord>,
+) {
+    let ids = {
+        let mut dirty = p.dirty.lock();
+        if dirty.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *dirty)
+    };
+    let snapshot = jobs.read();
+    for id in ids {
+        // The in-memory record is by definition newer than whatever was
+        // dropped, so it overwrites any queued snapshot for the same id.
+        if let Some(job) = snapshot.iter().find(|j| j.id == id) {
+            pending.insert(id, job.clone());
+        }
+    }
+}
+
+/// Write the coalesced batch.
+///
+/// Each id is re-read from memory first. That is what makes ordering safe: a
+/// snapshot sitting in the channel may already be stale relative to the
+/// in-memory record -- which is exactly how the database used to end up
+/// claiming "Encoding 97%" for a completed job (F-13). The queued snapshot is
+/// only a fallback for a job that has since been pruned out of memory.
+async fn flush(
+    p: &Persistence,
+    jobs: &RwLock<Vec<JobRecord>>,
+    pending: &mut std::collections::HashMap<String, JobRecord>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let batch: Vec<JobRecord> = {
+        let live = jobs.read();
+        pending
+            .iter()
+            .map(|(id, queued)| {
+                live.iter()
+                    .find(|j| j.id == *id)
+                    .cloned()
+                    .unwrap_or_else(|| queued.clone())
+            })
+            .collect()
+    };
+    match crate::db::persist_jobs(&p.pool, &batch).await {
+        Ok(()) => pending.clear(),
+        Err(e) => {
+            // Keep the records queued rather than losing them; the next tick
+            // retries. Coalescing means a persistent failure costs bounded
+            // memory, not an unbounded backlog.
+            tracing::error!("Failed to persist {} job record(s): {}", batch.len(), e);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn pool_in_temp(tag: &str) -> (Arc<SqlitePool>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "pt-jobs-{}-{}-{}",
+            std::process::id(),
+            tag,
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let pool = crate::db::init_pool(&dir.join("jobs.db"))
+            .await
+            .expect("init pool");
+        (Arc::new(pool), dir)
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_updates_coalesces_to_one_row_with_the_final_state() {
+        let (pool, dir) = pool_in_temp("coalesce").await;
+        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let queue = JobQueue::new(event_tx, Some(pool.clone()));
+        let persister = queue.spawn_persister().expect("persister started");
+
+        let mut job = JobRecord::new("D:/media/burst.mov", "ProfileA");
+        job.transition_to(JobPhase::Probing, None).unwrap();
+        let id = job.id.clone();
+        queue.push(job);
+
+        // The write amplification this step is about: one row per progress line.
+        for i in 0..1_000 {
+            queue.update(&id, |j| {
+                j.progress = i as f32 / 10.0;
+                j.current_frame = i;
+            });
+        }
+        queue.update(&id, |j| {
+            j.progress = 100.0;
+            j.current_frame = 1_000;
+            j.current_stage = "Finalizing".into();
+        });
+
+        queue.flush_persister().await;
+
+        let rows = crate::db::load_all_durable_jobs(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "a burst produced more than one row");
+        assert_eq!(rows[0].id, id);
+        // The whole point: the row reflects the newest state, not whichever
+        // write happened to land last.
+        assert_eq!(rows[0].progress, 100.0);
+        assert_eq!(rows[0].current_frame, 1_000);
+        assert_eq!(rows[0].current_stage, "Finalizing");
+
+        persister.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_full_channel_still_converges_on_the_latest_state() {
+        let (pool, dir) = pool_in_temp("backpressure").await;
+        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let queue = JobQueue::new(event_tx, Some(pool.clone()));
+
+        let mut job = JobRecord::new("D:/media/flood.mov", "ProfileA");
+        job.transition_to(JobPhase::Probing, None).unwrap();
+        let id = job.id.clone();
+        queue.push(job);
+
+        // No persister yet, so the channel fills and every further snapshot is
+        // dropped in favour of the dirty flag.
+        for i in 0..(PERSIST_CHANNEL_CAPACITY * 2) {
+            queue.update(&id, |j| j.progress = i as f32);
+        }
+        queue.update(&id, |j| {
+            j.progress = 42.0;
+            j.current_stage = "Latest".into();
+        });
+
+        let persister = queue.spawn_persister().expect("persister started");
+        queue.flush_persister().await;
+
+        let rows = crate::db::load_all_durable_jobs(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].current_stage, "Latest",
+            "the dirty flag did not recover the dropped snapshot"
+        );
+        assert_eq!(rows[0].progress, 42.0);
+
+        persister.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_local_does_not_write_until_persist_now() {
+        let (pool, dir) = pool_in_temp("local").await;
+        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let queue = JobQueue::new(event_tx, Some(pool.clone()));
+        let persister = queue.spawn_persister().expect("persister started");
+
+        let mut job = JobRecord::new("D:/media/local.mov", "ProfileA");
+        job.transition_to(JobPhase::Probing, None).unwrap();
+        let id = job.id.clone();
+        queue.push(job);
+        queue.flush_persister().await;
+
+        queue.update_local(&id, |j| j.current_stage = "Encoding 50%".into());
+        queue.flush_persister().await;
+        let rows = crate::db::load_all_durable_jobs(&pool).await.unwrap();
+        assert_ne!(
+            rows[0].current_stage, "Encoding 50%",
+            "update_local wrote to the database"
+        );
+        // ...but the in-memory record, which the API serves, is current.
+        assert_eq!(queue.get(&id).unwrap().current_stage, "Encoding 50%");
+
+        queue.persist_now(&id);
+        queue.flush_persister().await;
+        let rows = crate::db::load_all_durable_jobs(&pool).await.unwrap();
+        assert_eq!(rows[0].current_stage, "Encoding 50%");
+
+        persister.abort();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_pending_by_input_path_returns_the_oldest_match() {
+        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let queue = JobQueue::new_in_memory(event_tx);
+
+        let mut old = JobRecord::new("D:/media/same.mov", "ProfileA");
+        old.created_at = "2026-01-01T00:00:00Z".into();
+        let mut newer = JobRecord::new("D:/media/same.mov", "ProfileA");
+        newer.created_at = "2026-06-01T00:00:00Z".into();
+        let mut other = JobRecord::new("D:/media/different.mov", "ProfileA");
+        other.created_at = "2025-01-01T00:00:00Z".into();
+        let old_id = old.id.clone();
+        queue.push(newer);
+        queue.push(old);
+        queue.push(other);
+
+        let found = queue.find_pending_by_input_path("D:/media/same.mov");
+        assert_eq!(found.map(|j| j.id), Some(old_id));
+
+        // A job that is no longer pending is not adopted.
+        let mut done = JobRecord::new("D:/media/done.mov", "ProfileA");
+        done.state = JobState::Completed;
+        queue.push(done);
+        assert!(queue
+            .find_pending_by_input_path("D:/media/done.mov")
+            .is_none());
+        assert!(queue
+            .find_pending_by_input_path("D:/media/missing.mov")
+            .is_none());
+    }
 
     #[test]
     fn test_valid_forward_phase_transitions() {

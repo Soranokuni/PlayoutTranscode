@@ -2,20 +2,62 @@ use crate::bootstrap::ToolPaths;
 use crate::config::AppConfig;
 use crate::probe::ProbeData;
 use crate::profiles::{EncodingProfile, ProfileId};
-use regex::Regex;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{mpsc, LazyLock};
+use std::sync::mpsc;
 
 
-static TIME_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"time=(\d+):(\d+):(\d+)\.(\d+)").unwrap());
-static FRAME_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"frame=\s*(\d+)").unwrap());
-static FPS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"fps=\s*([\d.]+)").unwrap());
-static BITRATE_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"bitrate=\s*([\d.]+kbits/s)").unwrap());
-static SPEED_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"speed=\s*([\d.]+x)").unwrap());
+/// One `-progress` block from FFmpeg, accumulated key by key (T2-11).
+///
+/// FFmpeg emits `key=value` lines and terminates each block with
+/// `progress=continue` (or `progress=end` for the last one). Values are plain
+/// and machine-oriented: no padding, no units to strip, no locale.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct ProgressBlock {
+    pub frame: Option<i64>,
+    pub fps: Option<f64>,
+    /// Output bitrate exactly as FFmpeg spells it, e.g. `5000.0kbits/s`.
+    pub bitrate: Option<String>,
+    /// Encoded position in microseconds. FFmpeg's `out_time_ms` is a
+    /// long-standing misnomer that also carries microseconds, so this reads
+    /// `out_time_us` and falls back to `out_time_ms` only if it is absent.
+    pub out_time_us: Option<i64>,
+    pub speed: Option<String>,
+    /// True once `progress=end` has been seen.
+    pub ended: bool,
+}
+
+impl ProgressBlock {
+    /// Apply one `key=value` line. Returns true when the block is complete and
+    /// should be reported.
+    pub fn apply(&mut self, line: &str) -> bool {
+        let Some((key, value)) = line.split_once('=') else {
+            return false;
+        };
+        let key = key.trim();
+        let value = value.trim();
+        // FFmpeg writes `N/A` for a field it cannot compute yet.
+        let usable = !value.is_empty() && value != "N/A";
+
+        match key {
+            "frame" if usable => self.frame = value.parse().ok(),
+            "fps" if usable => self.fps = value.parse().ok(),
+            "bitrate" if usable => self.bitrate = Some(value.to_string()),
+            "speed" if usable => self.speed = Some(value.to_string()),
+            "out_time_us" if usable => self.out_time_us = value.parse().ok(),
+            "out_time_ms" if usable && self.out_time_us.is_none() => {
+                self.out_time_us = value.parse().ok()
+            }
+            "progress" => {
+                self.ended = value == "end";
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -135,7 +177,8 @@ pub fn transcode_file(
     let mut command = Command::new(&tools.ffmpeg);
     command.args(&args);
     command.stderr(Stdio::piped());
-    command.stdout(Stdio::null());
+    // Was `Stdio::null()`. `-progress pipe:1` writes here (T2-11).
+    command.stdout(Stdio::piped());
     command.stdin(Stdio::null());
 
     #[cfg(target_os = "windows")]
@@ -174,17 +217,56 @@ pub fn transcode_file(
             };
         }
     };
-    let mut reader = BufReader::new(stderr);
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
+            let _ = child.kill();
+            return EncodeResult {
+                output_path: output_path.to_path_buf(),
+                success: false,
+                error: Some("Failed to pipe stdout from ffmpeg process".to_string()),
+                stderr_tail: Vec::new(),
+                exit_pid: Some(pid),
+            };
+        }
+    };
 
-    let time_re = &*TIME_RE;
-    let frame_re = &*FRAME_RE;
-    let fps_re = &*FPS_RE;
-    let bitrate_re = &*BITRATE_RE;
-    let speed_re = &*SPEED_RE;
-
-    let mut last_frame = 0;
-    let mut stderr_lines: Vec<String> = Vec::new();
     const STDERR_RING_SIZE: usize = 200;
+
+    // stderr is now diagnostics only -- warnings and the failure reason. It has
+    // to be drained on its own thread regardless: a full pipe blocks FFmpeg,
+    // and a verbose encode fills 64 KiB long before it finishes.
+    let stderr_thread = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut lines: Vec<String> = Vec::new();
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Error reading ffmpeg stderr: {}", e);
+                    break;
+                }
+            }
+            let line = buf.trim_end_matches(|c| c == '\n' || c == '\r');
+            if line.is_empty() {
+                continue;
+            }
+            lines.push(line.to_string());
+            if lines.len() > STDERR_RING_SIZE {
+                lines.remove(0);
+            }
+        }
+        lines
+    });
+
+    // stdout carries the `-progress` blocks: newline-terminated key=value, one
+    // block every half second, ending with `progress=end`.
+    let mut reader = BufReader::new(stdout);
+    let mut block = ProgressBlock::default();
+    let mut last_frame = 0i64;
     let mut line_buf = String::new();
 
     loop {
@@ -193,63 +275,19 @@ pub fn transcode_file(
             Ok(0) => break,
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!("Error reading ffmpeg stderr: {}", e);
+                tracing::warn!("Error reading ffmpeg progress: {}", e);
                 break;
             }
         }
-        let line = line_buf.trim_end_matches(|c| c == '\n' || c == '\r');
-        if line.is_empty() {
+
+        if !block.apply(line_buf.trim()) {
             continue;
         }
-        stderr_lines.push(line.to_string());
-        if stderr_lines.len() > STDERR_RING_SIZE {
-            stderr_lines.remove(0);
+
+        if let Some(f) = block.frame {
+            last_frame = f;
         }
-
-        if let Some(caps) = frame_re.captures(line) {
-            last_frame = caps
-                .get(1)
-                .and_then(|m| m.as_str().parse::<i64>().ok())
-                .unwrap_or(last_frame);
-        }
-
-        let time_str = time_re.captures(line).map(|caps| {
-            format!(
-                "{}:{}:{}.{}",
-                caps.get(1).map_or("00", |m| m.as_str()),
-                caps.get(2).map_or("00", |m| m.as_str()),
-                caps.get(3).map_or("00", |m| m.as_str()),
-                caps.get(4).map_or("00", |m| m.as_str()),
-            )
-        });
-
-        let current_time_ms = time_str
-            .as_ref()
-            .map(|ts| {
-                let parts: Vec<f64> = ts.split(':').filter_map(|p| p.parse().ok()).collect();
-                if parts.len() == 4 {
-                    (parts[0] * 3600.0 + parts[1] * 60.0 + parts[2] + parts[3] / 100.0) as i64
-                        * 1000
-                } else {
-                    0
-                }
-            })
-            .unwrap_or(0);
-
-        let fps_val = fps_re
-            .captures(line)
-            .and_then(|caps| caps.get(1).and_then(|m| m.as_str().parse::<f64>().ok()))
-            .unwrap_or(0.0);
-
-        let bitrate = bitrate_re
-            .captures(line)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-            .unwrap_or_default();
-
-        let speed = speed_re
-            .captures(line)
-            .and_then(|caps| caps.get(1).map(|m| m.as_str().to_string()))
-            .unwrap_or_default();
+        let current_time_ms = block.out_time_us.map(|us| us / 1000).unwrap_or(0);
 
         let percent = if duration_ms > 0 && current_time_ms > 0 {
             ((current_time_ms as f64 / duration_ms as f64) * 100.0).min(99.0) as f32
@@ -259,19 +297,28 @@ pub fn transcode_file(
             0.0
         };
 
-        if time_str.is_some() {
-            let _ = progress_tx.send(EncodeProgress {
-                frame: last_frame,
-                total_frames,
-                percent,
-                fps: fps_val,
-                bitrate,
-                speed,
-                current_time_ms,
-                duration_ms,
-            });
+        let _ = progress_tx.send(EncodeProgress {
+            frame: last_frame,
+            total_frames,
+            percent,
+            fps: block.fps.unwrap_or(0.0),
+            bitrate: block.bitrate.clone().unwrap_or_default(),
+            speed: block.speed.clone().unwrap_or_default(),
+            current_time_ms,
+            duration_ms,
+        });
+
+        if block.ended {
+            break;
         }
+        // Carry `frame` forward: FFmpeg omits unchanged keys from later blocks.
+        block = ProgressBlock {
+            frame: Some(last_frame),
+            ..ProgressBlock::default()
+        };
     }
+
+    let stderr_lines = stderr_thread.join().unwrap_or_default();
 
     let status = match child.wait() {
         Ok(s) => s,
@@ -334,5 +381,156 @@ pub fn transcode_file(
             stderr_tail: tail,
             exit_pid: Some(pid),
         }
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    /// A real `-progress pipe:1` block, as FFmpeg 7 emits it.
+    const BLOCK: &[&str] = &[
+        "bitrate=5000.0kbits/s",
+        "total_size=3145728",
+        "out_time_us=4920000",
+        "out_time_ms=4920000",
+        "out_time=00:00:04.920000",
+        "dup_frames=0",
+        "drop_frames=0",
+        "speed=1.02x",
+        "progress=continue",
+    ];
+
+    fn feed(block: &mut ProgressBlock, lines: &[&str]) -> bool {
+        let mut complete = false;
+        for l in lines {
+            if block.apply(l) {
+                complete = true;
+            }
+        }
+        complete
+    }
+
+    #[test]
+    fn a_block_is_reported_only_once_progress_arrives() {
+        let mut b = ProgressBlock::default();
+        // Every key except the terminator: nothing to report yet.
+        assert!(!feed(&mut b, &BLOCK[..BLOCK.len() - 1]));
+        assert!(b.apply("progress=continue"), "progress= terminates a block");
+    }
+
+    #[test]
+    fn a_full_block_parses_every_field_this_code_uses() {
+        let mut b = ProgressBlock::default();
+        b.apply("frame=123");
+        b.apply("fps=25.00");
+        feed(&mut b, BLOCK);
+
+        assert_eq!(b.frame, Some(123));
+        assert_eq!(b.fps, Some(25.0));
+        assert_eq!(b.bitrate.as_deref(), Some("5000.0kbits/s"));
+        assert_eq!(b.speed.as_deref(), Some("1.02x"));
+        assert_eq!(b.out_time_us, Some(4_920_000));
+        assert!(!b.ended);
+    }
+
+    #[test]
+    fn out_time_us_wins_over_the_misnamed_out_time_ms() {
+        // FFmpeg's `out_time_ms` has carried microseconds for years. Reading it
+        // as milliseconds would put progress 1000x ahead and peg the bar at
+        // 99% within the first second.
+        let mut b = ProgressBlock::default();
+        b.apply("out_time_us=4920000");
+        b.apply("out_time_ms=4920000");
+        assert_eq!(b.out_time_us, Some(4_920_000));
+        assert_eq!(b.out_time_us.unwrap() / 1000, 4_920, "4.92 s in ms");
+    }
+
+    #[test]
+    fn out_time_ms_is_used_when_out_time_us_is_absent() {
+        // Older builds emit only `out_time_ms` -- still microseconds.
+        let mut b = ProgressBlock::default();
+        b.apply("out_time_ms=2000000");
+        assert_eq!(b.out_time_us, Some(2_000_000));
+    }
+
+    #[test]
+    fn progress_end_is_recognised_as_the_last_block() {
+        let mut b = ProgressBlock::default();
+        assert!(b.apply("progress=end"));
+        assert!(b.ended);
+    }
+
+    #[test]
+    fn not_available_values_are_ignored_rather_than_parsed_as_zero() {
+        // FFmpeg writes N/A before it can compute a field. Treating that as 0
+        // made the UI show 0 fps and an empty speed on every early block.
+        let mut b = ProgressBlock::default();
+        b.apply("fps=N/A");
+        b.apply("speed=N/A");
+        b.apply("bitrate=N/A");
+        assert_eq!(b.fps, None);
+        assert_eq!(b.speed, None);
+        assert_eq!(b.bitrate, None);
+    }
+
+    #[test]
+    fn junk_lines_do_not_terminate_or_corrupt_a_block() {
+        let mut b = ProgressBlock::default();
+        assert!(!b.apply("this is not a key value line"));
+        assert!(!b.apply(""));
+        assert!(!b.apply("frame=notanumber"));
+        assert_eq!(b.frame, None, "an unparseable value is dropped, not zeroed");
+    }
+
+    #[test]
+    fn real_ffmpeg_output_with_padded_values_parses() {
+        // Captured verbatim from FFmpeg 7 on 2026-09-18. Note the leading
+        // spaces inside the values -- FFmpeg pads them to a fixed width, and a
+        // parser that does not trim gets " 9.7x" and "   0.1kbits/s" into the
+        // UI.
+        let real = [
+            "frame=234",
+            "fps=225.30",
+            "stream_0_0_q=18.0",
+            "bitrate= 208.1kbits/s",
+            "total_size=262192",
+            "out_time_us=10077460",
+            "out_time_ms=10077460",
+            "out_time=00:00:10.077460",
+            "dup_frames=0",
+            "drop_frames=0",
+            "speed= 9.7x",
+            "progress=continue",
+        ];
+
+        let mut b = ProgressBlock::default();
+        assert!(feed(&mut b, &real));
+        assert_eq!(b.frame, Some(234));
+        assert_eq!(b.fps, Some(225.30));
+        assert_eq!(b.bitrate.as_deref(), Some("208.1kbits/s"));
+        assert_eq!(b.speed.as_deref(), Some("9.7x"));
+        assert_eq!(b.out_time_us, Some(10_077_460));
+        // 10.08 s of a 120 s clip.
+        assert_eq!(b.out_time_us.unwrap() / 1000, 10_077);
+    }
+
+    #[test]
+    fn the_argument_builder_asks_for_machine_readable_progress() {
+        // The whole fix depends on these three arguments being present.
+        let config = crate::config::AppConfig::default();
+        let profile = crate::profiles::EncodingProfile::by_id(crate::profiles::ProfileId::ProfileA);
+        let args = profile.build_ffmpeg_args(&config, "in.mxf", "out.mp4", 25, 1);
+
+        assert!(args.iter().any(|a| a == "-nostats"), "{:?}", args);
+        let i = args
+            .iter()
+            .position(|a| a == "-progress")
+            .expect("-progress must be passed");
+        assert_eq!(args[i + 1], "pipe:1");
+        assert!(
+            !args.iter().any(|a| a == "-stats"),
+            "-stats would put the carriage-return status line back on stderr"
+        );
     }
 }

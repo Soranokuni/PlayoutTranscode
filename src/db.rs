@@ -17,6 +17,9 @@ pub struct StructuredPurgeResult {
 pub struct MediaAsset {
     pub uuid: String,
     pub fingerprint: i64,
+    /// SHA-256 of the *source* file, hex. `None` for rows written before T2-6,
+    /// which is why dedup treats a missing value as "cannot confirm".
+    pub source_sha256: Option<String>,
     pub current_path: String,
     pub duration_ms: i64,
     pub trim_in_ms: i64,
@@ -99,7 +102,7 @@ impl From<MediaAsset> for AssetResponse {
     }
 }
 
-const SELECT_COLS: &str = "uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder";
+const SELECT_COLS: &str = "uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder";
 
 /// Find all assets with a given status. Used for startup recovery scans.
 pub async fn find_all_with_status(
@@ -163,6 +166,159 @@ pub async fn recover_failed_assets(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Registry backups (T2-13)
+//
+// The asset registry is the playout source of truth. It holds every uuid,
+// virtual folder, rating, trim window and compliance flag an operator has ever
+// set, and none of it can be reconstructed from the media files. Losing it
+// means re-ingesting the library and re-entering every piece of metadata by
+// hand -- and SQLite files do get lost, to a full volume mid-write, to antivirus
+// quarantine, to someone copying a WAL-mode database while the service runs.
+//
+// `VACUUM INTO` is the right primitive: it is a consistent snapshot taken
+// through the same connection pool, safe while the service is writing, and the
+// result is a plain defragmented database file. Copying the file is not safe;
+// `.backup` needs the CLI.
+// ---------------------------------------------------------------------------
+
+/// Directory under the data directory that holds registry snapshots.
+pub const BACKUP_DIR_NAME: &str = "backups";
+
+/// How many daily snapshots to keep. Two weeks of retention would be nicer, but
+/// a snapshot is roughly the size of the live registry, and an operator who has
+/// not noticed a problem in a week is not going to notice it in two.
+pub const BACKUP_RETENTION: usize = 7;
+
+/// A snapshot on disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupInfo {
+    pub file_name: String,
+    pub size_bytes: u64,
+    /// RFC 3339, from the filesystem.
+    pub created_at: Option<String>,
+}
+
+/// Where snapshots live for a given data directory.
+pub fn backup_dir(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(BACKUP_DIR_NAME)
+}
+
+/// The snapshot filename for a date, e.g. `media_assets-2026-09-18.db`.
+///
+/// Date-stamped rather than timestamped on purpose: a second backup on the same
+/// day overwrites the first, so an hourly trigger cannot fill the volume.
+pub fn backup_file_name(date: &str) -> String {
+    format!("media_assets-{}.db", date)
+}
+
+/// Take a consistent snapshot of the registry into `<data_dir>/backups/`.
+///
+/// Returns the path written. Safe to call while the service is running and
+/// writing; `VACUUM INTO` takes its own read transaction.
+pub async fn backup_now(pool: &SqlitePool, data_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let dir = backup_dir(data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let dest = dir.join(backup_file_name(&date));
+
+    // Checkpoint first, so the snapshot includes everything committed to the
+    // WAL rather than only what has been folded back into the main file.
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await;
+
+    // Vacuum into a unique temporary name, then rename it into place.
+    //
+    // `VACUUM INTO` refuses to overwrite, so the obvious implementation is
+    // "delete today's file, then vacuum onto it" -- and that has a window in
+    // which today's backup does not exist. Two concurrent calls (the daily task
+    // firing while an operator clicks Backup) can then delete the file the
+    // other is halfway through writing: the loser errors and the winner leaves
+    // a truncated snapshot. Write-then-rename has no such window -- the old
+    // snapshot stays intact until a complete new one atomically replaces it.
+    let staging = dir.join(format!(
+        ".{}.{}.tmp",
+        backup_file_name(&date),
+        uuid::Uuid::new_v4()
+    ));
+
+    // The path is interpolated because SQLite does not accept a bound parameter
+    // here. Single quotes are doubled so a path containing one cannot terminate
+    // the literal; the value is server-generated, never caller-supplied.
+    let escaped = staging.to_string_lossy().replace('\'', "''");
+    if let Err(e) = sqlx::query(&format!("VACUUM INTO '{}'", escaped))
+        .execute(pool)
+        .await
+    {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("VACUUM INTO failed: {}", e));
+    }
+
+    if let Err(e) = std::fs::rename(&staging, &dest) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("cannot publish {}: {}", dest.display(), e));
+    }
+
+    prune_backups(&dir, BACKUP_RETENTION);
+    Ok(dest)
+}
+
+/// List snapshots, newest first.
+pub fn list_backups(data_dir: &Path) -> Vec<BackupInfo> {
+    let dir = backup_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<BackupInfo> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("media_assets-") && name.ends_with(".db")
+        })
+        .map(|e| {
+            let meta = e.metadata().ok();
+            BackupInfo {
+                file_name: e.file_name().to_string_lossy().into_owned(),
+                size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                created_at: meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
+            }
+        })
+        .collect();
+
+    // By name, which sorts chronologically because the stamp is ISO-8601.
+    out.sort_by(|a, b| b.file_name.cmp(&a.file_name));
+    out
+}
+
+/// Delete all but the newest `keep` snapshots.
+pub fn prune_backups(dir: &Path, keep: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("media_assets-") && n.ends_with(".db"))
+        .collect();
+    names.sort();
+
+    let mut removed = 0;
+    while names.len() > keep {
+        let oldest = names.remove(0);
+        if std::fs::remove_file(dir.join(&oldest)).is_ok() {
+            removed += 1;
+            tracing::info!("Pruned old registry backup {}", oldest);
+        }
+    }
+    removed
+}
+
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let _ = std::fs::create_dir_all(db_dir);
@@ -179,6 +335,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS media_assets (
             uuid         TEXT PRIMARY KEY,
             fingerprint  INTEGER NOT NULL,
+            source_sha256 TEXT DEFAULT NULL,
             current_path TEXT NOT NULL,
             duration_ms  INTEGER NOT NULL DEFAULT 0,
             trim_in_ms   INTEGER NOT NULL DEFAULT 0,
@@ -288,6 +445,10 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         ("fps_den", "INTEGER", "0"),
         ("deleted_at", "TEXT", "NULL"),
         ("original_virtual_folder", "TEXT", "NULL"),
+        // T2-6. Nullable on purpose: rows ingested before this column existed
+        // have no full hash, and backfilling would mean re-reading the whole
+        // library from disk at startup.
+        ("source_sha256", "TEXT", "NULL"),
     ] {
         let sql = if default == "NULL" {
             format!(
@@ -354,6 +515,17 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await;
 
+    // T2-7. Every paginated listing filters on (status, deleted_at) or orders
+    // within a virtual folder; without these the LIMIT/OFFSET still scans the
+    // whole table and paging buys nothing but a smaller response.
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_status_deleted ON media_assets(status, deleted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_virtual_folder ON media_assets(virtual_folder)",
+        "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_created_at ON transcode_jobs(created_at)",
+    ] {
+        let _ = sqlx::query(idx).execute(&pool).await;
+    }
+
     tracing::info!(
         "Database initialized at {} (WAL mode, media_assets ready)",
         db_path.display()
@@ -366,14 +538,16 @@ pub async fn insert_processing(
     pool: &SqlitePool,
     uuid: &str,
     fingerprint: i64,
+    source_sha256: Option<&str>,
     path: &str,
     display_name: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO media_assets (uuid, fingerprint, current_path, display_name, status) VALUES (?1, ?2, ?3, ?4, 'processing')",
+        "INSERT INTO media_assets (uuid, fingerprint, source_sha256, current_path, display_name, status) VALUES (?1, ?2, ?3, ?4, ?5, 'processing')",
     )
     .bind(uuid)
     .bind(fingerprint)
+    .bind(source_sha256)
     .bind(path)
     .bind(display_name)
     .execute(pool)
@@ -595,15 +769,102 @@ pub async fn purge_row_by_uuid(pool: &SqlitePool, uuid: &str) -> Result<u64, sql
     Ok(result.rows_affected())
 }
 
-pub async fn purge_rows_by_fingerprint(
+/// What a re-ingest did to the rows that shared its fingerprint.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FingerprintPurge {
+    /// Unusable rows deleted: a failed or half-finished ingest of the whole file.
+    pub deleted: u64,
+    /// `ready` rows whose mezzanine has gone missing, demoted to `error` so the
+    /// operator's metadata survives.
+    pub demoted: u64,
+    /// Rows deliberately left alone — subclips, and `ready` rows that are fine.
+    pub protected: u64,
+}
+
+/// Clear the way for a re-ingest of `fingerprint`, without destroying work.
+///
+/// This used to be `DELETE FROM media_assets WHERE fingerprint = ?`, which is
+/// F-26: a subclip carries its **parent's** fingerprint, so re-ingesting a
+/// programme deleted every subclip an operator had cut from it, along with
+/// their ratings, virtual folders and compliance metadata. None of that is
+/// recoverable from the source file.
+///
+/// The rule now:
+///
+/// * a **subclip** (trimmed: `trim_in_ms > 0`, or `trim_out_ms` is neither 0
+///   nor the full duration) is never touched, whatever its status;
+/// * a `ready` full-length row whose file still exists is never touched —
+///   the caller only reaches here when it decided the existing asset is not
+///   usable, and "not usable" must not mean "delete someone's library entry";
+/// * a `ready` full-length row whose file has **gone** is demoted to `error`,
+///   not deleted, so the metadata survives for the re-ingest to be reconciled
+///   against by an operator;
+/// * only `error` / `processing` full-length rows are actually deleted. Those
+///   are the leftovers of a failed ingest and carry nothing worth keeping.
+///
+/// `file_exists` is injected so the decision is unit-testable without a
+/// filesystem.
+pub async fn purge_unusable_rows_by_fingerprint(
     pool: &SqlitePool,
     fingerprint: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM media_assets WHERE fingerprint = ?1")
-        .bind(fingerprint)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    file_exists: impl Fn(&str) -> bool,
+) -> Result<FingerprintPurge, sqlx::Error> {
+    let rows: Vec<(String, String, i64, i64, i64, String)> = sqlx::query_as(
+        "SELECT uuid, status, trim_in_ms, trim_out_ms, duration_ms, current_path
+         FROM media_assets WHERE fingerprint = ?1",
+    )
+    .bind(fingerprint)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = FingerprintPurge::default();
+
+    for (uuid, status, trim_in, trim_out, duration, path) in rows {
+        if is_subclip_row(trim_in, trim_out, duration) {
+            out.protected += 1;
+            continue;
+        }
+        match status.as_str() {
+            "ready" => {
+                if !path.is_empty() && file_exists(&path) {
+                    out.protected += 1;
+                } else {
+                    sqlx::query("UPDATE media_assets SET status = 'error' WHERE uuid = ?1")
+                        .bind(&uuid)
+                        .execute(pool)
+                        .await?;
+                    out.demoted += 1;
+                    tracing::warn!(
+                        "Asset {} was ready but its mezzanine is missing; demoted to 'error' \
+                         rather than deleted, so its metadata survives the re-ingest",
+                        uuid
+                    );
+                }
+            }
+            "error" | "processing" => {
+                sqlx::query("DELETE FROM media_assets WHERE uuid = ?1")
+                    .bind(&uuid)
+                    .execute(pool)
+                    .await?;
+                out.deleted += 1;
+            }
+            // Anything else (a status a later version introduces) is left
+            // alone. Failing safe here costs a duplicate row; failing open
+            // costs an operator's work.
+            _ => out.protected += 1,
+        }
+    }
+
+    Ok(out)
+}
+
+/// Is this row a trimmed excerpt rather than the whole file?
+///
+/// `trim_out_ms == 0` means "unset" in rows written before trimming existed,
+/// and `trim_out_ms == duration_ms` is the full-length case `mark_ready`
+/// writes. Anything else is a cut.
+pub fn is_subclip_row(trim_in_ms: i64, trim_out_ms: i64, duration_ms: i64) -> bool {
+    trim_in_ms > 0 || (trim_out_ms != 0 && trim_out_ms != duration_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1244,6 +1505,88 @@ pub fn like_prefix(norm: &str) -> String {
     out
 }
 
+/// The default page size for `GET /api/assets` (T2-7).
+///
+/// Chosen to be larger than most stations' whole library, so the common case
+/// is still a single request, while a library that has grown past it degrades
+/// into paging rather than into a multi-hundred-megabyte response.
+pub const ASSETS_DEFAULT_LIMIT: i64 = 1000;
+
+/// The most rows one request may ask for, whatever `?limit=` says.
+///
+/// An unbounded `limit` is the same unbounded response F-06 is about, just
+/// spelled by the caller instead of the server.
+pub const ASSETS_MAX_LIMIT: i64 = 5000;
+
+/// Clamp a caller-supplied page size into `1..=ASSETS_MAX_LIMIT`.
+///
+/// `None` is the default, not "no limit" — there is no way to ask for the whole
+/// library in one response any more, deliberately.
+pub fn clamp_asset_limit(requested: Option<i64>) -> i64 {
+    match requested {
+        None => ASSETS_DEFAULT_LIMIT,
+        Some(n) if n < 1 => 1,
+        Some(n) => n.min(ASSETS_MAX_LIMIT),
+    }
+}
+
+/// One page of assets, plus how many there are in total.
+pub struct AssetPage {
+    pub assets: Vec<MediaAsset>,
+    /// Matching rows ignoring `limit`/`offset` — served as `X-Total-Count`, so
+    /// a client knows whether to ask for another page.
+    pub total: i64,
+}
+
+/// A bounded page of live assets, ordered stably by uuid.
+///
+/// `find_all` used to fetch every row and let the handler serialise all of
+/// them. With `keyframe_offsets` on each row that is tens of kilobytes per
+/// asset, and a 5 000-asset library produced a response PlayOut's 16 MiB cap
+/// rejected outright (F-06). `LIMIT`/`OFFSET` are applied in SQL, so the cost
+/// is paid by the database, not by materialising the library in memory first.
+pub async fn find_page(
+    pool: &SqlitePool,
+    status_filter: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<AssetPage, sqlx::Error> {
+    let limit = clamp_asset_limit(Some(limit));
+    let offset = offset.max(0);
+
+    // ORDER BY uuid, not rowid: paging has to be stable across requests, and a
+    // concurrent ingest must not shuffle a row the client has already seen onto
+    // the next page.
+    let (where_clause, bind_status) = match status_filter {
+        Some(_) => ("status = ?1 AND deleted_at IS NULL", true),
+        None => ("deleted_at IS NULL", false),
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM media_assets WHERE {}", where_clause);
+    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql);
+    if bind_status {
+        count_q = count_q.bind(status_filter.unwrap_or_default());
+    }
+    let (total,) = count_q.fetch_one(pool).await?;
+
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE {} ORDER BY uuid LIMIT {} OFFSET {}",
+        SELECT_COLS, where_clause, limit, offset
+    );
+    let mut q = sqlx::query_as::<_, MediaAsset>(&sql);
+    if bind_status {
+        q = q.bind(status_filter.unwrap_or_default());
+    }
+    let assets = q.fetch_all(pool).await?;
+
+    Ok(AssetPage { assets, total })
+}
+
+/// Every live asset, unbounded.
+///
+/// Retained for internal callers that genuinely need the whole set (recovery
+/// sweeps, folder reconciliation). **Not** reachable from the HTTP surface —
+/// `GET /api/assets` goes through [`find_page`].
 pub async fn find_all(
     pool: &SqlitePool,
     status_filter: Option<&str>,
@@ -1392,10 +1735,14 @@ impl DurableJobRow {
     }
 }
 
-pub async fn insert_durable_job(
-    pool: &SqlitePool,
-    job: &crate::jobs::JobRecord,
-) -> Result<(), sqlx::Error> {
+/// Upsert one job row through any executor -- the pool, or a transaction.
+///
+/// Executor-generic so `persist_jobs` can run a whole coalesced batch inside a
+/// single transaction (T2-4) without a second copy of this 31-column statement.
+async fn upsert_job<'e, E>(executor: E, job: &crate::jobs::JobRecord) -> Result<(), sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let stderr_json = job
         .stderr_log
         .as_ref()
@@ -1475,123 +1822,41 @@ pub async fn insert_durable_job(
     .bind(&job.encode_speed)
     .bind(job.current_time_ms)
     .bind(job.duration_ms)
-    .execute(pool)
+    .execute(executor)
     .await?;
 
     Ok(())
 }
 
-#[allow(dead_code)]
-pub async fn claim_next_job(
+/// Persist a single job immediately. Used by startup population and tests; the
+/// running service goes through the coalescing persister and `persist_jobs`.
+pub async fn insert_durable_job(
     pool: &SqlitePool,
-    worker_id: &str,
-    lease_secs: i64,
-) -> Result<Option<crate::jobs::JobRecord>, sqlx::Error> {
+    job: &crate::jobs::JobRecord,
+) -> Result<(), sqlx::Error> {
+    upsert_job(pool, job).await
+}
+
+/// Persist a coalesced batch of jobs in one transaction.
+///
+/// Before T2-4 every in-memory job mutation spawned its own independent upsert,
+/// so two rapid writes for the same job could land out of order and leave the
+/// database claiming "Encoding 97%" for a job that had already completed. The
+/// persister hands this the newest record per job id, and one transaction makes
+/// the batch atomic and cheap: an encode used to cause one commit per FFmpeg
+/// progress line.
+pub async fn persist_jobs(
+    pool: &SqlitePool,
+    jobs: &[crate::jobs::JobRecord],
+) -> Result<(), sqlx::Error> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
     let mut tx = pool.begin().await?;
-
-    let row: Option<DurableJobRow> = sqlx::query_as(
-        "SELECT * FROM transcode_jobs 
-         WHERE (state = 'Pending' AND phase = 'queued') 
-            OR (state = 'Processing' AND leased_until IS NOT NULL AND leased_until < datetime('now'))
-         ORDER BY created_at ASC 
-         LIMIT 1",
-    )
-    .fetch_optional(&mut *tx)
-    .await?;
-
-    if let Some(r) = row {
-        let now = chrono::Utc::now();
-        let leased_until = (now + chrono::Duration::seconds(lease_secs)).to_rfc3339();
-        let heartbeat_at = now.to_rfc3339();
-        let started_at = r.started_at.clone().unwrap_or_else(|| now.to_rfc3339());
-
-        sqlx::query(
-            "UPDATE transcode_jobs SET
-                state = 'Processing',
-                phase = 'probing',
-                current_stage = 'Claimed by worker',
-                worker_id = ?1,
-                leased_until = ?2,
-                heartbeat_at = ?3,
-                started_at = ?4
-             WHERE id = ?5",
-        )
-        .bind(worker_id)
-        .bind(&leased_until)
-        .bind(&heartbeat_at)
-        .bind(&started_at)
-        .bind(&r.id)
-        .execute(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-
-        let mut job = r.into_job_record();
-        job.state = crate::jobs::JobState::Processing;
-        job.phase = crate::jobs::JobPhase::Probing;
-        job.current_stage = "Claimed by worker".to_string();
-        job.worker_id = Some(worker_id.to_string());
-        job.leased_until = Some(leased_until);
-        job.heartbeat_at = Some(heartbeat_at);
-        job.started_at = Some(started_at);
-
-        Ok(Some(job))
-    } else {
-        tx.rollback().await?;
-        Ok(None)
+    for job in jobs {
+        upsert_job(&mut *tx, job).await?;
     }
-}
-
-#[allow(dead_code)]
-pub async fn heartbeat_job(
-    pool: &SqlitePool,
-    job_id: &str,
-    worker_id: &str,
-    extend_secs: i64,
-) -> Result<bool, sqlx::Error> {
-    let now = chrono::Utc::now();
-    let leased_until = (now + chrono::Duration::seconds(extend_secs)).to_rfc3339();
-    let heartbeat_at = now.to_rfc3339();
-
-    let row: Option<(bool,)> = sqlx::query_as(
-        "SELECT cancel_requested FROM transcode_jobs WHERE id = ?1 AND worker_id = ?2",
-    )
-    .bind(job_id)
-    .bind(worker_id)
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some((cancel_req,)) = row {
-        if !cancel_req {
-            let _ = sqlx::query(
-                "UPDATE transcode_jobs SET leased_until = ?1, heartbeat_at = ?2 WHERE id = ?3 AND worker_id = ?4",
-            )
-            .bind(&leased_until)
-            .bind(&heartbeat_at)
-            .bind(job_id)
-            .bind(worker_id)
-            .execute(pool)
-            .await;
-        }
-        Ok(cancel_req)
-    } else {
-        Ok(false)
-    }
-}
-
-#[allow(dead_code)]
-pub async fn request_job_cancellation(
-    pool: &SqlitePool,
-    job_id: &str,
-) -> Result<bool, sqlx::Error> {
-    let res = sqlx::query(
-        "UPDATE transcode_jobs SET cancel_requested = 1, phase = CASE WHEN phase = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END, state = CASE WHEN phase = 'queued' THEN 'Cancelled' ELSE state END WHERE id = ?1 AND state IN ('Pending', 'Processing')",
-    )
-    .bind(job_id)
-    .execute(pool)
-    .await?;
-
-    Ok(res.rows_affected() > 0)
+    tx.commit().await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1647,6 +1912,61 @@ pub async fn recover_stale_jobs(pool: &SqlitePool) -> Result<JobRecoveryReport, 
     }
 
     Ok(report)
+}
+
+/// Jobs still waiting to be picked up, oldest first.
+pub async fn load_pending_jobs(
+    pool: &SqlitePool,
+) -> Result<Vec<crate::jobs::JobRecord>, sqlx::Error> {
+    let rows: Vec<DurableJobRow> = sqlx::query_as(
+        "SELECT * FROM transcode_jobs WHERE state = 'Pending' ORDER BY created_at ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| r.into_job_record()).collect())
+}
+
+/// Mark the given jobs failed because their source file is gone.
+///
+/// `recover_stale_jobs` re-queues interrupted work to `Pending`, but nothing
+/// ever consumed those rows: only the filesystem watcher feeds the dispatcher,
+/// so a job whose source had since been moved or deleted stayed `Pending`
+/// forever and showed up in `/api/jobs` and `/api/stats` as permanently
+/// outstanding work (F-13). Failing them at startup makes the queue reflect
+/// reality; a job whose source *does* still exist is left alone, because the
+/// watcher will re-offer the file and the dispatcher now adopts the existing
+/// record rather than creating a second one.
+pub async fn fail_jobs_with_missing_source(
+    pool: &SqlitePool,
+    job_ids: &[String],
+) -> Result<usize, sqlx::Error> {
+    if job_ids.is_empty() {
+        return Ok(0);
+    }
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut tx = pool.begin().await?;
+    let mut affected = 0usize;
+    for id in job_ids {
+        let res = sqlx::query(
+            "UPDATE transcode_jobs SET
+                state = 'Failed',
+                phase = 'failed',
+                current_stage = 'Failed',
+                error = 'Source file no longer exists',
+                error_category = 'source_missing_on_recovery',
+                worker_id = NULL,
+                leased_until = NULL,
+                finished_at = ?1
+             WHERE id = ?2 AND state = 'Pending'",
+        )
+        .bind(&now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        affected += res.rows_affected() as usize;
+    }
+    tx.commit().await?;
+    Ok(affected)
 }
 
 pub async fn load_all_durable_jobs(
@@ -2348,11 +2668,12 @@ mod tests {
         let video_path = temp_dir.join("video1.mp4");
         let sidecar_path = crate::identity::sidecar_path_for(&video_path);
 
+        std::fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
         std::fs::File::create(&video_path).unwrap();
         std::fs::File::create(&sidecar_path).unwrap();
 
         let uuid = "parent-1";
-        insert_processing(&pool, uuid, 12345, &video_path.to_string_lossy(), "video1")
+        insert_processing(&pool, uuid, 12345, None, &video_path.to_string_lossy(), "video1")
             .await
             .unwrap();
         mark_ready(
@@ -2396,6 +2717,7 @@ mod tests {
         let video_path = temp_dir.join("shared_mezzanine.mp4");
         let sidecar_path = crate::identity::sidecar_path_for(&video_path);
 
+        std::fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
         std::fs::File::create(&video_path).unwrap();
         std::fs::File::create(&sidecar_path).unwrap();
 
@@ -2406,6 +2728,7 @@ mod tests {
             &pool,
             parent_uuid,
             67890,
+        None,
             &video_path.to_string_lossy(),
             "shared",
         )
@@ -2509,6 +2832,7 @@ mod tests {
             &pool,
             parent_uuid,
             11111,
+        None,
             &video_path.to_string_lossy(),
             "multi",
         )
@@ -2570,7 +2894,7 @@ mod tests {
         std::fs::File::create(&staging_path).unwrap();
 
         let uuid = "failed-staging-asset";
-        insert_processing(&pool, uuid, 99999, &staging_path.to_string_lossy(), "video")
+        insert_processing(&pool, uuid, 99999, None, &staging_path.to_string_lossy(), "video")
             .await
             .unwrap();
 
@@ -2610,27 +2934,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_atomic_claim_and_lease() {
+    async fn recovery_fails_pending_jobs_whose_source_is_gone() {
         let (pool, temp_dir) = setup_test_pool().await;
-        let job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
-        insert_durable_job(&pool, &job).await.unwrap();
+        let present_path = temp_dir.join("still-here.mov");
+        std::fs::write(&present_path, b"media").expect("write fixture");
 
-        // Worker 1 claims job
-        let claimed = claim_next_job(&pool, "worker-1", 60).await.unwrap();
-        assert!(claimed.is_some());
-        let claimed_job = claimed.unwrap();
-        assert_eq!(claimed_job.id, job.id);
-        assert_eq!(claimed_job.worker_id.as_deref(), Some("worker-1"));
-        assert_eq!(claimed_job.phase, crate::jobs::JobPhase::Probing);
-        assert_eq!(claimed_job.state, crate::jobs::JobState::Processing);
+        // Pending, source still on disk: left alone, because the watcher will
+        // re-offer it and the dispatcher adopts this record.
+        let mut keep = crate::jobs::JobRecord::new(&present_path.to_string_lossy(), "ProfileA");
+        keep.state = crate::jobs::JobState::Pending;
+        keep.phase = crate::jobs::JobPhase::Queued;
+        insert_durable_job(&pool, &keep).await.unwrap();
 
-        // Worker 2 attempts to claim while lease is active -> None
-        let second_claim = claim_next_job(&pool, "worker-2", 60).await.unwrap();
-        assert!(second_claim.is_none());
+        // Pending, source gone: would sit Pending forever (F-13).
+        let mut orphan = crate::jobs::JobRecord::new("D:/media/deleted-while-down.mov", "ProfileA");
+        orphan.state = crate::jobs::JobState::Pending;
+        orphan.phase = crate::jobs::JobPhase::Queued;
+        insert_durable_job(&pool, &orphan).await.unwrap();
 
-        // Worker 1 heartbeats
-        let cancel_req = heartbeat_job(&pool, &job.id, "worker-1", 60).await.unwrap();
-        assert!(!cancel_req);
+        // Completed, source gone: must not be touched.
+        let mut done = crate::jobs::JobRecord::new("D:/media/already-done.mov", "ProfileA");
+        done.state = crate::jobs::JobState::Completed;
+        done.phase = crate::jobs::JobPhase::Completed;
+        insert_durable_job(&pool, &done).await.unwrap();
+
+        let pending = load_pending_jobs(&pool).await.unwrap();
+        assert_eq!(pending.len(), 2, "only Pending rows are considered");
+
+        let missing: Vec<String> = pending
+            .iter()
+            .filter(|j| !std::path::Path::new(&j.input_path).exists())
+            .map(|j| j.id.clone())
+            .collect();
+        assert_eq!(missing, vec![orphan.id.clone()]);
+
+        let n = fail_jobs_with_missing_source(&pool, &missing).await.unwrap();
+        assert_eq!(n, 1);
+
+        let all = load_all_durable_jobs(&pool).await.unwrap();
+        let o = all.iter().find(|j| j.id == orphan.id).unwrap();
+        assert_eq!(o.state, crate::jobs::JobState::Failed);
+        assert_eq!(o.phase, crate::jobs::JobPhase::Failed);
+        assert_eq!(
+            o.error_category.as_deref(),
+            Some("source_missing_on_recovery")
+        );
+        assert!(o.finished_at.is_some());
+
+        let k = all.iter().find(|j| j.id == keep.id).unwrap();
+        assert_eq!(k.state, crate::jobs::JobState::Pending);
+        let d = all.iter().find(|j| j.id == done.id).unwrap();
+        assert_eq!(d.state, crate::jobs::JobState::Completed);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn persist_jobs_writes_a_whole_batch_in_one_transaction() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let batch: Vec<crate::jobs::JobRecord> = (0..25)
+            .map(|i| crate::jobs::JobRecord::new(&format!("D:/media/clip{}.mov", i), "ProfileA"))
+            .collect();
+
+        persist_jobs(&pool, &batch).await.unwrap();
+        assert_eq!(load_all_durable_jobs(&pool).await.unwrap().len(), 25);
+
+        // Re-persisting the same ids updates rather than duplicating.
+        let mut again = batch.clone();
+        for j in &mut again {
+            j.progress = 100.0;
+        }
+        persist_jobs(&pool, &again).await.unwrap();
+        let rows = load_all_durable_jobs(&pool).await.unwrap();
+        assert_eq!(rows.len(), 25);
+        assert!(rows.iter().all(|r| r.progress == 100.0));
+
+        // An empty batch is a no-op, not an empty transaction.
+        persist_jobs(&pool, &[]).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -2673,7 +3053,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_job_cancellation_and_request_hash_dedup() {
+    async fn test_request_hash_dedup() {
         let (pool, temp_dir) = setup_test_pool().await;
         let mut job = crate::jobs::JobRecord::new("D:/media/clip.mp4", "ProfileA");
         job.request_hash = Some("hash-abc-123".into());
@@ -2685,14 +3065,6 @@ mod tests {
         assert!(found.is_some());
         assert_eq!(found.unwrap().id, job.id);
 
-        let cancel_res = request_job_cancellation(&pool, &job.id).await.unwrap();
-        assert!(cancel_res);
-
-        let all = load_all_durable_jobs(&pool).await.unwrap();
-        let j = all.iter().find(|j| j.id == job.id).unwrap();
-        assert_eq!(j.phase, crate::jobs::JobPhase::Cancelled);
-        assert_eq!(j.state, crate::jobs::JobState::Cancelled);
-
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
@@ -2700,7 +3072,7 @@ mod tests {
     async fn test_soft_delete_single_asset_and_restore() {
         let (pool, temp_dir) = setup_test_pool().await;
         let uuid = "test-soft-del-1";
-        insert_processing(&pool, uuid, 12345, "D:/target/clip1.mp4", "Clip 1")
+        insert_processing(&pool, uuid, 12345, None, "D:/target/clip1.mp4", "Clip 1")
             .await
             .unwrap();
         mark_ready(&pool, uuid, "D:/target/clip1.mp4", 5000, true, 25.0, 25, 1, 125, 50, 0, &[], "[]")
@@ -2754,13 +3126,13 @@ mod tests {
         // 1: /Shows/Drama
         // 2: /Shows/Drama/Season1
         // 3: /Shows/Dramatic (MUST NOT BE TRASHED BY /Shows/Drama!)
-        insert_processing(&pool, "u1", 1, "D:/target/c1.mp4", "C1").await.unwrap();
+        insert_processing(&pool, "u1", 1, None, "D:/target/c1.mp4", "C1").await.unwrap();
         set_virtual_folder(&pool, "u1", "/Shows/Drama").await.unwrap();
 
-        insert_processing(&pool, "u2", 2, "D:/target/c2.mp4", "C2").await.unwrap();
+        insert_processing(&pool, "u2", 2, None, "D:/target/c2.mp4", "C2").await.unwrap();
         set_virtual_folder(&pool, "u2", "/Shows/Drama/Season1").await.unwrap();
 
-        insert_processing(&pool, "u3", 3, "D:/target/c3.mp4", "C3").await.unwrap();
+        insert_processing(&pool, "u3", 3, None, "D:/target/c3.mp4", "C3").await.unwrap();
         set_virtual_folder(&pool, "u3", "/Shows/Dramatic").await.unwrap();
 
         // Trash /Shows/Drama
@@ -2796,17 +3168,17 @@ mod tests {
 
         // Legacy rows can carry LIKE metacharacters even though the validator
         // now rejects `%` at the API boundary, so the SQL must escape them.
-        insert_processing(&pool, "u1", 1, "D:/target/c1.mp4", "C1").await.unwrap();
+        insert_processing(&pool, "u1", 1, None, "D:/target/c1.mp4", "C1").await.unwrap();
         set_virtual_folder(&pool, "u1", "/promo_2026").await.unwrap();
-        insert_processing(&pool, "u2", 2, "D:/target/c2.mp4", "C2").await.unwrap();
+        insert_processing(&pool, "u2", 2, None, "D:/target/c2.mp4", "C2").await.unwrap();
         set_virtual_folder(&pool, "u2", "/promoX2026").await.unwrap();
-        insert_processing(&pool, "u3", 3, "D:/target/c3.mp4", "C3").await.unwrap();
+        insert_processing(&pool, "u3", 3, None, "D:/target/c3.mp4", "C3").await.unwrap();
         set_virtual_folder(&pool, "u3", "/promo_2026/teasers").await.unwrap();
-        insert_processing(&pool, "u4", 4, "D:/target/c4.mp4", "C4").await.unwrap();
+        insert_processing(&pool, "u4", 4, None, "D:/target/c4.mp4", "C4").await.unwrap();
         set_virtual_folder(&pool, "u4", "/a%b").await.unwrap();
-        insert_processing(&pool, "u5", 5, "D:/target/c5.mp4", "C5").await.unwrap();
+        insert_processing(&pool, "u5", 5, None, "D:/target/c5.mp4", "C5").await.unwrap();
         set_virtual_folder(&pool, "u5", "/a%b/c").await.unwrap();
-        insert_processing(&pool, "u6", 6, "D:/target/c6.mp4", "C6").await.unwrap();
+        insert_processing(&pool, "u6", 6, None, "D:/target/c6.mp4", "C6").await.unwrap();
         set_virtual_folder(&pool, "u6", "/aQb").await.unwrap();
 
         // `_` must not act as a single-character wildcard.
@@ -2861,7 +3233,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_folder_fallback_to_root() {
         let (pool, temp_dir) = setup_test_pool().await;
-        insert_processing(&pool, "u10", 10, "D:/target/c10.mp4", "C10").await.unwrap();
+        insert_processing(&pool, "u10", 10, None, "D:/target/c10.mp4", "C10").await.unwrap();
         set_virtual_folder(&pool, "u10", "/OldShows/SeriesA").await.unwrap();
 
         trash_folder(&pool, "/OldShows").await.unwrap();
@@ -2952,7 +3324,7 @@ mod tests {
         std::fs::File::create(&source).unwrap();
 
         let uuid = "error-row-uuid";
-        insert_processing(&pool, uuid, 4242, &source.to_string_lossy(), "Source")
+        insert_processing(&pool, uuid, 4242, None, &source.to_string_lossy(), "Source")
             .await
             .unwrap();
         mark_error(&pool, uuid).await.unwrap();
@@ -2990,11 +3362,13 @@ mod tests {
         let (pool, temp_dir) = setup_test_pool().await;
         let media_file = temp_dir.join("mezzanine_video.mp4");
         let sidecar_file = crate::identity::sidecar_path_for(&media_file);
+        // Since T3-5 the resolver always answers `<root>/sidecars/...`.
+        std::fs::create_dir_all(sidecar_file.parent().unwrap()).unwrap();
         std::fs::File::create(&media_file).unwrap();
         std::fs::File::create(&sidecar_file).unwrap();
 
         let uuid = "purge-test-uuid";
-        insert_processing(&pool, uuid, 8888, &media_file.to_string_lossy(), "Mezzanine")
+        insert_processing(&pool, uuid, 8888, None, &media_file.to_string_lossy(), "Mezzanine")
             .await
             .unwrap();
         // Only a `ready` row's current_path points at a published mezzanine;
@@ -3043,7 +3417,7 @@ mod tests {
 
         // Old asset deleted 15 days ago
         let old_time = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
-        insert_processing(&pool, "old-asset", 111, "D:/target/old.mp4", "Old").await.unwrap();
+        insert_processing(&pool, "old-asset", 111, None, "D:/target/old.mp4", "Old").await.unwrap();
         sqlx::query("UPDATE media_assets SET deleted_at = ?1 WHERE uuid = 'old-asset'")
             .bind(&old_time)
             .execute(&pool)
@@ -3052,7 +3426,7 @@ mod tests {
 
         // Recent asset deleted 2 days ago
         let recent_time = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
-        insert_processing(&pool, "recent-asset", 222, "D:/target/recent.mp4", "Recent").await.unwrap();
+        insert_processing(&pool, "recent-asset", 222, None, "D:/target/recent.mp4", "Recent").await.unwrap();
         sqlx::query("UPDATE media_assets SET deleted_at = ?1 WHERE uuid = 'recent-asset'")
             .bind(&recent_time)
             .execute(&pool)
@@ -3088,14 +3462,14 @@ mod tests {
         let (pool, temp_dir) = setup_test_pool().await;
 
         // 1. Insert master clip
-        insert_processing(&pool, "asset-master", 1001, "D:/target/master.mp4", "Master 1").await.unwrap();
+        insert_processing(&pool, "asset-master", 1001, None, "D:/target/master.mp4", "Master 1").await.unwrap();
         mark_ready(&pool, "asset-master", "D:/target/master.mp4", 10000, true, 25.0, 25, 1, 250, 50, 0, &["warning1".into()], "[]").await.unwrap();
 
         // 2. Insert subclip
         create_subclip(&pool, "asset-sub", "asset-master", "Subclip 1", 1000, 5000, true, "[]").await.unwrap();
 
         // 3. Insert trashed asset
-        insert_processing(&pool, "asset-trashed", 1002, "D:/target/trashed.mp4", "Trashed 1").await.unwrap();
+        insert_processing(&pool, "asset-trashed", 1002, None, "D:/target/trashed.mp4", "Trashed 1").await.unwrap();
         trash_asset(&pool, "asset-trashed").await.unwrap();
 
         // 4. Test Overview
@@ -3163,6 +3537,158 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+    // ---- T2-6: re-ingest must not destroy operator work (F-26) ----
+
+    /// Give `uuid` a `ready` row with an explicit trim window.
+    ///
+    /// `trim_out == duration` is the full-length case `mark_ready` writes;
+    /// anything narrower is a subclip an operator cut by hand.
+    async fn ready_row(
+        pool: &SqlitePool,
+        uuid: &str,
+        fingerprint: i64,
+        path: &str,
+        duration_ms: i64,
+        trim_in_ms: i64,
+        trim_out_ms: i64,
+    ) {
+        insert_processing(pool, uuid, fingerprint, None, path, uuid)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE media_assets SET status = 'ready', mezzanine_ok = 1, current_path = ?1,
+             duration_ms = ?2, trim_in_ms = ?3, trim_out_ms = ?4 WHERE uuid = ?5",
+        )
+        .bind(path)
+        .bind(duration_ms)
+        .bind(trim_in_ms)
+        .bind(trim_out_ms)
+        .bind(uuid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn a_trim_window_identifies_a_subclip() {
+        // Full length, two spellings: trim_out unset (legacy rows) and
+        // trim_out == duration (what mark_ready writes).
+        assert!(!is_subclip_row(0, 0, 10_000));
+        assert!(!is_subclip_row(0, 10_000, 10_000));
+        // Cuts.
+        assert!(is_subclip_row(500, 10_000, 10_000));
+        assert!(is_subclip_row(0, 4_000, 10_000));
+        assert!(is_subclip_row(1_000, 4_000, 10_000));
+    }
+
+    #[tokio::test]
+    async fn re_ingesting_a_parent_does_not_delete_its_subclips() {
+        let (pool, dir) = setup_test_pool().await;
+        let parent_file = dir.join("parent.mp4");
+
+        // The parent's mezzanine has gone missing -- the case that sends the
+        // processor down the purge path in the first place.
+        let fp = 777_001;
+        ready_row(
+            &pool,
+            "parent",
+            fp,
+            &parent_file.to_string_lossy(),
+            60_000,
+            0,
+            60_000,
+        )
+        .await;
+        // Subclips carry the PARENT's fingerprint. That is what made the old
+        // blanket DELETE destroy them.
+        ready_row(&pool, "clip-a", fp, "D:/target/clip-a.mp4", 60_000, 1_000, 5_000).await;
+        ready_row(&pool, "clip-b", fp, "D:/target/clip-b.mp4", 60_000, 0, 9_000).await;
+        // And a genuinely dead leftover, which should go.
+        insert_processing(&pool, "dead", fp, None, "D:/watch/x.mxf", "dead")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media_assets SET status = 'error' WHERE uuid = 'dead'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = purge_unusable_rows_by_fingerprint(&pool, fp, |p| {
+            std::path::Path::new(p).exists()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.deleted, 1, "only the failed-ingest row is deleted");
+        assert_eq!(
+            outcome.demoted, 1,
+            "the parent was ready but its file is gone -- demote, do not delete"
+        );
+        assert_eq!(outcome.protected, 2, "both subclips survive");
+
+        let survivors: Vec<(String, String)> =
+            sqlx::query_as("SELECT uuid, status FROM media_assets ORDER BY uuid")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<&str> = survivors.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(names, vec!["clip-a", "clip-b", "parent"]);
+
+        // The parent kept its row -- and therefore its rating, virtual folder
+        // and compliance metadata -- it just is not ready any more.
+        let parent_status = &survivors.iter().find(|(u, _)| u == "parent").unwrap().1;
+        assert_eq!(parent_status, "error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_ready_asset_whose_file_still_exists_is_never_purged() {
+        let (pool, dir) = setup_test_pool().await;
+        let file = dir.join("live.mp4");
+        std::fs::File::create(&file).unwrap();
+
+        let fp = 777_002;
+        ready_row(&pool, "live", fp, &file.to_string_lossy(), 1_000, 0, 1_000).await;
+
+        let outcome = purge_unusable_rows_by_fingerprint(&pool, fp, |p| {
+            std::path::Path::new(p).exists()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, FingerprintPurge { deleted: 0, demoted: 0, protected: 1 });
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_source_hash_round_trips_and_is_null_for_legacy_rows() {
+        let (pool, dir) = setup_test_pool().await;
+
+        insert_processing(&pool, "hashed", 1, Some("deadbeef"), "D:/w/a.mxf", "A")
+            .await
+            .unwrap();
+        insert_processing(&pool, "legacy", 2, None, "D:/w/b.mxf", "B")
+            .await
+            .unwrap();
+
+        let a = find_by_fingerprint(&pool, 1).await.unwrap().unwrap();
+        let b = find_by_fingerprint(&pool, 2).await.unwrap().unwrap();
+        assert_eq!(a.source_sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            b.source_sha256, None,
+            "a row with no stored hash must read back as None, which is what \
+             makes dedup refuse to confirm rather than guess"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
 
 
@@ -3192,4 +3718,6 @@ mod rating_tests {
         assert!(!is_valid_rating("K|line\nbreak"));
         assert!(!is_valid_rating("NOT-A-RATING"));
     }
+
+
 }

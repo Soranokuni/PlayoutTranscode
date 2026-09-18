@@ -447,6 +447,7 @@ pub fn process_file_sync(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
 ) {
     process_file_sync_with_runner(
         queue,
@@ -456,6 +457,7 @@ pub fn process_file_sync(
         config,
         pool,
         active_pids,
+        existing_job,
         &RealTranscodeRunner,
     );
 }
@@ -468,6 +470,7 @@ pub fn process_file_sync_with_runner(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
 ) {
     process_file_sync_with_runner_and_measurer(
@@ -478,6 +481,7 @@ pub fn process_file_sync_with_runner(
         config,
         pool,
         active_pids,
+        existing_job,
         runner,
         &probe::RealLoudnessMeasurer,
     );
@@ -491,6 +495,7 @@ pub fn process_file_sync_with_runner_and_measurer(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
@@ -503,6 +508,7 @@ pub fn process_file_sync_with_runner_and_measurer(
             config,
             pool,
             active_pids,
+            existing_job.clone(),
             runner,
             measurer,
         );
@@ -532,6 +538,207 @@ pub fn process_file_sync_with_runner_and_measurer(
     }
 }
 
+/// The floor for the disk preflight, whatever the job's own estimate says.
+///
+/// Even a thirty-second ident needs room for the staged file, the sidecar and
+/// FFmpeg's own scratch, and a volume this close to full is about to cause
+/// other problems anyway.
+pub const MIN_FREE_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Headroom over the arithmetic estimate: VBR overshoot, container overhead and
+/// whatever else lands on the volume while the encode runs.
+const DISK_ESTIMATE_MARGIN: f64 = 1.2;
+
+/// Slack for the sidecar, FFmpeg's temp files and filesystem rounding.
+const DISK_FIXED_SLACK: u64 = 64 * 1024 * 1024;
+
+/// Parse an FFmpeg rate string — `15M`, `320k`, `4500000` — into bits/second.
+///
+/// Returns `None` for anything it does not understand, which the caller treats
+/// as "fall back to the floor" rather than as an error: refusing to encode
+/// because a bitrate string was unfamiliar would be worse than a preflight that
+/// is occasionally too optimistic.
+pub fn parse_ffmpeg_rate_bps(rate: &str) -> Option<u64> {
+    let t = rate.trim();
+    if t.is_empty() {
+        return None;
+    }
+    let (digits, multiplier) = match t.chars().last() {
+        Some('k') | Some('K') => (&t[..t.len() - 1], 1_000u64),
+        Some('m') | Some('M') => (&t[..t.len() - 1], 1_000_000u64),
+        Some('g') | Some('G') => (&t[..t.len() - 1], 1_000_000_000u64),
+        _ => (t, 1u64),
+    };
+    digits.trim().parse::<f64>().ok().and_then(|n| {
+        if n < 0.0 || !n.is_finite() {
+            None
+        } else {
+            Some((n * multiplier as f64) as u64)
+        }
+    })
+}
+
+/// How much free space this particular job needs.
+///
+/// The preflight used to be a flat 500 MB for every job (F-22), so a two-hour
+/// feature at 15 Mbit/s — about 13 GB — passed a check made against 500 MB,
+/// encoded for an hour and then died on `No space left on device` with the
+/// staged file abandoned. Sizing it from the job means the failure happens in
+/// the first second instead, and says what it actually needs.
+pub fn required_bytes_for(duration_secs: f64, video_rate: &str, audio_rate: &str) -> u64 {
+    let video_bps = parse_ffmpeg_rate_bps(video_rate).unwrap_or(0);
+    let audio_bps = parse_ffmpeg_rate_bps(audio_rate).unwrap_or(0);
+    let total_bps = video_bps.saturating_add(audio_bps);
+
+    if duration_secs <= 0.0 || total_bps == 0 {
+        // An unprobeable duration or an unparseable rate. The floor is the only
+        // honest answer; guessing high would refuse work that would have run.
+        return MIN_FREE_BYTES;
+    }
+
+    let bytes = (duration_secs * total_bps as f64 / 8.0) * DISK_ESTIMATE_MARGIN;
+    let estimate = if bytes.is_finite() && bytes >= 0.0 {
+        bytes as u64
+    } else {
+        0
+    };
+    estimate
+        .saturating_add(DISK_FIXED_SLACK)
+        .max(MIN_FREE_BYTES)
+}
+
+/// Where a mezzanine goes when the registry will not accept it (T2-8).
+///
+/// Not a temp directory and not the bin: an operator has to be able to find it
+/// and decide. The name is preserved so it is obvious what the file was.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
+/// Retry a fallible blocking operation with a fixed backoff.
+///
+/// `op` receives the 1-based attempt number. Returns the first success, or the
+/// last error once `attempts` have been spent.
+fn retry_blocking<T, E: std::fmt::Display>(
+    attempts: u32,
+    backoff: std::time::Duration,
+    what: &str,
+    mut op: impl FnMut(u32) -> Result<T, E>,
+) -> Result<T, E> {
+    let attempts = attempts.max(1);
+    let mut last: Option<E> = None;
+    for attempt in 1..=attempts {
+        match op(attempt) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < attempts {
+                    tracing::warn!(
+                        "{} failed on attempt {}/{}: {} -- retrying in {}ms",
+                        what,
+                        attempt,
+                        attempts,
+                        e,
+                        backoff.as_millis()
+                    );
+                    std::thread::sleep(backoff);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    // `attempts >= 1`, so the loop ran and `last` is populated on this path.
+    Err(last.expect("retry_blocking ran at least one attempt"))
+}
+
+/// Move a published mezzanine out of the library into `<target>/quarantine/`.
+///
+/// Called when the file encoded fine but the registry would not record it. It
+/// must not stay in `videos/`: nothing references it, the next ingest of the
+/// same source would collide with it, and a listing built from the filesystem
+/// rather than the registry would show an asset PlayOut cannot resolve.
+///
+/// Returns where the file ended up. A name collision in `quarantine/` is
+/// resolved by suffixing, because a repeated failure must not overwrite the
+/// evidence from the first one.
+fn quarantine_published(
+    target_root: &Path,
+    published: &Path,
+) -> Result<std::path::PathBuf, String> {
+    let dir = target_root.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create the quarantine directory: {}", e))?;
+
+    let file_name = published
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".to_string());
+
+    let mut dest: std::path::PathBuf = dir.join(&file_name);
+    if dest.exists() {
+        let stem = published
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unnamed".into());
+        let ext = published
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        for n in 1..1000 {
+            let candidate = dir.join(format!("{}.{}{}", stem, n, ext));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
+            }
+        }
+    }
+
+    // Same volume, so a rename is atomic and cheap. Fall back to copy+delete
+    // only if it is not (a target folder spanning volumes is unsupported, but
+    // losing the file over it would be worse than a slow move).
+    match std::fs::rename(published, &dest) {
+        Ok(()) => Ok(dest),
+        Err(_) => {
+            std::fs::copy(published, &dest)
+                .map_err(|e| format!("cannot move the file to quarantine: {}", e))?;
+            let _ = std::fs::remove_file(published);
+            Ok(dest)
+        }
+    }
+}
+
+/// Is a sampled-fingerprint match a *real* duplicate?
+///
+/// The sampled fingerprint is a prefilter, never a verdict — see
+/// [`crate::fingerprint`]. Only two full SHA-256 hashes that agree confirm a
+/// duplicate; every other combination means "cannot confirm", and the file is
+/// ingested.
+///
+/// Failing towards a redundant encode is the cheap mistake. Failing the other
+/// way silently drops a programme, and nothing downstream can tell that it
+/// happened (F-15).
+fn is_confirmed_duplicate(
+    stored_hash: Option<&str>,
+    our_hash: Option<&str>,
+    existing_uuid: &str,
+) -> bool {
+    match (stored_hash, our_hash) {
+        (Some(stored), Some(ours)) => stored == ours,
+        // The existing row predates `source_sha256` (T2-6), so there is nothing
+        // to compare against. Falling back to the sampled match would reinstate
+        // F-15 for exactly the rows most likely to have been hit by it. The
+        // cost of re-ingesting is one redundant encode per legacy asset, once.
+        (None, _) => {
+            tracing::info!(
+                "Dedup: asset {} matched on the sampled fingerprint but predates \
+                 source_sha256; cannot confirm, re-transcoding",
+                existing_uuid
+            );
+            false
+        }
+        // Our own hash could not be computed — an unreadable or vanishing
+        // source. Same reasoning.
+        (_, None) => false,
+    }
+}
+
 fn process_file_inner(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -540,18 +747,103 @@ fn process_file_inner(
     config: &config::AppConfig,
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
+    // Every early return below happens before the main job record is created.
+    //
+    // T2-4 made them close out an *adopted* record, or it stayed Pending
+    // forever (F-13). But on a fresh ingest -- the watcher offering a file for
+    // the first time -- there was no record to close, so a file rejected at the
+    // watch-folder boundary, or skipped as a duplicate, simply vanished: no job,
+    // no event, nothing in /api/jobs, and an operator watching a folder saw
+    // their file disappear with no explanation (F-26). Now every early return
+    // leaves a visible terminal record, adopted or created.
+    let terminate_early = |phase: jobs::JobPhase,
+                           category: Option<&str>,
+                           message: &str,
+                           asset_uuid: Option<&str>| {
+        let msg = message.to_string();
+        let cat = category.map(|c| c.to_string());
+        let stage = phase.as_str().to_string();
+        let apply = move |job: &mut jobs::JobRecord| {
+            job.error = Some(msg);
+            job.error_category = cat;
+            job.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        };
+
+        let id = match existing_job.as_ref() {
+            Some(prior) => {
+                let _ = queue.transition(&prior.id, phase, Some(stage), apply);
+                prior.id.clone()
+            }
+            None => {
+                let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
+                if let Some(u) = asset_uuid {
+                    // A skip points at the asset that already holds this
+                    // content, so the UI can link straight to it.
+                    job.uuid = Some(u.to_string());
+                }
+                let id = job.id.clone();
+                let _ = job.transition_to(phase, Some(stage));
+                apply(&mut job);
+                queue.push(job);
+                id
+            }
+        };
+
+        // `skipped` is a new event type. Clients that do not know it must treat
+        // an unknown SSE event as a no-op -- PlayOut and the web UI both do.
+        let event = if phase == jobs::JobPhase::Skipped {
+            "skipped"
+        } else {
+            "failed"
+        };
+        queue.broadcast(
+            event,
+            &serde_json::json!({
+                "id": id,
+                "error": message,
+                "error_category": category,
+                "uuid": asset_uuid,
+            })
+            .to_string(),
+        );
+    };
+
+    let close_job = |category: &str, message: &str| {
+        terminate_early(jobs::JobPhase::Failed, Some(category), message, None);
+    };
+    let skip_job = |asset_uuid: &str, message: &str| {
+        terminate_early(jobs::JobPhase::Skipped, None, message, Some(asset_uuid));
+    };
+
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
-    let canonical_input = input_path
-        .canonicalize()
-        .unwrap_or_else(|_| input_path.to_path_buf());
-    let canonical_watch = watch_root
-        .canonicalize()
-        .unwrap_or_else(|_| watch_root.to_path_buf());
+    // Both sides must end up spelled the same way or the containment check is
+    // meaningless.
+    //
+    // The previous version canonicalized each side and fell back to the raw
+    // path on failure. That is not enough: a file deleted between the watcher
+    // offering it and this worker picking it up cannot be canonicalized, so its
+    // side kept whatever spelling the watcher produced while the watch root was
+    // resolved to its true form. Wherever those differ the comparison fails and
+    // a missing file is reported as a path-traversal attempt.
+    //
+    // They differ more often than it looks. Windows hands out 8.3 short names
+    // (`C:\Users\RUNNER~1\...` for `C:\Users\runneradmin\...`) through the
+    // environment, and junctions and mapped drives resolve elsewhere again. CI
+    // on a GitHub Windows runner is exactly that case, which is how this was
+    // caught.
+    //
+    // `canonicalize_existing_prefix` resolves the deepest ancestor that exists
+    // -- normally the watch folder itself -- and re-joins the rest, so both
+    // sides are canonical even when the file is gone.
+    let canonical_input = crate::paths::canonicalize_existing_prefix(input_path);
+    let canonical_watch = crate::paths::canonicalize_existing_prefix(watch_root);
     if !canonical_input.starts_with(&canonical_watch) {
         tracing::warn!("Rejected path traversal attempt: {}", input_path.display());
+        close_job("path_outside_watch_folder", "Input is outside the watch folder");
         return;
     }
 
@@ -565,38 +857,111 @@ fn process_file_inner(
 
     let handle = tokio::runtime::Handle::current();
 
-    let fingerprint = match fingerprint::compute_fnv1a64(input_path) {
+    let fingerprint = match fingerprint::compute_sampled_fingerprint(input_path) {
         Ok(fp) => fp,
         Err(e) => {
             tracing::error!("Fingerprint failed for {}: {}", input_path.display(), e);
+            close_job("fingerprint_failure", "Could not read the source file");
             return;
         }
     };
 
+    // The full hash, computed lazily: only when the cheap sampled hash has
+    // already matched something. For a library of distinct media that is
+    // approximately never, so the common path still reads 192 KiB, not 40 GB.
+    let mut source_sha256: Option<String> = None;
+    let mut full_hash_of_source = || -> Option<String> {
+        if source_sha256.is_none() {
+            match fingerprint::compute_full_sha256(input_path) {
+                Ok(h) => source_sha256 = Some(h),
+                Err(e) => {
+                    tracing::warn!(
+                        "Full hash failed for {}: {} -- treating as not-a-duplicate",
+                        input_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        source_sha256.clone()
+    };
+
     if let Ok(Some(existing)) = handle.block_on(db::find_by_fingerprint(pool, fingerprint)) {
-        if existing.status == "ready"
+        let usable = existing.status == "ready"
             && existing.mezzanine_ok
             && !existing.current_path.is_empty()
-            && std::path::Path::new(&existing.current_path).exists()
-        {
+            && std::path::Path::new(&existing.current_path).exists();
+
+        // A sampled-hash match is a *candidate*, never a verdict. Two distinct
+        // programmes cut from the same master share size, leader and tail, and
+        // the old code dropped the second one on that evidence alone (F-15).
+        let confirmed = usable
+            && is_confirmed_duplicate(
+                existing.source_sha256.as_deref(),
+                full_hash_of_source().as_deref(),
+                &existing.uuid,
+            );
+
+        if confirmed {
             tracing::info!(
-                "Dedup: asset {} already ready with valid mezzanine at {} (fingerprint={}), skipping transcode",
+                "Dedup: asset {} is byte-identical (sha256 confirmed) and already ready at {}, skipping transcode",
                 existing.uuid,
                 existing.current_path,
-                fingerprint,
+            );
+            // A confirmed duplicate is not a failure -- nothing went wrong and
+            // no work was needed. T2-6 gave the phase machine a terminal
+            // `Skipped` for it, which maps to the v1 `Completed` state so the
+            // wire contract is unchanged (T2-4 had to report this as `Failed`
+            // for want of anywhere else to put it).
+            skip_job(
+                &existing.uuid,
+                "Skipped: an identical asset is already ingested",
             );
             return;
         }
 
-        tracing::info!(
-            "Dedup: fingerprint {} matched but existing asset not usable (status={}, mezzanine_ok={}, path_exists={}), re-transcoding",
-            fingerprint,
-            existing.status,
-            existing.mezzanine_ok,
-            std::path::Path::new(&existing.current_path).exists(),
-        );
-        let _ = handle.block_on(db::purge_rows_by_fingerprint(pool, fingerprint));
+        if usable {
+            tracing::info!(
+                "Dedup: fingerprint {} matched asset {} but the full hashes differ -- \
+                 these are different files, ingesting both",
+                fingerprint,
+                existing.uuid,
+            );
+        } else {
+            tracing::info!(
+                "Dedup: fingerprint {} matched but existing asset not usable (status={}, mezzanine_ok={}, path_exists={}), re-transcoding",
+                fingerprint,
+                existing.status,
+                existing.mezzanine_ok,
+                std::path::Path::new(&existing.current_path).exists(),
+            );
+            // Only clears out the leftovers of a failed ingest. Subclips and
+            // live `ready` rows are protected -- deleting every row sharing the
+            // fingerprint destroyed operator-cut subclips (F-26).
+            match handle.block_on(db::purge_unusable_rows_by_fingerprint(
+                pool,
+                fingerprint,
+                |p| std::path::Path::new(p).exists(),
+            )) {
+                Ok(outcome) => {
+                    if outcome.demoted > 0 || outcome.protected > 0 {
+                        tracing::info!(
+                            "Re-ingest cleanup for fingerprint {}: {} deleted, {} demoted to error, {} protected (subclips / live assets)",
+                            fingerprint,
+                            outcome.deleted,
+                            outcome.demoted,
+                            outcome.protected,
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("Re-ingest cleanup failed: {}", e),
+            }
+        }
     }
+
+    // Computed here if the dedup path never needed it, so every new row
+    // carries one and the next ingest has something to confirm against.
+    let source_sha256 = full_hash_of_source();
 
     let metadata_uuid = Uuid::new_v4().to_string();
     let video_dir = target_root.join("videos");
@@ -617,21 +982,59 @@ fn process_file_inner(
         pool,
         &metadata_uuid,
         fingerprint,
+        source_sha256.as_deref(),
         &input_path.to_string_lossy(),
         &raw_stem,
     )) {
+        // This used to log and carry on, which is F-18 at its worst: the encode
+        // ran to completion, wrote a mezzanine into the library, and then
+        // `mark_ready` updated a row that had never been inserted -- zero rows
+        // affected, `Ok(())`. The result was a published file no registry knew
+        // about, and therefore an hour of CPU spent on an asset PlayOut could
+        // never see. Fail here instead, before any of that work happens.
         tracing::error!(
-            "DB insert processing failed for {}: {}",
+            "DB insert processing failed for {}: {} -- refusing to transcode a file \
+             the registry has no row for",
             input_path.display(),
             e
         );
+        publisher.cleanup_staging(&staged_output_path);
+        close_job(
+            "db_insert_failed",
+            "Could not create the registry entry for this file",
+        );
+        return;
     }
 
-    let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
-    job.uuid = Some(metadata_uuid.clone());
-    job.fingerprint = Some(fingerprint);
-    let _ = job.transition_to(jobs::JobPhase::Probing, Some("Probing".to_string()));
-    queue.push(job.clone());
+    // Reuse the adopted record where there is one. Creating a fresh JobRecord
+    // for a retry is what left the old one behind as a permanent ghost (F-13);
+    // the id, created_at and attempt count all carry over.
+    let job = match existing_job.as_ref() {
+        Some(prior) => {
+            let uuid = metadata_uuid.clone();
+            let _ = queue.transition(
+                &prior.id,
+                jobs::JobPhase::Probing,
+                Some("Probing".to_string()),
+                |j| {
+                    j.uuid = Some(uuid);
+                    j.fingerprint = Some(fingerprint);
+                    j.error = None;
+                    j.error_category = None;
+                    j.finished_at = None;
+                },
+            );
+            queue.get(&prior.id).unwrap_or_else(|| prior.clone())
+        }
+        None => {
+            let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
+            job.uuid = Some(metadata_uuid.clone());
+            job.fingerprint = Some(fingerprint);
+            let _ = job.transition_to(jobs::JobPhase::Probing, Some("Probing".to_string()));
+            queue.push(job.clone());
+            job
+        }
+    };
     queue.broadcast(
         "job_update",
         &serde_json::json!({"id": job.id, "stage": "Probing", "phase": "probing"}).to_string(),
@@ -739,9 +1142,15 @@ fn process_file_inner(
         },
     );
 
-    // Preflight disk space check on target directory (require at least 500MB)
-    let min_free_space_bytes: u64 = 500 * 1024 * 1024;
-    if let Err(e) = check_disk_space(Path::new(&config.paths.target_folder), min_free_space_bytes) {
+    // Sized from this job, not a flat 500 MB (T2-9). `profile` is the encoding
+    // profile chosen from the source probe a few lines above, so its maxrate is
+    // the rate this encode will actually be capped at.
+    let required_bytes = required_bytes_for(
+        probe_data.duration_secs,
+        &profile.config_for(config).maxrate,
+        &config.encoding.audio_bitrate,
+    );
+    if let Err(e) = check_disk_space(Path::new(&config.paths.target_folder), required_bytes) {
         tracing::error!("Disk preflight failed for {}: {}", input_path.display(), e);
         let _ = queue.transition(
             &job.id,
@@ -794,7 +1203,12 @@ fn process_file_inner(
             const THROTTLE_MS: u64 = 250;
             while let Ok(p) = prx.recv() {
                 let pct = p.percent;
-                qc.update(&jid, |j| {
+                // In-memory only: FFmpeg emits a progress line every few
+                // frames and each one used to spawn its own upsert -- from
+                // this std thread, that meant a new OS thread and a new Tokio
+                // runtime per line (F-13). The row is written below, at the
+                // same 250 ms throttle as the SSE broadcast.
+                qc.update_local(&jid, |j| {
                     j.progress = pct;
                     j.current_frame = p.frame;
                     j.encode_fps = p.fps;
@@ -813,6 +1227,7 @@ fn process_file_inner(
                     || pct >= 100.0
                 {
                     last_broadcast = now;
+                    qc.persist_now(&jid);
                     let determinate = p.duration_ms > 0 || p.total_frames > 0;
                     let _ = qc.broadcast(
                         "progress",
@@ -1000,6 +1415,7 @@ fn process_file_inner(
                 faststart_ok,
                 measured_loudness.as_ref(),
                 &audio_policy,
+                &config.effective_validation_policy(),
             );
 
             let mezzanine_ok = qc_report.passed;
@@ -1022,8 +1438,89 @@ fn process_file_inner(
                 },
             );
 
+            // Everything after a successful `publish` that can still fail has
+            // the same remedy: get the orphaned mezzanine out of the library,
+            // drop its sidecar, mark the row `error` and fail the job visibly
+            // (T2-8). Leaving it in `videos/` is the silent loss F-18 is about.
+            let fail_after_publish = |category: &str, message: &str| {
+                match quarantine_published(target_root, &final_output_path) {
+                    Ok(dest) => tracing::error!(
+                        "Quarantined {} -> {} ({})",
+                        final_output_path.display(),
+                        dest.display(),
+                        category
+                    ),
+                    Err(e) => tracing::error!(
+                        "Could not quarantine {}: {} -- it is still in the library and \
+                         nothing references it",
+                        final_output_path.display(),
+                        e
+                    ),
+                }
+                let sidecar = identity::sidecar_path_for(&final_output_path);
+                if sidecar.exists() {
+                    if let Err(e) = std::fs::remove_file(&sidecar) {
+                        tracing::warn!("Could not remove {}: {}", sidecar.display(), e);
+                    }
+                }
+                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                let msg = message.to_string();
+                let cat = category.to_string();
+                let _ = queue.transition(
+                    &job.id,
+                    jobs::JobPhase::Failed,
+                    Some("Failed".into()),
+                    |j| {
+                        j.error = Some(msg);
+                        j.error_category = Some(cat);
+                    },
+                );
+                queue.broadcast(
+                    "failed",
+                    &serde_json::json!({
+                        "id": job.id,
+                        "uuid": metadata_uuid,
+                        "error": message,
+                        "error_category": category,
+                    })
+                    .to_string(),
+                );
+                queue.prune_old(500);
+            };
+
             let sha256 = compute_file_sha256(&staged_output_path).ok();
             let file_size_bytes = std::fs::metadata(&staged_output_path).ok().map(|m| m.len());
+
+            // Checked again here (T2-9). The publish itself is a same-volume
+            // rename and needs nothing, but the sidecar write does, and a
+            // concurrent job may have filled the volume during this encode.
+            // Failing now leaves a staged file to clean up; failing after a
+            // half-written sidecar leaves a `ready` asset PlayOut cannot use.
+            if let Err(e) = check_disk_space(target_root, DISK_FIXED_SLACK) {
+                tracing::error!(
+                    "Disk space ran out during the encode of {}: {}",
+                    input_path.display(),
+                    e
+                );
+                let _ = queue.transition(
+                    &job.id,
+                    jobs::JobPhase::Failed,
+                    Some("Failed".into()),
+                    |j| {
+                        j.error = Some(e.clone());
+                        j.error_category = Some("io_disk_full".into());
+                    },
+                );
+                queue.broadcast(
+                    "failed",
+                    &serde_json::json!({"id": job.id, "error": e, "error_category": "io_disk_full"})
+                        .to_string(),
+                );
+                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                publisher.cleanup_staging(&staged_output_path);
+                queue.prune_old(500);
+                return;
+            }
 
             if let Err(e) = publisher.publish(&staged_output_path, &final_output_path) {
                 tracing::error!("Atomic publish failed for {}: {}", input_path.display(), e);
@@ -1097,31 +1594,69 @@ fn process_file_inner(
                 sha256,
                 file_size_bytes,
             ) {
+                // Used to log and continue to `mark_ready`, which published a
+                // `ready` asset with no sidecar -- and the sidecar is the
+                // contract PlayOut hydrates from, so the asset was broken in a
+                // way only PlayOut would discover (F-18). Quarantine it.
                 tracing::error!(
                     "Failed to write metadata sidecar for '{}': {}",
                     final_output_path.display(),
                     e
                 );
+                fail_after_publish(
+                    "sidecar_write_failed",
+                    "The mezzanine encoded but its sidecar could not be written",
+                );
+                return;
             }
 
             let keyframe_offsets_json =
                 serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
 
-            let _ = handle.block_on(db::mark_ready(
-                pool,
-                &metadata_uuid,
-                &final_output_path.to_string_lossy(),
-                duration_ms,
-                mezzanine_ok,
-                fps,
-                output_probe.fps_num,
-                output_probe.fps_den,
-                total_frames,
-                gop_frames,
-                keyframe_safe_start_ms,
-                &warnings_list,
-                &keyframe_offsets_json,
-            ));
+            // Retried, because this is the last write of a job that may have
+            // cost an hour of CPU and a transient `database is locked` must not
+            // throw it away.
+            let ready = retry_blocking(
+                3,
+                std::time::Duration::from_millis(500),
+                "mark_ready",
+                |_| {
+                    handle.block_on(db::mark_ready(
+                        pool,
+                        &metadata_uuid,
+                        &final_output_path.to_string_lossy(),
+                        duration_ms,
+                        mezzanine_ok,
+                        fps,
+                        output_probe.fps_num,
+                        output_probe.fps_den,
+                        total_frames,
+                        gop_frames,
+                        keyframe_safe_start_ms,
+                        &warnings_list,
+                        &keyframe_offsets_json,
+                    ))
+                },
+            );
+
+            if let Err(e) = ready {
+                // The file is encoded, validated and published, and the
+                // registry will not record it. `let _ =` here left exactly that
+                // on disk: a mezzanine in `videos/` that nothing references,
+                // which the next ingest of the same source would collide with.
+                tracing::error!(
+                    uuid = %metadata_uuid,
+                    path = %final_output_path.display(),
+                    "mark_ready failed after 3 attempts: {} -- quarantining the mezzanine",
+                    e
+                );
+                fail_after_publish(
+                    "db_mark_ready_failed",
+                    "The mezzanine encoded but the registry could not record it",
+                );
+                return;
+            }
+
             let _ = queue.transition(
                 &job.id,
                 jobs::JobPhase::Completed,
@@ -1407,6 +1942,19 @@ fn probe_with_retry(
     }
 }
 
+/// Evaluate the encoded mezzanine against the operator's validation policy
+/// (T3-3, F-29).
+///
+/// `validation_policy.*` used to be pure decoration: `GET /api/config` served
+/// the knobs, the UI rendered them, `PUT /api/config` stored them, and nothing
+/// ever read them. Every check here was unconditionally blocking. An operator
+/// who turned off `enforce_faststart` because their downstream did not care
+/// still had every such asset marked `mezzanine_ok = false`.
+///
+/// Each `enforce_*` now chooses **severity**, not whether the check runs: the
+/// finding is always recorded, so the sidecar and the DB viewer still say what
+/// was observed. Turning one off downgrades it from blocking to a warning; it
+/// never hides it.
 pub fn run_qc_evaluation(
     output_probe: &probe::ProbeData,
     source_probe: &probe::ProbeData,
@@ -1414,10 +1962,34 @@ pub fn run_qc_evaluation(
     faststart_ok: bool,
     measured_loudness: Option<&probe::MeasuredLoudness>,
     _audio_policy: &config::AudioPolicy,
+    policy: &config::ValidationPolicy,
 ) -> identity::QcReport {
     let mut findings = Vec::new();
     let mut blocking_errors = 0;
     let mut warnings_count = 0;
+
+    // Records a finding at error severity when the operator enforces this rule,
+    // and at warning severity when they do not.
+    let push = |enforced: bool,
+                    code: &str,
+                    message: &str,
+                    observed: Option<String>,
+                    expected: Option<String>,
+                    findings: &mut Vec<identity::ValidationFinding>,
+                    blocking: &mut usize,
+                    warnings: &mut usize| {
+        if enforced {
+            findings.push(identity::ValidationFinding::error(
+                code, message, observed, expected,
+            ));
+            *blocking += 1;
+        } else {
+            findings.push(identity::ValidationFinding::warning(
+                code, message, observed, expected,
+            ));
+            *warnings += 1;
+        }
+    };
 
     // 1. Duration check
     let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
@@ -1460,35 +2032,44 @@ pub fn run_qc_evaluation(
 
     // 3. Audio sample rate check
     if output_probe.audio_sample_rate != 48000 {
-        findings.push(identity::ValidationFinding::error(
+        push(
+            policy.enforce_48k_audio,
             "audio_sample_rate_not_48k",
             "Output audio sample rate must be exactly 48000 Hz",
             Some(format!("{} Hz", output_probe.audio_sample_rate)),
             Some("48000 Hz".to_string()),
-        ));
-        blocking_errors += 1;
+            &mut findings,
+            &mut blocking_errors,
+            &mut warnings_count,
+        );
     }
 
     // 4. Closed GOP check
     if !closed_gop_ok {
-        findings.push(identity::ValidationFinding::error(
+        push(
+            policy.enforce_closed_gop,
             "closed_gop_violation",
             "Keyframe structure does not satisfy closed GOP cadence requirements",
             Some("irregular GOP detected".to_string()),
             Some("strict closed GOP with 2s interval".to_string()),
-        ));
-        blocking_errors += 1;
+            &mut findings,
+            &mut blocking_errors,
+            &mut warnings_count,
+        );
     }
 
     // 5. Faststart check
     if !faststart_ok {
-        findings.push(identity::ValidationFinding::error(
+        push(
+            policy.enforce_faststart,
             "missing_faststart",
             "MP4 moov atom is not at the beginning of the file (faststart missing)",
             Some("moov atom not in first 64KB".to_string()),
             Some("+faststart enabled".to_string()),
-        ));
-        blocking_errors += 1;
+            &mut findings,
+            &mut blocking_errors,
+            &mut warnings_count,
+        );
     }
 
     // 6. Audio loudness checks
@@ -1512,7 +2093,38 @@ pub fn run_qc_evaluation(
         }
     }
 
-    let passed = blocking_errors == 0;
+    // 7. Duration drift against the source.
+    //
+    // There was no such check at all before T3-3, despite
+    // `max_duration_delta_ms` being an advertised, validated, UI-rendered knob.
+    // A mezzanine silently a second short of its source is exactly the failure
+    // an as-run log catches at transmission and nobody catches before it.
+    let source_ms = (source_probe.duration_secs * 1000.0).round() as i64;
+    if source_ms > 0 && duration_ms > 0 {
+        let delta = (duration_ms - source_ms).abs();
+        if delta > policy.max_duration_delta_ms {
+            push(
+                true,
+                "duration_delta_exceeded",
+                "Output duration differs from the source by more than the configured tolerance",
+                Some(format!("{} ms drift", delta)),
+                Some(format!("<= {} ms", policy.max_duration_delta_ms)),
+                &mut findings,
+                &mut blocking_errors,
+                &mut warnings_count,
+            );
+        }
+    }
+
+    // `strict_ready_blocking` promotes warnings to blocking. For a station that
+    // will not air anything with an open question against it, "passed with
+    // warnings" is not a state they want in the library.
+    let passed = if policy.strict_ready_blocking {
+        blocking_errors == 0 && warnings_count == 0
+    } else {
+        blocking_errors == 0
+    };
+
     identity::QcReport {
         passed,
         blocking_errors,
@@ -1919,6 +2531,559 @@ mod tests {
         assert_eq!(max_att, 1);
     }
 
+    /// A queue, pool and watch/target tree for driving `process_file_sync`.
+    async fn adoption_fixture(
+        tag: &str,
+    ) -> (
+        jobs::JobQueue,
+        SqlitePool,
+        config::AppConfig,
+        std::path::PathBuf,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "pt-adopt-{}-{}-{}",
+            std::process::id(),
+            tag,
+            Uuid::new_v4()
+        ));
+        let watch = root.join("watch");
+        let target = root.join("target");
+        std::fs::create_dir_all(&watch).expect("watch dir");
+        std::fs::create_dir_all(&target).expect("target dir");
+
+        let pool = crate::db::init_pool(&root.join("jobs.db"))
+            .await
+            .expect("init pool");
+        let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let queue = jobs::JobQueue::new(event_tx, None);
+
+        let mut cfg = config::AppConfig::default();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = target.to_string_lossy().to_string();
+
+        (queue, pool, cfg, root)
+    }
+
+    /// A job in the state a manual retry leaves behind: re-queued and pending.
+    fn requeued_job(input: &std::path::Path) -> jobs::JobRecord {
+        let mut job = jobs::JobRecord::new(&input.to_string_lossy(), "pending");
+        job.transition_to(jobs::JobPhase::Probing, None).unwrap();
+        job.transition_to(jobs::JobPhase::Failed, Some("Failed".into()))
+            .unwrap();
+        job.transition_to(jobs::JobPhase::Queued, Some("Re-queued (manual retry)".into()))
+            .unwrap();
+        job.attempt = 2;
+        job
+    }
+
+    #[tokio::test]
+    async fn a_retry_whose_source_vanished_closes_its_own_job() {
+        // The ghost F-13 describes: the retry cannot run, and before T2-4
+        // nothing ever moved the re-queued record off Pending, so it sat in
+        // /api/jobs forever as outstanding work.
+        let (queue, pool, cfg, root) = adoption_fixture("gone").await;
+        let missing = std::path::Path::new(&cfg.paths.watch_folder).join("vanished.mov");
+
+        let job = requeued_job(&missing);
+        let id = job.id.clone();
+        queue.push(job.clone());
+
+        process_file_sync(
+            &queue,
+            &bootstrap::ToolPaths {
+                ffmpeg: std::path::PathBuf::new(),
+                ffprobe: std::path::PathBuf::new(),
+            },
+            std::path::Path::new(&cfg.paths.target_folder),
+            &missing,
+            &cfg,
+            &pool,
+            crate::service_handle::ActivePids::default(),
+            Some(job),
+        );
+
+        let all = queue.all();
+        assert_eq!(all.len(), 1, "a second, ghost job record was created");
+        let after = queue.get(&id).expect("the adopted job is still there");
+        assert_eq!(after.phase, jobs::JobPhase::Failed);
+        assert_eq!(after.state, jobs::JobState::Failed);
+        assert_eq!(after.error_category.as_deref(), Some("fingerprint_failure"));
+        assert_eq!(after.attempt, 2, "the attempt count was reset");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn an_input_outside_the_watch_folder_closes_an_adopted_job() {
+        let (queue, pool, cfg, root) = adoption_fixture("outside").await;
+        // Real file, but not under the watch folder: the traversal guard trips.
+        let outside = root.join("elsewhere.mov");
+        std::fs::write(&outside, b"not media").expect("write fixture");
+
+        let job = requeued_job(&outside);
+        let id = job.id.clone();
+        queue.push(job.clone());
+
+        process_file_sync(
+            &queue,
+            &bootstrap::ToolPaths {
+                ffmpeg: std::path::PathBuf::new(),
+                ffprobe: std::path::PathBuf::new(),
+            },
+            std::path::Path::new(&cfg.paths.target_folder),
+            &outside,
+            &cfg,
+            &pool,
+            crate::service_handle::ActivePids::default(),
+            Some(job),
+        );
+
+        let after = queue.get(&id).expect("job still present");
+        assert_eq!(after.phase, jobs::JobPhase::Failed);
+        assert_eq!(
+            after.error_category.as_deref(),
+            Some("path_outside_watch_folder")
+        );
+        assert_eq!(queue.all().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_ingest_that_fails_early_still_leaves_a_visible_job() {
+        // T2-4 asserted the opposite -- that a fresh ingest creating no record
+        // was correct. T2-6 changed that deliberately: a file the watcher
+        // offered and the service then rejected used to vanish with no job, no
+        // event and nothing in /api/jobs, so an operator saw their file
+        // disappear with no explanation (F-26).
+        let (queue, pool, cfg, root) = adoption_fixture("fresh").await;
+        let missing = std::path::Path::new(&cfg.paths.watch_folder).join("nope.mov");
+
+        process_file_sync(
+            &queue,
+            &bootstrap::ToolPaths {
+                ffmpeg: std::path::PathBuf::new(),
+                ffprobe: std::path::PathBuf::new(),
+            },
+            std::path::Path::new(&cfg.paths.target_folder),
+            &missing,
+            &cfg,
+            &pool,
+            crate::service_handle::ActivePids::default(),
+            None,
+        );
+
+        let all = queue.all();
+        assert_eq!(all.len(), 1, "the rejection must be visible as a job");
+        assert_eq!(all[0].phase, jobs::JobPhase::Failed);
+        assert_eq!(all[0].input_path, missing.to_string_lossy());
+        assert!(
+            all[0].error_category.is_some(),
+            "a visible failure must say why: {:?}",
+            all[0]
+        );
+        assert!(
+            all[0].finished_at.is_some(),
+            "a terminal job must carry a finish time"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- T3-3: the validation policy knobs actually do something (F-29) ----
+
+    fn probe_at(duration_secs: f64, sample_rate: i64) -> probe::ProbeData {
+        probe::ProbeData {
+            duration_secs,
+            frame_count: (duration_secs * 25.0) as i64,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: sample_rate,
+            audio_channels: 2,
+            fps_num: crate::profiles::TARGET_FPS_NUM,
+            fps_den: crate::profiles::TARGET_FPS_DEN,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "input.mp4".into(),
+        }
+    }
+
+    fn qc(
+        closed_gop_ok: bool,
+        faststart_ok: bool,
+        sample_rate: i64,
+        policy: &config::ValidationPolicy,
+    ) -> identity::QcReport {
+        let out = probe_at(10.0, sample_rate);
+        let src = probe_at(10.0, 48000);
+        run_qc_evaluation(
+            &out,
+            &src,
+            closed_gop_ok,
+            faststart_ok,
+            None,
+            &config::AudioPolicy::default(),
+            policy,
+        )
+    }
+
+    #[test]
+    fn with_the_default_policy_every_check_blocks() {
+        let p = config::ValidationPolicy::default();
+        assert!(!qc(false, true, 48000, &p).passed, "closed GOP");
+        assert!(!qc(true, false, 48000, &p).passed, "faststart");
+        assert!(!qc(true, true, 44100, &p).passed, "sample rate");
+        assert!(qc(true, true, 48000, &p).passed, "a clean encode passes");
+    }
+
+    #[test]
+    fn turning_off_enforcement_downgrades_the_finding_rather_than_hiding_it() {
+        // The distinction that matters: an operator whose downstream does not
+        // care about faststart should not have every asset marked unusable --
+        // but the observation must still reach the sidecar and the DB viewer,
+        // or nobody can answer "was this file actually faststart?" later.
+        let p = config::ValidationPolicy {
+            enforce_faststart: false,
+            ..Default::default()
+        };
+
+        let report = qc(true, false, 48000, &p);
+        assert!(report.passed, "must no longer block");
+        assert_eq!(report.blocking_errors, 0);
+        assert!(report.warnings_count >= 1, "but it must still be recorded");
+        assert!(
+            report.findings.iter().any(|f| f.code == "missing_faststart"),
+            "the finding must survive the downgrade: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn each_enforcement_flag_governs_only_its_own_check() {
+        let p = config::ValidationPolicy {
+            enforce_closed_gop: false,
+            ..Default::default()
+        };
+        // GOP is waived, faststart is not.
+        assert!(qc(false, true, 48000, &p).passed);
+        assert!(!qc(false, false, 48000, &p).passed);
+
+        let p = config::ValidationPolicy {
+            enforce_48k_audio: false,
+            ..Default::default()
+        };
+        assert!(qc(true, true, 44100, &p).passed);
+        assert!(!qc(false, true, 44100, &p).passed);
+    }
+
+    #[test]
+    fn duration_drift_beyond_the_tolerance_blocks() {
+        // There was no duration-delta check at all before T3-3, despite
+        // `max_duration_delta_ms` being advertised, validated and rendered in
+        // the UI. A mezzanine a second short of its source is the failure an
+        // as-run log catches at transmission and nothing catches before it.
+        let policy = config::ValidationPolicy::default(); // 80 ms
+        let src = probe_at(10.0, 48000);
+
+        let within = run_qc_evaluation(
+            &probe_at(10.05, 48000),
+            &src,
+            true,
+            true,
+            None,
+            &config::AudioPolicy::default(),
+            &policy,
+        );
+        assert!(within.passed, "50 ms of drift is inside the 80 ms tolerance");
+
+        let beyond = run_qc_evaluation(
+            &probe_at(11.0, 48000),
+            &src,
+            true,
+            true,
+            None,
+            &config::AudioPolicy::default(),
+            &policy,
+        );
+        assert!(!beyond.passed, "a full second of drift must block");
+        assert!(beyond
+            .findings
+            .iter()
+            .any(|f| f.code == "duration_delta_exceeded"));
+    }
+
+    #[test]
+    fn a_wider_tolerance_admits_drift_a_narrow_one_rejects() {
+        let src = probe_at(10.0, 48000);
+        let out = probe_at(10.5, 48000); // 500 ms
+
+        let narrow = config::ValidationPolicy {
+            max_duration_delta_ms: 80,
+            ..Default::default()
+        };
+        let wide = config::ValidationPolicy {
+            max_duration_delta_ms: 1000,
+            ..Default::default()
+        };
+
+        let audio = config::AudioPolicy::default();
+        assert!(!run_qc_evaluation(&out, &src, true, true, None, &audio, &narrow).passed);
+        assert!(run_qc_evaluation(&out, &src, true, true, None, &audio, &wide).passed);
+    }
+
+    #[test]
+    fn strict_ready_blocking_promotes_warnings_to_failures() {
+        // For a station that will not air anything with an open question
+        // against it, "passed with warnings" is not a state they want.
+        // enforce_faststart off produces a warning, not an error.
+        let lenient = config::ValidationPolicy {
+            enforce_faststart: false,
+            ..Default::default()
+        };
+        assert!(qc(true, false, 48000, &lenient).passed);
+
+        let strict_policy = config::ValidationPolicy {
+            strict_ready_blocking: true,
+            ..lenient
+        };
+        let strict = qc(true, false, 48000, &strict_policy);
+        assert!(!strict.passed, "a warning now blocks");
+        assert_eq!(strict.blocking_errors, 0, "it is still a warning, not an error");
+        assert!(strict.warnings_count >= 1);
+    }
+
+    // ---- T2-9: the preflight has to know how big this job is ----
+
+    #[test]
+    fn ffmpeg_rate_strings_parse_to_bits_per_second() {
+        assert_eq!(parse_ffmpeg_rate_bps("15M"), Some(15_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("15m"), Some(15_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("320k"), Some(320_000));
+        assert_eq!(parse_ffmpeg_rate_bps("320K"), Some(320_000));
+        assert_eq!(parse_ffmpeg_rate_bps("1G"), Some(1_000_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("4500000"), Some(4_500_000));
+        assert_eq!(parse_ffmpeg_rate_bps(" 8M "), Some(8_000_000));
+        assert_eq!(parse_ffmpeg_rate_bps("1.5M"), Some(1_500_000));
+
+        // Unparseable, which must be `None` rather than 0 -- the caller
+        // distinguishes them.
+        assert_eq!(parse_ffmpeg_rate_bps(""), None);
+        assert_eq!(parse_ffmpeg_rate_bps("fast"), None);
+        assert_eq!(parse_ffmpeg_rate_bps("-5M"), None);
+    }
+
+    #[test]
+    fn a_two_hour_feature_needs_far_more_than_the_old_flat_500mb() {
+        // The case from F-22: 2 h at 15 Mbit/s video + 320 kbit/s audio.
+        // 7200 s x 15.32 Mbit/s / 8 = ~13.8 GB, x1.2 margin = ~16.5 GB.
+        let required = required_bytes_for(7200.0, "15M", "320k");
+        let gb = required as f64 / 1_000_000_000.0;
+        assert!(
+            (16.0..17.5).contains(&gb),
+            "expected about 16.5 GB, got {:.2} GB",
+            gb
+        );
+        assert!(
+            required > 30 * MIN_FREE_BYTES,
+            "the old flat floor was off by more than an order of magnitude"
+        );
+    }
+
+    #[test]
+    fn an_hour_at_profile_a_rates_sizes_correctly() {
+        // 3600 s x (15 Mbit/s + 320 kbit/s) / 8 = 6.894 GB, x1.2 = 8.273 GB,
+        // + 64 MiB = 8.34 GB.
+        //
+        // REMEDIATION-PLAN.md quotes "~7.1 GB" for this case. That figure is a
+        // slip -- no combination of the margin, the slack and GB-vs-GiB
+        // produces it -- so the arithmetic above is what this asserts. Sizing
+        // it *lower* than reality is the one direction that reintroduces F-22.
+        let bytes = required_bytes_for(3600.0, "15M", "320k");
+        let gb = bytes as f64 / 1_000_000_000.0;
+        assert!((8.2..8.5).contains(&gb), "expected ~8.34 GB, got {:.2} GB", gb);
+        assert_eq!(bytes, (3600.0 * 15_320_000.0 / 8.0 * 1.2) as u64 + DISK_FIXED_SLACK);
+    }
+
+    #[test]
+    fn a_short_clip_never_falls_below_the_floor() {
+        // 10 s at 15 Mbit/s is ~22 MB, well under the floor -- but the staged
+        // file, the sidecar and FFmpeg's scratch still need room.
+        assert_eq!(required_bytes_for(10.0, "15M", "320k"), MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn an_unknown_duration_or_rate_falls_back_to_the_floor() {
+        // Refusing to encode because a bitrate string was unfamiliar would be
+        // worse than a preflight that is occasionally optimistic.
+        assert_eq!(required_bytes_for(0.0, "15M", "320k"), MIN_FREE_BYTES);
+        assert_eq!(required_bytes_for(-1.0, "15M", "320k"), MIN_FREE_BYTES);
+        assert_eq!(required_bytes_for(3600.0, "", ""), MIN_FREE_BYTES);
+        assert_eq!(required_bytes_for(3600.0, "veryfast", "nope"), MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn an_absurd_duration_does_not_overflow() {
+        // A corrupt probe reporting a nonsense duration must produce a large
+        // number, not a wrapped-around small one that passes the check.
+        let huge = required_bytes_for(f64::MAX, "15M", "320k");
+        assert!(huge >= MIN_FREE_BYTES);
+        let nan = required_bytes_for(f64::NAN, "15M", "320k");
+        assert!(nan >= MIN_FREE_BYTES);
+    }
+
+    // ---- T2-8: a publish that the registry refuses must not leave the file ----
+
+    #[test]
+    fn retry_blocking_returns_the_first_success() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<&str, String> = retry_blocking(
+            3,
+            std::time::Duration::from_millis(0),
+            "test",
+            |attempt| {
+                calls.set(calls.get() + 1);
+                if attempt < 2 {
+                    Err("locked".to_string())
+                } else {
+                    Ok("ok")
+                }
+            },
+        );
+        assert_eq!(out.unwrap(), "ok");
+        assert_eq!(calls.get(), 2, "must stop as soon as it succeeds");
+    }
+
+    #[test]
+    fn retry_blocking_surfaces_the_last_error_after_exhausting_attempts() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<(), String> = retry_blocking(
+            3,
+            std::time::Duration::from_millis(0),
+            "test",
+            |attempt| {
+                calls.set(calls.get() + 1);
+                Err(format!("failure {}", attempt))
+            },
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            out.unwrap_err(),
+            "failure 3",
+            "the caller needs the most recent error, not the first"
+        );
+    }
+
+    #[test]
+    fn retry_blocking_always_runs_at_least_once() {
+        let calls = std::cell::Cell::new(0u32);
+        let _: Result<(), String> = retry_blocking(0, std::time::Duration::from_millis(0), "t", |_| {
+            calls.set(calls.get() + 1);
+            Err("e".into())
+        });
+        assert_eq!(calls.get(), 1, "zero attempts must not mean zero work");
+    }
+
+    fn quarantine_fixture(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pt-quar-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("videos")).unwrap();
+        root
+    }
+
+    #[test]
+    fn an_orphaned_mezzanine_is_moved_out_of_the_library() {
+        let root = quarantine_fixture("move");
+        let published = root.join("videos").join("programme.mp4");
+        std::fs::write(&published, b"mezzanine").unwrap();
+
+        let dest = quarantine_published(&root, &published).expect("quarantine");
+
+        assert!(!published.exists(), "it must not stay where PlayOut looks");
+        assert!(dest.exists());
+        assert_eq!(dest.parent().unwrap(), root.join(QUARANTINE_DIR));
+        assert_eq!(
+            dest.file_name().unwrap(),
+            "programme.mp4",
+            "the name is preserved so an operator can tell what it was"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"mezzanine");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repeated_failure_does_not_overwrite_the_first_ones_evidence() {
+        let root = quarantine_fixture("collide");
+        let videos = root.join("videos");
+
+        std::fs::write(videos.join("clip.mp4"), b"first").unwrap();
+        let a = quarantine_published(&root, &videos.join("clip.mp4")).unwrap();
+
+        std::fs::write(videos.join("clip.mp4"), b"second").unwrap();
+        let b = quarantine_published(&root, &videos.join("clip.mp4")).unwrap();
+
+        assert_ne!(a, b, "the second must not land on the first");
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantining_creates_the_directory_on_first_use() {
+        let root = quarantine_fixture("mkdir");
+        assert!(!root.join(QUARANTINE_DIR).exists());
+
+        let published = root.join("videos").join("x.mp4");
+        std::fs::write(&published, b"x").unwrap();
+        quarantine_published(&root, &published).unwrap();
+
+        assert!(root.join(QUARANTINE_DIR).is_dir());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dedup_confirms_only_on_two_agreeing_full_hashes() {
+        // The one case that is a duplicate.
+        assert!(is_confirmed_duplicate(Some("abc"), Some("abc"), "u"));
+
+        // Same sampled fingerprint, different bytes: two different programmes
+        // cut from one master. This is F-15, and it must ingest both.
+        assert!(!is_confirmed_duplicate(Some("abc"), Some("def"), "u"));
+
+        // A row ingested before source_sha256 existed. Unconfirmable, so it
+        // re-transcodes rather than guessing from the sampled hash alone.
+        assert!(!is_confirmed_duplicate(None, Some("abc"), "u"));
+
+        // Our own hash failed -- unreadable source. Also unconfirmable.
+        assert!(!is_confirmed_duplicate(Some("abc"), None, "u"));
+        assert!(!is_confirmed_duplicate(None, None, "u"));
+    }
+
+    #[test]
+    fn a_skipped_phase_is_terminal_and_reads_as_completed_on_the_wire() {
+        // The whole point of adding the phase: a duplicate is not a failure,
+        // but v1 clients only see `state`, so it has to land on Completed.
+        assert!(jobs::JobPhase::Skipped.is_terminal());
+        assert_eq!(
+            jobs::JobPhase::Skipped.as_v1_state(),
+            jobs::JobState::Completed
+        );
+        assert_eq!(jobs::JobPhase::Skipped.as_str(), "skipped");
+        // Re-triable: the operator may purge the asset that caused the skip.
+        assert!(jobs::JobPhase::Skipped.can_transition_to(jobs::JobPhase::Queued));
+        assert!(jobs::JobPhase::Queued.can_transition_to(jobs::JobPhase::Skipped));
+    }
+
     #[test]
     fn test_mock_runner_retryable_until_exhausted() {
         use std::path::PathBuf;
@@ -2316,7 +3481,15 @@ mod tests {
         };
         let policy = config::AudioPolicy::default();
 
-        let qc = run_qc_evaluation(&dummy_probe, &dummy_probe, true, true, None, &policy);
+        let qc = run_qc_evaluation(
+            &dummy_probe,
+            &dummy_probe,
+            true,
+            true,
+            None,
+            &policy,
+            &config::ValidationPolicy::default(),
+        );
         assert!(qc.passed);
         assert_eq!(qc.blocking_errors, 0);
     }
@@ -2344,7 +3517,15 @@ mod tests {
         let policy = config::AudioPolicy::default();
 
         // 1. Zero duration + 44.1k audio + GOP violation + missing faststart -> 4 blocking errors
-        let qc = run_qc_evaluation(&dummy_output, &dummy_source, false, false, None, &policy);
+        let qc = run_qc_evaluation(
+            &dummy_output,
+            &dummy_source,
+            false,
+            false,
+            None,
+            &policy,
+            &config::ValidationPolicy::default(),
+        );
         assert!(!qc.passed);
         assert!(qc.blocking_errors >= 4);
         assert!(qc.findings.iter().any(|f| f.code == "zero_duration"));
@@ -2357,6 +3538,11 @@ mod tests {
     }
 
     #[test]
+    // `check_disk_space` is a deliberate no-op off Windows -- it has no
+    // GetDiskFreeSpaceEx equivalent wired up, and the product is a Windows
+    // service -- so the "insufficient space" half of this can only be asserted
+    // there. Running it on Linux asserted that a no-op returns an error.
+    #[cfg(windows)]
     fn test_check_disk_space_current_dir() {
         let cwd = std::env::current_dir().unwrap();
         // Request 1 byte (should succeed on any working volume)
