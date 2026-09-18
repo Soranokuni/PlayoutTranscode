@@ -40,6 +40,23 @@ Write-Host "[3/5] Building Rust release binary..." -ForegroundColor Yellow
 cargo build --release
 Copy-Item -Path "target\release\PlayoutTranscode.exe" -Destination "$OutputDir\" -Force
 
+# Debug symbols, kept OUT of the installer payload (T3-6).
+#
+# The release profile no longer strips, so a panic backtrace names functions
+# instead of hex addresses -- but only if the matching .pdb is available when
+# someone reads it, months later. It goes beside the installer rather than
+# inside it: the shipped payload stays the same size, and the symbols are
+# archived with the build so a crash report from it can still be symbolised.
+$symbolDir = Join-Path (Split-Path -Parent $OutputDir) "symbols"
+New-Item -ItemType Directory -Path $symbolDir -Force | Out-Null
+$pdb = "target\release\PlayoutTranscode.pdb"
+if (Test-Path -LiteralPath $pdb) {
+    Copy-Item -LiteralPath $pdb -Destination $symbolDir -Force
+    Write-Host "Symbols archived to $symbolDir (not shipped in the installer)" -ForegroundColor Green
+} else {
+    Write-Warning "No PDB at $pdb - a crash report from this build will not symbolise."
+}
+
 # Build Vue SPA
 Write-Host "[4/5] Building Vue SPA..." -ForegroundColor Yellow
 Push-Location "web-ui"
@@ -55,57 +72,110 @@ try {
 Copy-Item -Path "config.toml" -Destination "$OutputDir\config.toml.example" -Force -ErrorAction SilentlyContinue
 
 # Copy post-install script
-@'
-@'
+#
+# T2-1: the service is registered against `service-run`, the Service Control
+# Manager entry point, not `run`. `run` is a plain console program: the SCM
+# waits for a status report that never arrives and fails the start with
+# error 1053 after 30 s, which is why "Install as Windows Service" never
+# produced a working service (F-11).
+#
+# It runs as NT AUTHORITY\LocalService, not LocalSystem: the service needs
+# filesystem access to the media folders and nothing else, and LocalSystem
+# hands a compromised FFmpeg invocation the whole machine.
+#
+# Because LocalService cannot write under Program Files, all mutable state
+# lives in %ProgramData%\PlayoutTranscode (T2-2), created and ACL'd here.
+$installScript = @'
+$ErrorActionPreference = "Stop"
 Write-Host "=== PlayoutTranscode Post-Install ===" -ForegroundColor Cyan
 
-$exeDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$exeDir  = $PSScriptRoot
 $exePath = Join-Path $exeDir "PlayoutTranscode.exe"
-
-if (-not (Test-Path $exePath)) {
+if (-not (Test-Path -LiteralPath $exePath)) {
     Write-Error "PlayoutTranscode.exe not found at $exePath"
     exit 1
 }
 
-$configPath = Join-Path $exeDir "config.toml"
-if (-not (Test-Path $configPath)) {
-    Copy-Item "$exeDir\config.toml.example" $configPath
-    Write-Host "Created default config at $configPath" -ForegroundColor Green
-    Write-Host "Edit $configPath to set watch/target folders" -ForegroundColor Yellow
+$svcName    = "PlayoutTranscode"
+$svcAccount = "NT AUTHORITY\LocalService"
+$dataDir    = Join-Path $env:ProgramData "PlayoutTranscode"
+$logDir     = Join-Path $dataDir "logs"
+$configPath = Join-Path $dataDir "config.toml"
+
+New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+New-Item -ItemType Directory -Path $logDir  -Force | Out-Null
+
+if (-not (Test-Path -LiteralPath $configPath)) {
+    $example = Join-Path $exeDir "config.toml.example"
+    if (Test-Path -LiteralPath $example) {
+        Copy-Item -LiteralPath $example -Destination $configPath
+        Write-Host "Created default config at $configPath" -ForegroundColor Green
+        Write-Host "Edit it to set the watch and target folders." -ForegroundColor Yellow
+    }
 }
 
-# Register Windows Service
-$svcName = "PlayoutTranscode"
+# The service account needs Modify on the data directory: config.toml, the
+# asset registry, the rotated logs and any downloaded toolchain all live there.
+Write-Host "Granting $svcAccount Modify on $dataDir" -ForegroundColor Yellow
+& icacls.exe $dataDir /grant "${svcAccount}:(OI)(CI)M" /T /C | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "icacls returned $LASTEXITCODE. The service may not be able to write to $dataDir."
+}
+
+# Re-registering is the supported upgrade path; sc.exe cannot edit obj= and
+# binPath= atomically, and a stale binPath is how a half-upgraded install
+# keeps launching the old entry point.
 $existing = Get-Service -Name $svcName -ErrorAction SilentlyContinue
 if ($existing) {
-    Write-Host "Service $svcName already exists, stopping..." -ForegroundColor Yellow
+    Write-Host "Service $svcName exists; stopping and removing it..." -ForegroundColor Yellow
     Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
-    sc.exe delete $svcName | Out-Null
-    Start-Sleep -Seconds 2
+    & sc.exe delete $svcName | Out-Null
+    # sc.exe delete is asynchronous; wait for the name to be released.
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Get-Service -Name $svcName -ErrorAction SilentlyContinue)) { break }
+        Start-Sleep -Milliseconds 500
+    }
 }
 
-$binPath = "`"$exePath`" run --config `"$configPath`""
-sc.exe create $svcName binPath= $binPath start= auto DisplayName= "PlayoutTranscode Media Service" | Out-Null
-sc.exe description $svcName "Automated broadcast media transcoding service" | Out-Null
-sc.exe start $svcName | Out-Null
+$binPath = '"{0}" service-run --data-dir "{1}" --config "{2}"' -f $exePath, $dataDir, $configPath
+& sc.exe create $svcName binPath= $binPath start= auto obj= $svcAccount DisplayName= "PlayoutTranscode Media Service" | Out-Null
+if ($LASTEXITCODE -ne 0) { Write-Error "sc.exe create failed with $LASTEXITCODE"; exit 1 }
+
+& sc.exe description $svcName "Automated broadcast media transcoding service" | Out-Null
+
+# Restart after a crash: 5 s, then 30 s, then every 60 s; the failure count
+# resets daily so a long-lived service is not permanently in "failed" state.
+& sc.exe failure $svcName reset= 86400 actions= restart/5000/restart/30000/restart/60000 | Out-Null
+
+& sc.exe start $svcName | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "sc.exe start returned $LASTEXITCODE. Check $logDir and 'sc query $svcName'."
+}
 
 # Desktop shortcut
-$desktop = [Environment]::GetFolderPath("Desktop")
+$desktop      = [Environment]::GetFolderPath("CommonDesktopDirectory")
 $shortcutPath = Join-Path $desktop "PlayoutTranscode.url"
-$webUrl = "http://127.0.0.1:4353"
-@"
-[InternetShortcut]
-URL=$webUrl
-"@ | Out-File -FilePath $shortcutPath -Encoding ASCII
+$webUrl       = "http://127.0.0.1:4353"
+"[InternetShortcut]`r`nURL=$webUrl" | Out-File -FilePath $shortcutPath -Encoding ASCII
 
 # Start Menu folder
-$startMenu = Join-Path ([Environment]::GetFolderPath("Programs")) "PlayoutTranscode"
+$startMenu = Join-Path ([Environment]::GetFolderPath("CommonPrograms")) "PlayoutTranscode"
 New-Item -ItemType Directory -Path $startMenu -Force | Out-Null
-$smShortcut = Join-Path $startMenu "PlayoutTranscode Web UI.url"
-Copy-Item $shortcutPath $smShortcut -Force
+Copy-Item -LiteralPath $shortcutPath -Destination (Join-Path $startMenu "PlayoutTranscode Web UI.url") -Force
 
-Write-Host "Installation complete. Open http://127.0.0.1:4353 in your browser." -ForegroundColor Green
-'@ | Set-Content -Path "$OutputDir\install.ps1" -Encoding UTF8
+Write-Host ""
+Write-Host "Installation complete." -ForegroundColor Green
+Write-Host "  Service account : $svcAccount"
+Write-Host "  Data directory  : $dataDir"
+Write-Host "  Config          : $configPath"
+Write-Host "  Web UI          : $webUrl"
+Write-Host ""
+Write-Host "Grant $svcAccount Modify on the watch and target folders before starting ingest:" -ForegroundColor Yellow
+Write-Host "  icacls ""<watch folder>"" /grant ""$svcAccount`:(OI)(CI)M"" /T" -ForegroundColor Yellow
+Write-Host "  icacls ""<target folder>"" /grant ""$svcAccount`:(OI)(CI)M"" /T" -ForegroundColor Yellow
+'@
+
+Set-Content -Path "$OutputDir\install.ps1" -Value $installScript -Encoding UTF8
 
 Write-Host "[5/5] Complete!" -ForegroundColor Green
 Write-Host "Installer files at: $OutputDir"

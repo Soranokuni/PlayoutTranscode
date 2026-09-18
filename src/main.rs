@@ -1,9 +1,8 @@
-use playout_transcode::{bootstrap, config, db, jobs, logging, profiles, server, service_handle};
+use playout_transcode::app::{self, ShutdownToken};
+use playout_transcode::{bootstrap, config, paths};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use service_handle::ServiceHandle;
-use std::sync::Arc;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -12,6 +11,11 @@ use std::sync::Arc;
     about = "Broadcast media transcoding service"
 )]
 struct Cli {
+    /// Directory holding `config.toml`, the asset registry, logs and the
+    /// downloaded toolchain. Overrides `PLAYOUT_TRANSCODE_DATA`.
+    #[arg(long, value_name = "PATH", global = true)]
+    data_dir: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -20,6 +24,15 @@ struct Cli {
 enum Commands {
     #[command(about = "Run as headless background service (no GUI)")]
     Run {
+        #[arg(long, value_name = "PATH")]
+        config: Option<String>,
+    },
+    #[command(
+        name = "service-run",
+        about = "Windows Service entry point. Used by the SCM only; use `run` from a console",
+        hide = true
+    )]
+    ServiceRun {
         #[arg(long, value_name = "PATH")]
         config: Option<String>,
     },
@@ -42,6 +55,19 @@ enum Commands {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Must happen before anything reads `config.toml`, opens the registry or
+    // audits the toolchain: every one of those resolves through
+    // `paths::data_dir()` and re-resolving mid-run would split the service's
+    // state across two directories (T2-2).
+    let data_dir = paths::resolve_data_dir_from_env(cli.data_dir.as_deref());
+    let data_dir = match paths::set_data_dir(data_dir.clone()) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("{} ({})", e, data_dir.display());
+            std::process::exit(1);
+        }
+    };
+
     match cli.command {
         None => {
             run_headless(None);
@@ -54,6 +80,12 @@ fn main() -> Result<()> {
         },
         Some(Commands::Run { config }) => {
             run_headless(config);
+        }
+        Some(Commands::ServiceRun { config }) => {
+            if let Err(e) = run_as_windows_service(config) {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
         }
         Some(Commands::CheckUpdate) => {
             let result = bootstrap::check_ffmpeg_update();
@@ -69,6 +101,7 @@ fn main() -> Result<()> {
             }
         }
         Some(Commands::Status) => {
+            println!("Data dir: {}", data_dir.display());
             let (_, status) = bootstrap::audit_toolchain();
             println!("FFmpeg found: {}", status.ffmpeg_found);
             println!("FFprobe found: {}", status.ffprobe_found);
@@ -85,9 +118,8 @@ fn main() -> Result<()> {
 /// Printed to stdout and never logged: the operator copies it into PlayOut's
 /// settings and into the web UI, and it is redacted from `GET /api/config`.
 fn gen_token(config_path_override: Option<String>) -> Result<()> {
-    let (mut app_config, config_path) =
-        config::AppConfig::load(config_path_override.as_deref())
-            .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
+    let (mut app_config, config_path) = config::AppConfig::load(config_path_override.as_deref())
+        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
 
     let token = config::gen_api_token();
     app_config.server.api_token = token.clone();
@@ -95,157 +127,62 @@ fn gen_token(config_path_override: Option<String>) -> Result<()> {
         .save_to(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to save configuration: {}", e))?;
 
-    println!("
+    println!(
+        "
 API token written to {}
-", config_path.display());
-    println!("  {}
-", token);
+",
+        config_path.display()
+    );
+    println!(
+        "  {}
+",
+        token
+    );
     println!("This is the only time it is shown. Set it in:");
     println!("  - PlayOut  : settings.ingestorApiToken");
     println!("  - Web UI   : the token prompt on first load");
-    println!("
+    println!(
+        "
 Restart the service for it to take effect.
-");
+"
+    );
     Ok(())
 }
 
+/// Hand the process to the Service Control Manager (T2-1).
+///
+/// Only valid when the SCM launched us; from a console it fails immediately
+/// rather than half-starting, and the message points at `run`.
+#[cfg(windows)]
+fn run_as_windows_service(config_path_override: Option<String>) -> Result<()> {
+    playout_transcode::win_service::run(config_path_override).map_err(|e| anyhow::anyhow!(e))
+}
+
+#[cfg(not(windows))]
+fn run_as_windows_service(_config_path_override: Option<String>) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "`service-run` is the Windows Service Control Manager entry point and is \
+         only available on Windows. Use `PlayoutTranscode run`."
+    ))
+}
+
 fn run_headless(config_path_override: Option<String>) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // `Runtime::new().unwrap()` panicked with a backtrace and no explanation
+    // when the process could not get a thread pool (F-30). Say what failed.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create the Tokio runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
     rt.block_on(async move {
-        if let Err(e) = run_service(config_path_override).await {
+        if let Err(e) = app::run_service(config_path_override, ShutdownToken::new()).await {
             eprintln!("Service error: {}", e);
             std::process::exit(1);
         }
     });
-}
-
-async fn run_service(config_path_override: Option<String>) -> Result<()> {
-    use std::path::PathBuf;
-
-    let (app_config, _config_path) = config::AppConfig::load(config_path_override.as_deref())
-        .map_err(|e| anyhow::anyhow!("Failed to load configuration: {}", e))?;
-
-    logging::init_logging(&app_config.logging.level);
-
-    profiles::validate_color_constants()
-        .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
-
-    // Must happen before any `audit_toolchain()` call so configured paths and
-    // the download digest pin are honoured (T1-2).
-    bootstrap::set_toolchain_policy(app_config.effective_toolchain_policy());
-
-    let port = app_config.server.web_port;
-    let bind_addr = app_config.server.bind_address.clone();
-    let url = format!("http://{}:{}", bind_addr, port);
-    println!("\n  PlayoutTranscode web UI starting at {}\n", url);
-    tracing::info!("PlayoutTranscode starting on {}", url);
-
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-
-    let pool = db::init_pool(&exe_dir.join("media_assets.db"))
-        .await
-        .map_err(|e| anyhow::anyhow!("Database init failed: {}", e))?;
-    let pool = Arc::new(pool);
-    tracing::info!("Asset database ready");
-
-    let (_, toolchain_status) = bootstrap::audit_toolchain();
-    tracing::info!("FFmpeg: {:?}", toolchain_status.ffmpeg_version);
-
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(256);
-    let job_queue = jobs::JobQueue::new(event_tx, Some(pool.clone()));
-    if let Ok(report) = db::recover_stale_jobs(&pool).await {
-        if report.requeued > 0 || report.failed_exhausted > 0 {
-            tracing::info!(
-                "Startup crash recovery: {} job(s) re-queued, {} job(s) marked failed",
-                report.requeued,
-                report.failed_exhausted
-            );
-        }
-    }
-    if let Ok(existing_jobs) = db::load_all_durable_jobs(&pool).await {
-        job_queue.populate(existing_jobs);
-    }
-    let service_handle = ServiceHandle::new();
-
-    let watch_root = PathBuf::from(&app_config.paths.watch_folder);
-    let target_root = PathBuf::from(&app_config.paths.target_folder);
-    let _ = std::fs::create_dir_all(&target_root);
-
-    let config_initialized = app_config.initialized;
-
-    let server_cfg = app_config.clone();
-    let bind_addr = server_cfg.server.bind_address.clone();
-    let port = server_cfg.server.web_port;
-    let sh = service_handle.clone();
-    let jq = job_queue.clone();
-    let server_pool = pool.clone();
-
-    let web_ui_dir = if exe_dir
-        .join("web-ui")
-        .join("dist")
-        .join("index.html")
-        .exists()
-    {
-        exe_dir.join("web-ui").join("dist")
-    } else if let Ok(cwd) = std::env::current_dir() {
-        if cwd.join("web-ui").join("dist").join("index.html").exists() {
-            cwd.join("web-ui").join("dist")
-        } else {
-            exe_dir.join("web-ui").join("dist")
-        }
-    } else {
-        exe_dir.join("web-ui").join("dist")
-    };
-
-    let server_task = tokio::spawn(async move {
-        server::run_server(
-            port,
-            &bind_addr,
-            server::ServerDeps {
-                jobs: jq,
-                config: server_cfg,
-                toolchain_status: toolchain_status.clone(),
-                service_handle: sh,
-                web_ui_dir,
-                pool: server_pool,
-            },
-        )
-        .await
-    });
-
-    if config_initialized
-        && !watch_root.to_string_lossy().is_empty()
-        && !target_root.to_string_lossy().is_empty()
-        && app_config.validate().is_ok()
-    {
-        service_handle.add_log("info", "Auto-starting service with configured watch folder");
-        if let Ok(tools) = bootstrap::ensure_toolchain() {
-            let _ = service_handle::start_processing_loop(
-                &service_handle,
-                &app_config,
-                &job_queue,
-                &tools,
-                pool.clone(),
-            );
-        } else {
-            service_handle.add_log("warn", "FFmpeg not found. Download from the web UI.");
-        }
-    }
-
-    tokio::select! {
-        result = server_task => {
-            if let Err(e) = result {
-                tracing::error!("Server task failed: {}", e);
-            }
-        }
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("Shutting down...");
-            service_handle::stop_processing(&service_handle);
-        }
-    }
-
-    Ok(())
 }

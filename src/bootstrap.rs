@@ -62,19 +62,29 @@ fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Where a downloaded toolchain is installed.
+///
+/// This is the data directory, not the exe directory: under the production
+/// layout the exe sits in `Program Files` and the service account cannot write
+/// there (T2-2).
 fn bin_dir() -> PathBuf {
-    exe_dir().join("bin")
+    crate::paths::toolchain_bin_dir()
 }
 
 /// Directories searched for the toolchain, in order, after any explicit path
 /// from `toolchain_policy`.
 fn search_dirs() -> Vec<PathBuf> {
     let exe = exe_dir();
-    vec![
-        exe.join("bin"),
-        // The installer's layout.
-        exe.join("Requirements").join("ffmpeg").join("bin"),
-    ]
+    let mut dirs = vec![bin_dir()];
+    // A portable build resolves the data directory to the exe directory, in
+    // which case the two entries coincide; keep both for the split layout, where
+    // an operator may still have dropped a toolchain next to the exe.
+    if !dirs.contains(&exe.join("bin")) {
+        dirs.push(exe.join("bin"));
+    }
+    // The installer's layout.
+    dirs.push(exe.join("Requirements").join("ffmpeg").join("bin"));
+    dirs
 }
 
 fn executable_name(base: &str) -> String {
@@ -146,6 +156,15 @@ pub fn file_sha256(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
+/// Resolve and describe the toolchain, hashing both binaries.
+///
+/// Honours `toolchain_policy.verify_on_startup`: when false, the SHA-256 of
+/// each binary is skipped and reported as `None`. Hashing a ~170 MB pair costs
+/// around 25 s, and it ran before the HTTP server bound — 25 s of a red status
+/// light in PlayOut every time a broadcast host rebooted (T3-3). Everything
+/// else the audit does (resolution, `-version`) is cheap and still runs, and
+/// `ensure_toolchain` still verifies before an encode, so nothing runs
+/// unverified either way.
 pub fn audit_toolchain() -> (ToolPaths, ToolchainStatus) {
     let policy = current_policy();
     let dirs = search_dirs();
@@ -172,9 +191,18 @@ pub fn audit_toolchain() -> (ToolPaths, ToolchainStatus) {
         ffprobe_version: ffprobe.as_ref().and_then(|p| run_version(p)),
         bundled,
         bin_dir: bin.to_string_lossy().into_owned(),
-        // Lets an operator spot a swapped binary from /api/toolchain.
-        ffmpeg_sha256: ffmpeg.as_ref().and_then(|p| file_sha256(p)),
-        ffprobe_sha256: ffprobe.as_ref().and_then(|p| file_sha256(p)),
+        // Lets an operator spot a swapped binary from /api/toolchain. `None`
+        // when `verify_on_startup` is off -- absent, not stale.
+        ffmpeg_sha256: if policy.verify_on_startup {
+            ffmpeg.as_ref().and_then(|p| file_sha256(p))
+        } else {
+            None
+        },
+        ffprobe_sha256: if policy.verify_on_startup {
+            ffprobe.as_ref().and_then(|p| file_sha256(p))
+        } else {
+            None
+        },
         ffmpeg_path: ffmpeg.as_ref().map(|p| p.to_string_lossy().into_owned()),
     };
 

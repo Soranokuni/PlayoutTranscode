@@ -244,6 +244,7 @@ async fn error_bodies_never_contain_filesystem_paths() {
         &s.pool,
         uuid,
         1234,
+        None,
         &missing.to_string_lossy(),
         "Gone",
     )

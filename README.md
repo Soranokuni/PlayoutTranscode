@@ -171,6 +171,29 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 
 ## Configuration (`config.toml`)
 
+### Where the service keeps its data
+
+`config.toml`, the asset registry (`media_assets.db`), rotated logs and any
+downloaded FFmpeg toolchain all live in the **data directory**, resolved once at
+startup in this order:
+
+| Order | Source | Result |
+|---|---|---|
+| 1 | `--data-dir <PATH>` | that path |
+| 2 | `PLAYOUT_TRANSCODE_DATA` environment variable | that path |
+| 3 | exe is under a `Program Files` tree | `%ProgramData%\PlayoutTranscode` |
+| 4 | anything else | the executable's own directory (portable layout) |
+
+The service refuses to start if the directory cannot be created. The resolved
+path is logged at startup and reported as `system.data_dir` by
+`GET /api/diagnostics`.
+
+Rule 3 exists because the Windows service runs as `NT AUTHORITY\LocalService`,
+which has no write access under `Program Files`. A portable or development
+build is unaffected and keeps writing next to the executable, as before.
+
+The data directory may not be used as the watch or target folder.
+
 > **Security warning.** `bind_address` must be a loopback address (`127.0.0.1`,
 > `::1` or `localhost`) unless `server.api_token` is set. Binding to `0.0.0.0`
 > without a token would expose every mutating route — config changes, library
@@ -179,6 +202,24 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 > `/api/**` call except `GET /api/health` and `GET /api/v2/health`.
 
 ```toml
+# Every section and key below is real: `tests/config_docs.rs` parses this block
+# and fails the build if it does not round-trip through the actual schema, or if
+# it names a key the service does not read. Sections the service writes on a
+# fresh install are shown with their defaults; the `*_policy` sections are
+# optional and absent unless you add them.
+
+version = 1
+# Set true by the setup wizard. While false the service will not auto-start the
+# processing loop, however complete the rest of this file looks.
+initialized = false
+
+[paths]
+# Both must be set and must not nest inside one another.
+watch_folder = "D:/Media/Ingest"
+target_folder = "D:/Media/Mezzanine"
+# NOTE: there is no database_path. The registry, the logs and the downloaded
+# toolchain all live in the data directory (see above), not here.
+
 [server]
 web_port = 4353
 bind_address = "127.0.0.1"
@@ -190,19 +231,113 @@ allowed_origins = []
 # A non-loopback bind_address requires this to be set.
 api_token = ""
 
-[paths]
-watch_folder = "D:/Media/Ingest"
-target_folder = "D:/Media/Mezzanine"
-database_path = "D:/PlayoutTranscode/logs/media_assets.db"
+[encoding]
+preset = "medium"
+# 0 = derive from cpu_cores and ingestion.max_concurrency.
+ffmpeg_threads = 0
+# 0 = all logical cores.
+cpu_cores = 0
+audio_codec = "aac"
+audio_bitrate = "320k"
+tune = "film"
+probesize = "500M"
+analyzeduration = "500M"
 
-[transcode]
-default_profile = "ProfileA"
+# One section per broadcast profile. The profile is chosen automatically from
+# the source probe; these set its rate control.
+[profile_a]
+enabled = true
+crf = 24
+maxrate = "15M"
+bufsize = "16M"
+
+[profile_b]
+enabled = true
+crf = 23
+maxrate = "15M"
+bufsize = "16M"
+
+[profile_c]
+enabled = true
+crf = 20
+maxrate = "5M"
+bufsize = "6M"
+
+[ingestion]
+# Seconds a file must sit unchanged before it is considered complete.
+settle_secs = 5
+poll_secs = 10
 max_concurrency = 2
-process_priority = "BelowNormal"
-settling_delay_seconds = 5
+stable_polls_min = 2
+retry_policy = "once"
+auto_retry_on_start = true
+max_attempts = 2
+retry_delay_ms = 2000
+# Delete the source after a verified successful ingest.
+clean_source_after_success = false
+# Empty include list = every extension not excluded.
+include_extensions = []
+exclude_extensions = []
 
-[audio]
-mode = "ebu_r128"          # Options: "ebu_r128", "atsc_a85", "legacy_v1_encode", "passthrough_validate"
+[logging]
+# Console level, and the level written to the rotated JSON files.
+# RUST_LOG overrides this for a support session without editing config.toml.
+level = "info"
+# Base name inside <data_dir>/logs; the appender adds a .YYYY-MM-DD suffix.
+log_file = "transcode.log"
+# Rotated files older than this are deleted at startup. 0 disables pruning.
+retain_days = 14
+
+# ---------------------------------------------------------------------------
+# Optional policy sections. Absent from a fresh config.toml; add them only to
+# override the defaults shown.
+# ---------------------------------------------------------------------------
+
+[toolchain_policy]
+# Absolute paths to the toolchain. Leave unset to search <data_dir>/bin, then
+# <exe_dir>/bin, then <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately
+# NOT searched: a writable directory earlier in PATH would let a local user
+# supply the ffmpeg.exe this service runs.
+# ffmpeg_path = "C:/PlayoutTranscode/bin/ffmpeg.exe"
+# ffprobe_path = "C:/PlayoutTranscode/bin/ffprobe.exe"
+# SHA-256 both binaries at startup. On a ~170 MB pair that costs ~25 s before
+# the HTTP server binds. False skips it; the toolchain is still verified before
+# the first encode, so nothing ever runs unverified either way.
+verify_on_startup = true
+# Expected SHA-256 of the FFmpeg release archive. The in-app download is
+# DISABLED until this is set - an unpinned executable download is not
+# acceptable on a broadcast host. Install manually if you prefer.
+download_sha256 = ""
+
+[validation_policy]
+# Each enforce_* chooses the SEVERITY of its check, not whether it runs. Turning
+# one off downgrades that finding from blocking to a warning; the finding is
+# still recorded in the sidecar and the DB viewer, so "was this file actually
+# faststart?" always has an answer.
+enforce_closed_gop = true
+enforce_faststart = true
+enforce_48k_audio = true
+# Maximum tolerated drift between the source duration and the mezzanine.
+max_duration_delta_ms = 80
+# Promote warnings to blocking, so an asset with any open question against it
+# is not marked ready.
+strict_ready_blocking = false
+
+[storage_policy]
+# Always true and not settable: publication stages to a temp name and renames.
+atomic_publication = true
+preserve_subclips_on_purge = true
+clean_source_after_success = false
+
+[retry_policy_v2]
+# Overrides the equivalent [ingestion] keys when present.
+max_attempts = 2
+retry_delay_ms = 2000
+auto_retry_on_start = true
+
+[audio_policy]
+# Options: "ebu_r128", "atsc_a85", "legacy_v1_encode", "passthrough_validate"
+mode = "ebu_r128"
 codec = "aac"
 bitrate = "320k"
 sample_rate_hz = 48000
@@ -210,25 +345,63 @@ channels = 2
 target_lufs = -23.0
 true_peak_dbtp = -1.0
 lra_target = 7.0
-preserve_original = false
-
-[cleanup]
-auto_purge_days = 30
-verified_source_cleanup = false
-
-[toolchain_policy]
-# Absolute paths to the toolchain. Leave unset to search <exe_dir>/bin and then
-# <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately NOT searched: a
-# writable directory earlier in PATH would let a local user supply the
-# ffmpeg.exe this service runs.
-# ffmpeg_path = "C:/PlayoutTranscode/bin/ffmpeg.exe"
-# ffprobe_path = "C:/PlayoutTranscode/bin/ffprobe.exe"
-verify_on_startup = true
-# Expected SHA-256 of the FFmpeg release archive. The in-app download is
-# DISABLED until this is set - an unpinned executable download is not
-# acceptable on a broadcast host. Install manually if you prefer.
-download_sha256 = ""
+dual_mono = false
+preserve_original_track = false
 ```
+
+### Logs
+
+A headless install used to discard every log line, so after an incident there
+was nothing to read. There are now four sinks:
+
+| Sink | Format | Contents |
+|---|---|---|
+| stdout | pretty | everything at `logging.level` (interactive runs) |
+| `<data_dir>/logs/transcode.log.<date>` | JSON, rotated daily | everything at `logging.level` |
+| `<data_dir>/logs/audit.log.<date>` | JSON, rotated daily | destructive operations only |
+| the web UI log panel | plain text | `WARN`, `ERROR` and every audit record |
+
+The audit log is the record of destructive API calls — purge, trash, empty
+recycle bin, retry-all, config write, service stop — with the method, path,
+caller address and resulting status:
+
+```json
+{"timestamp":"2026-09-16T18:21:41.252824Z","level":"WARN","fields":{"message":"destructive operation","op":"DELETE","path":"/api/recycle-bin/purge","remote_addr":"127.0.0.1:58051","status":200},"target":"audit"}
+```
+
+---
+
+## Running as a Windows Service
+
+The installer registers the service against the `service-run` subcommand, which
+is the Service Control Manager entry point:
+
+```
+sc.exe create PlayoutTranscode ^
+  binPath= "\"C:\Program Files\PlayoutTranscode\PlayoutTranscode.exe\" service-run --data-dir \"C:\ProgramData\PlayoutTranscode\" --config \"C:\ProgramData\PlayoutTranscode\config.toml\"" ^
+  start= auto obj= "NT AUTHORITY\LocalService"
+sc.exe failure PlayoutTranscode reset= 86400 actions= restart/5000/restart/30000/restart/60000
+```
+
+- `service-run` is **only** for the SCM. From a console it exits immediately
+  and tells you to use `run` instead. Registering `run` as the `binPath` is
+  what made the service fail to start with error 1053.
+- The account is `NT AUTHORITY\LocalService`, not LocalSystem. The service
+  needs filesystem access to the media folders and nothing else.
+- That account must be granted **Modify** on the data directory (the installer
+  does this) and on the watch and target folders (the operator must):
+
+  ```
+  icacls "<watch folder>"  /grant "NT AUTHORITY\LocalService:(OI)(CI)M" /T
+  icacls "<target folder>" /grant "NT AUTHORITY\LocalService:(OI)(CI)M" /T
+  ```
+
+A service stop drains in-flight HTTP requests, stops the watcher, kills any
+running FFmpeg child and closes the database before reporting `STOPPED`.
+
+`scripts\verify-service.ps1` proves all of this against a real SCM, under a
+throwaway service name in a temp directory. Run it from an elevated prompt
+before a release.
 
 ---
 

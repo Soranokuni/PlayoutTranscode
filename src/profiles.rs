@@ -334,7 +334,15 @@ impl EncodingProfile {
             "-hide_banner".to_string(),
             "-loglevel".to_string(),
             "info".to_string(),
-            "-stats".to_string(),
+            // `-nostats -progress pipe:1`, not `-stats` (T2-11). The human
+            // status line goes to stderr terminated by a carriage return, not a
+            // newline, so a line-oriented reader saw the whole encode as one
+            // enormous line and the UI progress bar did not move until it
+            // finished (F-21). `-progress` writes newline-terminated key=value
+            // blocks to stdout, which is designed to be parsed.
+            "-nostats".to_string(),
+            "-progress".to_string(),
+            "pipe:1".to_string(),
             "-analyzeduration".to_string(),
             config.encoding.analyzeduration.clone(),
             "-probesize".to_string(),

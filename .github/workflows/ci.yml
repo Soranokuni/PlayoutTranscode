@@ -1,0 +1,187 @@
+name: CI
+
+# T3-2. Until this existed the fmt and clippy gates were conventions in a
+# handoff document, which is to say they were not gates. The warning count was
+# tracked by hand ("62 warning sites, do not add new ones") and a regression
+# only surfaced when someone remembered to look.
+#
+# Deliberately *not* `-D warnings` on clippy yet: the tree carries 62
+# pre-existing warning sites and failing every build on them would mean either
+# a red CI from day one or a rushed sweep through code this remediation has not
+# otherwise touched. The `clippy-budget` job pins the count instead, so the
+# number can only go down. Tighten to `-D warnings` once it reaches zero.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # A broadcast service: a backtrace in a CI failure is worth more than the
+  # handful of milliseconds it costs.
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is the only supported deployment target, so it is the one that
+        # must pass. Linux is here because it catches the `#[cfg(windows)]`
+        # mistakes that a Windows-only build never sees — a non-portable path
+        # assumption compiles happily until someone opens the repo on a Mac.
+        os: [windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: cargo test
+        run: cargo test --all-targets --locked
+
+      # Doc-tests are not covered by --all-targets and the crate has doc
+      # examples in its public API.
+      - name: cargo test --doc
+        run: cargo test --doc --locked
+
+  clippy-budget:
+    name: clippy (warning budget)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      # The budget is a ratchet, not a target. If this fails because the count
+      # went DOWN, lower MAX_WARNINGS in the same commit — that is the point.
+      - name: Count clippy warnings
+        shell: bash
+        env:
+          MAX_WARNINGS: 62
+        run: |
+          cargo clippy --all-targets --locked 2>&1 | tee clippy.log
+          count=$(grep -c '^warning' clippy.log || true)
+          echo "clippy warning sites: $count (budget $MAX_WARNINGS)"
+          if [ "$count" -gt "$MAX_WARNINGS" ]; then
+            echo "::error::clippy warnings rose from $MAX_WARNINGS to $count"
+            grep '^warning' clippy.log | sort | uniq -c | sort -rn
+            exit 1
+          fi
+          if [ "$count" -lt "$MAX_WARNINGS" ]; then
+            echo "::notice::clippy warnings fell to $count - lower MAX_WARNINGS to ratchet this in"
+          fi
+
+  fmt:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      # `cargo fmt --check` fails repo-wide today, and fixing it would reformat
+      # every file and bury the diffs this work is reviewed through. So it
+      # reports rather than blocks.
+      #
+      # It reports by *succeeding* and writing a notice, not via
+      # `continue-on-error`. A job left permanently red is worse than no job:
+      # it trains everyone to skim past a red X, and the next genuine failure
+      # goes unnoticed. Green-with-a-notice stays readable.
+      #
+      # When the count reaches zero, replace this whole step with a plain
+      # `cargo fmt --all -- --check`.
+      - name: cargo fmt --check (advisory)
+        shell: bash
+        run: |
+          if cargo fmt --all -- --check > fmt.out 2>&1; then
+            echo "::notice::rustfmt is clean - make this job blocking"
+            echo "rustfmt is clean. Make this job blocking." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          files=$(grep '^Diff in' fmt.out | sed 's/^Diff in //; s/ at line.*//' | sort -u | wc -l)
+          hunks=$(grep -c '^Diff in' fmt.out || true)
+          echo "::notice::rustfmt would change $hunks hunk(s) across $files file(s) - advisory, not enforced"
+          {
+            echo "### rustfmt (advisory)"
+            echo ""
+            echo "\`cargo fmt --check\` would change **$hunks hunk(s)** across **$files file(s)**."
+            echo "Not enforced - see the comment in .github/workflows/ci.yml."
+          } >> "$GITHUB_STEP_SUMMARY"
+          head -100 fmt.out
+
+  web-ui:
+    name: web UI build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web-ui/package-lock.json
+      - run: npm ci
+        working-directory: web-ui
+      # `npm run build` is `vue-tsc --build && vite build`, so this type-checks
+      # as well as bundles.
+      - run: npm run build
+        working-directory: web-ui
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+  service:
+    name: Windows service smoke test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo build --release --locked
+
+      # The regression gate for T2-1 and T2-5: registers a throwaway service
+      # under LocalService, starts it, polls /api/health, stops it, and checks
+      # that no process survived and that the instance lock was released. It is
+      # the only thing that exercises the real SCM path, and every failure it
+      # has caught so far looked like something else from the outside.
+      #
+      # The GitHub Windows runner is already elevated, which the script
+      # requires.
+      - name: scripts/verify-service.ps1
+        shell: pwsh
+        run: .\scripts\verify-service.ps1
+
+      - name: Upload service logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-service-logs
+          path: |
+            C:\ProgramData\PlayoutTranscodeVerify-*\**\logs\**
+          if-no-files-found: ignore

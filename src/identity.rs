@@ -265,39 +265,121 @@ pub struct OutputInfo {
     pub fps_den: i64,
 }
 
+/// Where the sidecar for a mezzanine lives.
+///
+/// **Deterministic** since T3-5: the answer depends only on `media_path`, never
+/// on what happens to exist on disk. It used to probe the filesystem and return
+/// whichever of three candidate locations it found first, which meant the same
+/// asset resolved to different paths depending on call order and on whether a
+/// previous write had landed — a write could create the file the *next* read
+/// then found somewhere else, and a delete could silently retarget the next
+/// write to a legacy location (F-28).
+///
+/// The rule is now flat:
+///
+/// * `<root>/videos/clip.mp4` -> `<root>/sidecars/clip.uuid.json`
+/// * anything else            -> `<dir>/sidecars/clip.uuid.json`
+///
+/// Legacy sidecars written adjacent to the media (`clip.uuid.json` next to
+/// `clip.mp4`) are moved into place once, at startup, by
+/// [`migrate_legacy_sidecars`].
 pub fn sidecar_path_for(media_path: &Path) -> PathBuf {
     let sidecar_filename = match media_path.file_stem() {
         Some(stem) => format!("{}.uuid.json", stem.to_string_lossy()),
         None => "metadata.uuid.json".to_string(),
     };
 
-    if let Some(parent) = media_path.parent() {
-        // 1. If media_path is in a "videos" directory: e.g. <root>/videos/clip.mp4 -> <root>/sidecars/clip.uuid.json
-        if parent.file_name().map(|n| n == "videos").unwrap_or(false) {
-            if let Some(grandparent) = parent.parent() {
-                let sidecars_sibling = grandparent.join("sidecars").join(&sidecar_filename);
-                if sidecars_sibling.exists() {
-                    return sidecars_sibling;
-                }
-                let legacy_adjacent = media_path.with_extension("uuid.json");
-                if legacy_adjacent.exists() {
-                    return legacy_adjacent;
-                }
-                return sidecars_sibling;
+    let Some(parent) = media_path.parent() else {
+        return media_path.with_extension("uuid.json");
+    };
+
+    // `<root>/videos/clip.mp4` -> `<root>/sidecars/clip.uuid.json`
+    if parent.file_name().map(|n| n == "videos").unwrap_or(false) {
+        if let Some(root) = parent.parent() {
+            return root.join("sidecars").join(&sidecar_filename);
+        }
+    }
+
+    parent.join("sidecars").join(&sidecar_filename)
+}
+
+/// The pre-T3-5 location: `clip.uuid.json` beside `clip.mp4`.
+pub fn legacy_sidecar_path_for(media_path: &Path) -> PathBuf {
+    media_path.with_extension("uuid.json")
+}
+
+/// What a sidecar migration sweep did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SidecarMigration {
+    pub moved: usize,
+    pub already_current: usize,
+    pub failed: usize,
+}
+
+/// Move legacy adjacent sidecars to the canonical `sidecars/` directory.
+///
+/// Run once at startup over `<target>/videos`. Idempotent: a second run finds
+/// nothing to do. A legacy file whose canonical counterpart already exists is
+/// **left alone**, not overwritten — the canonical one is the newer of the two
+/// by construction, and destroying it to honour a stale file would lose data.
+pub fn migrate_legacy_sidecars(videos_dir: &Path) -> SidecarMigration {
+    let mut out = SidecarMigration::default();
+
+    let Ok(entries) = fs::read_dir(videos_dir) else {
+        return out;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        // Only media files; the legacy sidecars themselves end `.uuid.json`.
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.ends_with(".uuid.json") {
+            continue;
+        }
+
+        let legacy = legacy_sidecar_path_for(&path);
+        if !legacy.exists() {
+            continue;
+        }
+
+        let canonical = sidecar_path_for(&path);
+        if canonical.exists() {
+            out.already_current += 1;
+            continue;
+        }
+
+        if let Some(parent) = canonical.parent() {
+            if let Err(e) = fs::create_dir_all(parent) {
+                tracing::warn!("Sidecar migration: cannot create {}: {}", parent.display(), e);
+                out.failed += 1;
+                continue;
             }
         }
 
-        // 2. Check if subfolder <parent>/sidecars/<sidecar_filename> exists:
-        let sidecars_subfolder = parent.join("sidecars").join(&sidecar_filename);
-        if sidecars_subfolder.exists() {
-            return sidecars_subfolder;
+        match fs::rename(&legacy, &canonical) {
+            Ok(()) => {
+                tracing::info!(
+                    "Migrated sidecar {} -> {}",
+                    legacy.display(),
+                    canonical.display()
+                );
+                out.moved += 1;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Sidecar migration: could not move {}: {}",
+                    legacy.display(),
+                    e
+                );
+                out.failed += 1;
+            }
         }
-
-        let legacy_adjacent = media_path.with_extension("uuid.json");
-        return legacy_adjacent;
     }
 
-    media_path.with_extension("uuid.json")
+    out
 }
 
 pub fn write_sidecar_payload(sidecar_path: &Path, payload: &SidecarPayload) -> Result<PathBuf, String> {
@@ -354,7 +436,62 @@ pub fn write_sidecar_payload(sidecar_path: &Path, payload: &SidecarPayload) -> R
     Ok(sidecar_path.to_path_buf())
 }
 
-pub fn build_sidecar_from_db_asset(asset: &crate::db::MediaAsset) -> Result<PathBuf, String> {
+/// Why a sidecar could not be rebuilt.
+#[derive(Debug)]
+pub enum SidecarRebuildError {
+    /// The mezzanine is not on disk.
+    MezzanineMissing,
+    /// ffprobe is unavailable or could not read the file.
+    ///
+    /// The caller must surface this rather than write a sidecar, because the
+    /// only alternative is fabricating the values — which is what this used to
+    /// do (T3-5, F-27).
+    ProbeUnavailable(String),
+    /// The sidecar itself could not be written.
+    WriteFailed(String),
+}
+
+/// Rebuild a sidecar for an asset whose sidecar was lost.
+///
+/// **Re-probes the mezzanine.** The previous implementation filled the payload
+/// from the registry row and hard-coded everything the row does not carry:
+/// `width: 1920`, `height: 1080`, `codec: "h264"`, `audio_codec: "aac"`,
+/// `audio_sample_rate: 48000`, `field_order: "progressive"`. For a 1080p25
+/// H.264 mezzanine those happen to be right, which is why it went unnoticed;
+/// for anything else — a legacy SD asset, a 720p promo, a 5.1 feature — it
+/// wrote confident, wrong metadata into the file PlayOut hydrates from, and
+/// nothing downstream could tell it apart from a real sidecar (F-27).
+///
+/// Without a usable ffprobe there is no honest output, so this returns
+/// `ProbeUnavailable` and the caller answers 503. A missing sidecar is a
+/// recoverable annoyance; a plausible wrong one is not.
+pub fn rebuild_sidecar_from_media(
+    asset: &crate::db::MediaAsset,
+    tools: &crate::bootstrap::ToolPaths,
+) -> Result<PathBuf, SidecarRebuildError> {
+    if asset.current_path.is_empty() {
+        return Err(SidecarRebuildError::MezzanineMissing);
+    }
+    let media_path = Path::new(&asset.current_path);
+    if !media_path.exists() {
+        return Err(SidecarRebuildError::MezzanineMissing);
+    }
+
+    let probed = crate::probe::probe_media(tools, media_path)
+        .map_err(SidecarRebuildError::ProbeUnavailable)?;
+
+    build_sidecar_from_db_asset_with_probe(asset, Some(&probed))
+        .map_err(SidecarRebuildError::WriteFailed)
+}
+
+/// The payload builder. `probe` supplies the real stream properties; `None`
+/// falls back to the registry row and to conservative defaults, and is only
+/// used by tests — every production path goes through
+/// [`rebuild_sidecar_from_media`].
+pub fn build_sidecar_from_db_asset_with_probe(
+    asset: &crate::db::MediaAsset,
+    probe: Option<&ProbeData>,
+) -> Result<PathBuf, String> {
     if asset.current_path.is_empty() {
         return Err("Asset current_path is empty".to_string());
     }
@@ -385,27 +522,41 @@ pub fn build_sidecar_from_db_asset(asset: &crate::db::MediaAsset) -> Result<Path
         filepath: asset.current_path.clone(),
         transcoded_at: Utc::now().to_rfc3339(),
         profile_used: "rebuilt_from_db".to_string(),
+        // Every field below comes from the probe when there is one. The
+        // rebuilt sidecar describes the mezzanine as it actually is; the only
+        // thing it cannot recover is the *original source*, which is long gone
+        // by the time anyone needs to rebuild, so `original_source` is filled
+        // from the mezzanine and `profile_used` says `rebuilt_from_db` to make
+        // that explicit.
         original_source: SourceInfo {
             path: asset.current_path.clone(),
-            codec: "h264".to_string(),
+            codec: probe
+                .map(|p| p.video_codec.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
             duration_secs,
             frame_count: asset.total_frames,
-            width: 1920,
-            height: 1080,
+            width: probe.map(|p| p.width).unwrap_or(0),
+            height: probe.map(|p| p.height).unwrap_or(0),
             fps: asset.fps,
             fps_num: asset.fps_num,
             fps_den: asset.fps_den,
-            field_order: "progressive".to_string(),
+            field_order: probe
+                .map(|p| p.field_order.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
         },
         output_media: OutputInfo {
             duration_secs,
             frame_count: asset.total_frames,
-            width: 1920,
-            height: 1080,
-            codec: "h264".to_string(),
-            audio_codec: "aac".to_string(),
-            audio_sample_rate: 48000,
-            audio_channels: 2,
+            width: probe.map(|p| p.width).unwrap_or(0),
+            height: probe.map(|p| p.height).unwrap_or(0),
+            codec: probe
+                .map(|p| p.video_codec.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            audio_codec: probe
+                .map(|p| p.audio_codec.clone())
+                .unwrap_or_else(|| "unknown".to_string()),
+            audio_sample_rate: probe.map(|p| p.audio_sample_rate).unwrap_or(0),
+            audio_channels: probe.map(|p| p.audio_channels).unwrap_or(0),
             fps_num: asset.fps_num,
             fps_den: asset.fps_den,
         },
@@ -700,11 +851,125 @@ mod tests {
     }
 
     #[test]
-    fn test_sidecar_path_generic_folder_defaults_to_adjacent() {
+    fn a_generic_folder_also_resolves_into_a_sidecars_subdirectory() {
+        // Was `C:/media/custom_folder/clip_abc.uuid.json`. T3-5 made the rule
+        // flat: every mezzanine's sidecar lives in a `sidecars/` directory, so
+        // the answer no longer depends on which branch of the old lookup won.
         let media = Path::new("C:/media/custom_folder/clip_abc.mp4");
         let sidecar = sidecar_path_for(media);
         let normalized = sidecar.to_string_lossy().replace('\\', "/");
-        assert_eq!(normalized, "C:/media/custom_folder/clip_abc.uuid.json");
+        assert_eq!(normalized, "C:/media/custom_folder/sidecars/clip_abc.uuid.json");
+    }
+
+    #[test]
+    fn the_resolver_does_not_depend_on_what_is_on_disk() {
+        // The heart of F-28. The old resolver probed the filesystem and
+        // returned whichever candidate it found first, so a write could create
+        // the file that the next read then located somewhere else, and a delete
+        // could silently retarget the next write to a legacy location.
+        let dir = std::env::temp_dir().join(format!(
+            "pt-sidecar-det-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let videos = dir.join("videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        let media = videos.join("clip.mp4");
+        std::fs::write(&media, b"x").unwrap();
+
+        let before = sidecar_path_for(&media);
+
+        // Create a legacy adjacent sidecar -- the old code would now return it.
+        std::fs::write(legacy_sidecar_path_for(&media), b"{}").unwrap();
+        assert_eq!(sidecar_path_for(&media), before, "a legacy file must not retarget the resolver");
+
+        // And create the canonical one -- still the same answer.
+        std::fs::create_dir_all(before.parent().unwrap()).unwrap();
+        std::fs::write(&before, b"{}").unwrap();
+        assert_eq!(sidecar_path_for(&media), before);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn migration_fixture(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pt-sidecar-mig-{}-{}-{}",
+            name,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join("videos")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_legacy_adjacent_sidecar_is_moved_into_place() {
+        let root = migration_fixture("move");
+        let videos = root.join("videos");
+        let media = videos.join("programme.mp4");
+        std::fs::write(&media, b"video").unwrap();
+        std::fs::write(legacy_sidecar_path_for(&media), br#"{"id":"legacy"}"#).unwrap();
+
+        let report = migrate_legacy_sidecars(&videos);
+        assert_eq!(report.moved, 1);
+        assert_eq!(report.failed, 0);
+
+        let canonical = sidecar_path_for(&media);
+        assert!(canonical.exists(), "moved to {}", canonical.display());
+        assert!(!legacy_sidecar_path_for(&media).exists(), "and removed from beside the media");
+        assert_eq!(
+            std::fs::read_to_string(&canonical).unwrap(),
+            r#"{"id":"legacy"}"#,
+            "contents must survive the move"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let root = migration_fixture("idempotent");
+        let videos = root.join("videos");
+        let media = videos.join("clip.mp4");
+        std::fs::write(&media, b"video").unwrap();
+        std::fs::write(legacy_sidecar_path_for(&media), b"{}").unwrap();
+
+        assert_eq!(migrate_legacy_sidecars(&videos).moved, 1);
+        // It runs at every startup, so a second pass must be a no-op.
+        assert_eq!(migrate_legacy_sidecars(&videos), SidecarMigration::default());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_legacy_file_never_overwrites_a_current_one() {
+        // The canonical sidecar is the newer of the two by construction.
+        // Honouring a stale legacy file would lose the real metadata.
+        let root = migration_fixture("no-clobber");
+        let videos = root.join("videos");
+        let media = videos.join("clip.mp4");
+        std::fs::write(&media, b"video").unwrap();
+        std::fs::write(legacy_sidecar_path_for(&media), br#"{"which":"stale"}"#).unwrap();
+
+        let canonical = sidecar_path_for(&media);
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        std::fs::write(&canonical, br#"{"which":"current"}"#).unwrap();
+
+        let report = migrate_legacy_sidecars(&videos);
+        assert_eq!(report.already_current, 1);
+        assert_eq!(report.moved, 0);
+        assert_eq!(
+            std::fs::read_to_string(&canonical).unwrap(),
+            r#"{"which":"current"}"#
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn migrating_a_directory_that_does_not_exist_is_not_an_error() {
+        let missing = std::env::temp_dir().join("pt-sidecar-mig-absent");
+        assert_eq!(migrate_legacy_sidecars(&missing), SidecarMigration::default());
     }
 
     #[test]
@@ -716,6 +981,7 @@ mod tests {
         std::fs::write(&media_file, b"fake video content").unwrap();
 
         let asset = crate::db::MediaAsset {
+            source_sha256: None,
             uuid: "test-uuid-1234".to_string(),
             fingerprint: 12345,
             current_path: media_file.to_string_lossy().into_owned(),
@@ -740,7 +1006,25 @@ mod tests {
             original_virtual_folder: None,
         };
 
-        let result = build_sidecar_from_db_asset(&asset).unwrap();
+        // A 720p50 MPEG-2 asset with 5.1 audio: nothing like the 1080p25 H.264
+        // stereo the old code hard-coded.
+        let probe = ProbeData {
+            duration_secs: 10.0,
+            frame_count: 500,
+            width: 1280,
+            height: 720,
+            video_codec: "mpeg2video".into(),
+            audio_codec: "pcm_s24le".into(),
+            audio_sample_rate: 44100,
+            audio_channels: 6,
+            fps_num: 50,
+            fps_den: 1,
+            field_order: "tt".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: asset.current_path.clone(),
+        };
+
+        let result = build_sidecar_from_db_asset_with_probe(&asset, Some(&probe)).unwrap();
         let normalized = result.to_string_lossy().replace('\\', "/");
         assert!(normalized.ends_with("sidecars/test_clip.uuid.json"));
         assert!(result.exists(), "Sidecar file must exist on disk");
@@ -752,6 +1036,169 @@ mod tests {
         assert_eq!(parsed.fps_num, 25);
         assert_eq!(parsed.fps_den, 1);
         assert!(parsed.mezzanine_ok);
+
+        // The point of T3-5: these come from the probe, not from constants.
+        // The old code wrote 1920x1080 / h264 / aac / 48000 / 2 / progressive
+        // for every asset it rebuilt, and nothing downstream could tell that
+        // apart from a real sidecar (F-27).
+        assert_eq!(parsed.output_media.width, 1280);
+        assert_eq!(parsed.output_media.height, 720);
+        assert_eq!(parsed.output_media.codec, "mpeg2video");
+        assert_eq!(parsed.output_media.audio_codec, "pcm_s24le");
+        assert_eq!(parsed.output_media.audio_sample_rate, 44100);
+        assert_eq!(parsed.output_media.audio_channels, 6);
+        assert_eq!(parsed.original_source.field_order, "tt");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn a_rebuild_without_a_probe_says_unknown_rather_than_guessing() {
+        // The `None` path exists only for tests, but if it is ever reached the
+        // output must be obviously incomplete rather than plausibly wrong.
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pt-sidecar-noprobe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("videos")).unwrap();
+        let media = temp_dir.join("videos").join("clip.mp4");
+        std::fs::write(&media, b"x").unwrap();
+
+        let asset = crate::db::MediaAsset {
+            uuid: "u".into(),
+            fingerprint: 1,
+            source_sha256: None,
+            current_path: media.to_string_lossy().into_owned(),
+            duration_ms: 1000,
+            trim_in_ms: 0,
+            trim_out_ms: 1000,
+            rating: "K".into(),
+            tp: "None".into(),
+            status: "ready".into(),
+            display_name: "clip".into(),
+            virtual_folder: "/".into(),
+            mezzanine_ok: true,
+            fps: 25.0,
+            fps_num: 25,
+            fps_den: 1,
+            total_frames: 25,
+            gop_frames: 50,
+            keyframe_safe_start_ms: 0,
+            warnings: "[]".into(),
+            keyframe_offsets_json: "[]".into(),
+            deleted_at: None,
+            original_virtual_folder: None,
+        };
+
+        let path = build_sidecar_from_db_asset_with_probe(&asset, None).unwrap();
+        let parsed: SidecarPayload =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+
+        assert_eq!(parsed.output_media.width, 0, "0, not a fabricated 1920");
+        assert_eq!(parsed.output_media.height, 0);
+        assert_eq!(parsed.output_media.codec, "unknown");
+        assert_eq!(parsed.output_media.audio_codec, "unknown");
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn a_rebuild_of_a_missing_mezzanine_never_reaches_the_probe() {
+        let asset = crate::db::MediaAsset {
+            uuid: "gone".into(),
+            fingerprint: 1,
+            source_sha256: None,
+            current_path: "D:/definitely/not/here.mp4".into(),
+            duration_ms: 1000,
+            trim_in_ms: 0,
+            trim_out_ms: 1000,
+            rating: "K".into(),
+            tp: "None".into(),
+            status: "ready".into(),
+            display_name: "gone".into(),
+            virtual_folder: "/".into(),
+            mezzanine_ok: true,
+            fps: 25.0,
+            fps_num: 25,
+            fps_den: 1,
+            total_frames: 25,
+            gop_frames: 50,
+            keyframe_safe_start_ms: 0,
+            warnings: "[]".into(),
+            keyframe_offsets_json: "[]".into(),
+            deleted_at: None,
+            original_virtual_folder: None,
+        };
+
+        let tools = crate::bootstrap::ToolPaths {
+            ffmpeg: std::path::PathBuf::new(),
+            ffprobe: std::path::PathBuf::new(),
+        };
+        match rebuild_sidecar_from_media(&asset, &tools) {
+            Err(SidecarRebuildError::MezzanineMissing) => {}
+            other => panic!("expected MezzanineMissing, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn a_rebuild_without_ffprobe_reports_probe_unavailable_and_writes_nothing() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "pt-sidecar-noffprobe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(temp_dir.join("videos")).unwrap();
+        let media = temp_dir.join("videos").join("clip.mp4");
+        std::fs::write(&media, b"not really a video").unwrap();
+
+        let asset = crate::db::MediaAsset {
+            uuid: "u".into(),
+            fingerprint: 1,
+            source_sha256: None,
+            current_path: media.to_string_lossy().into_owned(),
+            duration_ms: 1000,
+            trim_in_ms: 0,
+            trim_out_ms: 1000,
+            rating: "K".into(),
+            tp: "None".into(),
+            status: "ready".into(),
+            display_name: "clip".into(),
+            virtual_folder: "/".into(),
+            mezzanine_ok: true,
+            fps: 25.0,
+            fps_num: 25,
+            fps_den: 1,
+            total_frames: 25,
+            gop_frames: 50,
+            keyframe_safe_start_ms: 0,
+            warnings: "[]".into(),
+            keyframe_offsets_json: "[]".into(),
+            deleted_at: None,
+            original_virtual_folder: None,
+        };
+
+        let tools = crate::bootstrap::ToolPaths {
+            ffmpeg: std::path::PathBuf::from("no-such-ffmpeg"),
+            ffprobe: std::path::PathBuf::from("no-such-ffprobe"),
+        };
+        match rebuild_sidecar_from_media(&asset, &tools) {
+            Err(SidecarRebuildError::ProbeUnavailable(_)) => {}
+            other => panic!("expected ProbeUnavailable, got {:?}", other),
+        }
+
+        // And crucially, no sidecar was left behind. A plausible wrong sidecar
+        // is worse than a missing one, because nothing downstream can tell.
+        assert!(
+            !sidecar_path_for(&media).exists(),
+            "a failed rebuild must not write a partial or fabricated sidecar"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }

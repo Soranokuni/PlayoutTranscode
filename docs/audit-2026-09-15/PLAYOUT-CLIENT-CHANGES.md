@@ -1,3 +1,21 @@
+> **SUPERSEDED — 2026-09-18.**
+>
+> The remediation is complete. Read
+> [`docs/PLAYOUT-CLIENT-DOCUMENTATION.md`](../PLAYOUT-CLIENT-DOCUMENTATION.md)
+> instead: it is the single current spec for the PlayOut client, written against
+> the finished service and checked against PlayOut's actual call sites.
+>
+> This file was written incrementally as each step landed and is kept only as
+> history. Two things in it are now **wrong**:
+>
+> - §6.3 says a skipped duplicate is reported as `Failed` with
+>   `error_category = "duplicate_skipped"`. T2-6 added a terminal `Skipped`
+>   phase; it is now `state: "Completed"`, `phase: "skipped"`.
+> - §3 asks what values `tp` takes. Answered: `TP` and `NONE`, from
+>   `src/stores/mediaLibrary.ts`.
+
+---
+
 # PlayOut client changes required by the PlayoutTranscode hardening
 
 Audience: the PlayOut (Tauri/Vue) client team.
@@ -196,7 +214,284 @@ based on the row disappearing, read `media_removed` from the response instead.
 
 ---
 
-## 5. Still coming (no action yet, listed for planning)
+## 5. Deployment changes — **no client code change, but read this**
+
+**Status in PlayoutTranscode:** shipped (T2-2, T2-1, T2-3).
+
+Nothing here changes the wire contract. It changes where the service lives and
+how it is started, which matters for support calls and for the upgrade.
+
+### 5.1 The service now works as a Windows service
+
+The documented production deployment mode did not work before. The installer
+registered `PlayoutTranscode run`, which is a console program: the Service
+Control Manager waited for a status report that never arrived and failed the
+start with **error 1053** after 30 seconds. The only way to keep ingest running
+was to leave someone logged in with a console window open, and a logoff killed
+it.
+
+The installer now registers a real SCM entry point (`service-run`) running as
+`NT AUTHORITY\LocalService`, with auto-restart on crash. A service stop drains
+in-flight HTTP requests, stops the watcher, kills any running FFmpeg child and
+closes the database before reporting `STOPPED`.
+
+**What this means for PlayOut:** the ingest service is now expected to be up
+whether or not anyone is logged in. If PlayOut's status light was previously
+red after a server reboot until someone logged in and started the app, that
+should stop happening. No client change.
+
+> **Verified on a real host**, 2026-09-16, via `scripts\verify-service.ps1`:
+> the SCM reports `RUNNING`, `/api/health` answers 200 while under the SCM,
+> `sc stop` reaches `STOPPED`, no `PlayoutTranscode.exe` or `ffmpeg.exe`
+> survives the stop, and `LocalService` successfully wrote the registry into
+> its data directory.
+
+### 5.2 Config, database and logs moved out of the install directory
+
+`LocalService` cannot write under `Program Files`, so all mutable state moved
+to a **data directory**, resolved at startup as:
+
+| Order | Source | Result |
+|---|---|---|
+| 1 | `--data-dir <PATH>` | that path |
+| 2 | `PLAYOUT_TRANSCODE_DATA` | that path |
+| 3 | exe under a `Program Files` tree | `%ProgramData%\PlayoutTranscode` |
+| 4 | anything else | next to the exe (unchanged, portable/dev builds) |
+
+`config.toml`, `media_assets.db`, `logs\` and any downloaded FFmpeg all live
+there.
+
+**Upgrade note worth telling operators:** on an installed build, a `config.toml`
+that was previously edited next to the executable is **no longer read**. It must
+be moved to `%ProgramData%\PlayoutTranscode\config.toml`. A portable build is
+unaffected.
+
+`GET /api/diagnostics` gained an additive field so support can ask for the right
+files without guessing:
+
+```json
+{ "system": { "os": "windows", "arch": "x86_64", "logical_cores": 16,
+              "data_dir": "C:\\ProgramData\\PlayoutTranscode" } }
+```
+
+No existing field changed. If PlayOut surfaces a diagnostics panel, showing
+`system.data_dir` there would save a support round-trip.
+
+### 5.3 There are now real logs after an incident
+
+Previously a headless install discarded every log line. There are now four
+sinks:
+
+| Sink | Format | Contents |
+|---|---|---|
+| stdout | pretty | everything at `logging.level` (interactive runs only) |
+| `<data_dir>\logs\transcode.log.<date>` | JSON, rotated daily | everything at `logging.level` |
+| `<data_dir>\logs\audit.log.<date>` | JSON, rotated daily | destructive operations only |
+| the web UI log panel | plain text | `WARN`, `ERROR` and every audit record |
+
+`logging.retain_days` (default 14) prunes older files at startup.
+
+The audit log records every destructive call PlayOut makes — the ones listed in
+section 2 — with the method, path, **caller address** and resulting status:
+
+```json
+{"timestamp":"2026-09-16T18:21:41.252824Z","level":"WARN",
+ "fields":{"message":"destructive operation","op":"DELETE",
+ "path":"/api/recycle-bin/purge","remote_addr":"127.0.0.1:58051","status":200},
+ "target":"audit"}
+```
+
+Two consequences for PlayOut:
+
+1. **Purges are now attributable.** "Who emptied the recycle bin?" has an
+   answer. If several clients share one service, the address in that line is
+   PlayOut's.
+2. The web UI log panel now shows service-wide `WARN`/`ERROR`, not just the
+   handful of hand-written lines it used to. An operator looking at the UI will
+   see failures PlayOut reported as generic errors, which may change what they
+   report to you.
+
+---
+
+## 6. Job records: retries no longer leave ghosts — **check your job handling**
+
+**Status in PlayoutTranscode:** shipped (T2-4).
+
+Nothing renamed, nothing removed. But what `GET /api/jobs`, `/api/jobs/active`,
+`/api/jobs/pending` and `/api/stats` return has changed in ways a client can
+notice.
+
+### 6.1 A retry reuses the job id instead of creating a second job
+
+Before: `POST /api/jobs/{id}/retry` marked the old record re-queued and the
+service then created a **brand-new** job for the same file. The old record
+stayed `Pending` forever. Every retry permanently added one phantom pending job
+to the list, and `/api/stats` counted it.
+
+Now: the retry reuses the same record. The `id` you retried is the `id` that
+runs, and `created_at` is preserved.
+
+**What PlayOut should check:**
+
+- If anything keys off "a retry produces a new job id", it will now see the
+  same id transition `Pending → Processing → …` again. This is the intended
+  behaviour and simpler to follow, but it is a change.
+- If PlayOut has been filtering or de-duplicating the job list to hide the
+  phantom pending entries, that workaround can go — and if it de-duplicates by
+  `input_path`, it may now be hiding the real job.
+- Pending counts will drop on upgrade for any installation that has been
+  retrying jobs. That is the phantom work disappearing, not lost work.
+
+### 6.2 Startup can now move a Pending job to Failed
+
+At startup, a job left `Pending` whose source file no longer exists is failed
+with:
+
+```json
+{ "state": "Failed", "phase": "failed",
+  "error_category": "source_missing_on_recovery",
+  "error": "Source file no longer exists" }
+```
+
+Previously those sat `Pending` forever. A job whose source still exists is left
+`Pending` and picked up normally.
+
+### 6.3 A retry that hits an already-ingested asset reports Failed
+
+If a retry turns out to be a duplicate of an asset already ingested and valid,
+the job ends as:
+
+```json
+{ "state": "Failed", "phase": "failed",
+  "error_category": "duplicate_skipped",
+  "error": "Skipped: an identical asset is already ingested" }
+```
+
+This is **not** an error condition — nothing went wrong and no work was needed.
+It is reported as `Failed` because the job phase machine has no non-error
+terminal state reachable from a queued job.
+
+**Please key on `error_category`, not on `state`,** if you surface this to an
+operator. Showing "duplicate_skipped" as a red failure would be misleading. Say
+"already ingested" or similar. Tell us if you would prefer a dedicated phase and
+we will look at widening the state machine.
+
+### 6.4 Two new `error_category` values
+
+Add these to whatever mapping PlayOut uses for failure reasons:
+
+| `error_category` | Meaning | Operator-facing wording |
+|---|---|---|
+| `source_missing_on_recovery` | Job was pending across a restart; source file is gone | "Source file no longer available" |
+| `duplicate_skipped` | Retry matched an asset already ingested | "Already ingested — nothing to do" |
+| `fingerprint_failure` | Source could not be read | "Could not read the source file" |
+| `path_outside_watch_folder` | Input resolved outside the watch folder | "File is not in the watch folder" |
+
+The last two existed as behaviour but previously produced no job record at all
+on a retry; now they close the job out visibly.
+
+### 6.5 Progress updates are unchanged for you
+
+SSE `progress` events still arrive at the same 250 ms throttle and carry the
+same fields. What changed is only how often the *database* is written, which
+PlayOut never sees. `GET /api/jobs` still serves the live in-memory record, so
+percentages are as current as they ever were.
+
+---
+
+## 7. Service lifecycle: `POST /api/service/start` now uses status codes
+
+**Status in PlayoutTranscode:** shipped (T2-5).
+
+PlayOut does not call these endpoints today — `src-tauri/src/ingestor_api.rs`
+has no `/api/service/*` call site, and the operator starts and stops the
+service from the PlayoutTranscode web UI or the Windows Services console. This
+section is here because that may change, and because the deployment note in
+7.4 affects anyone running both.
+
+### 7.1 Why it changed
+
+`running` was a boolean, so "stopped" and "still stopping" looked the same. A
+stop followed immediately by a start spawned a second watcher over the same
+folder while the first was still killing its FFmpeg children — two dispatchers
+on one concurrency semaphore, and whichever encode lost failed on a locked
+output file. The service now has an explicit state machine.
+
+### 7.2 New fields, additive
+
+`GET /api/service/status`:
+
+```json
+{ "running": false, "state": "stopped", "generation": 3 }
+```
+
+| Field | Meaning |
+|---|---|
+| `running` | **unchanged.** `true` only in `running` |
+| `state` | `stopped` \| `starting` \| `running` \| `stopping` |
+| `generation` | incremented once per start; identifies the current run |
+
+`GET /api/diagnostics` gains the same string at `service.state`. No existing
+field changed, so a client that only reads `running` keeps working.
+
+**The one that matters is `stopping`.** `POST /api/service/stop` returns as soon
+as the stop is *requested*; the processing thread then unwinds, which takes as
+long as the in-flight FFmpeg children take to die. During that window `running`
+is already `false` but a start will be refused. If PlayOut ever drives a
+restart, poll `GET /api/service/status` until `state == "stopped"` rather than
+sleeping a fixed interval.
+
+### 7.3 `POST /api/service/start` answers with a status code
+
+It used to return `200` with `{"success": false, "error": "..."}` for every
+refusal. Now:
+
+| Status | Body `error` | Meaning |
+|---|---|---|
+| `200` | — | started; `{"success": true, "state": "running"}` |
+| `409` | `Service already running` / `Service is starting` / `Service is stopping` | retry later; the body also carries `state` |
+| `503` | `FFmpeg toolchain: …` | the toolchain is missing or unusable — operator action |
+| `400` | `Watch and target folders must be configured first` | configuration, not timing |
+
+`success` and `error` are still in every body, so a client that ignores the
+status code and reads the body behaves exactly as before. The distinction is
+worth honouring though: `409` is worth retrying, `400` and `503` are not.
+
+`POST /api/service/stop` is unchanged apart from an additive `state` in its
+body. It still requires `X-Confirm-Destructive: yes` (section 2).
+
+### 7.4 One instance per data directory — **tell your operators**
+
+The service now takes an advisory lock, `playout-transcode.lock`, in its data
+directory (section 5.2) and refuses to start if a live process already holds
+it. Startup fails with:
+
+```
+another PlayoutTranscode instance (pid 1234) is already using this data
+directory; its lock is C:\ProgramData\PlayoutTranscode\playout-transcode.lock.
+Stop that instance, or start this one with a different --data-dir.
+```
+
+This is deliberate. Two processes on one data directory meant two watchers on
+one folder and two writers on one SQLite registry, and the symptom was a stream
+of unexplained ingest failures with no obvious cause. The way operators reached
+it was starting the portable build while the Windows service was already
+running — which, since 5.1 made the service actually work, is now easier to do
+by accident, not harder.
+
+Two installs with **separate** data directories are unaffected and remain
+supported.
+
+A lock left behind by a crash is taken over by the next start, with a warning
+in the log. No one has to delete a file by hand.
+
+### 7.5 Nothing else for PlayOut here
+
+Ingest, job, asset and SSE behaviour are untouched by this step.
+
+---
+
+## 8. Still coming (no action yet, listed for planning)
 
 - **Paginated listings (T2-7).** `GET /api/assets` will default to
   `limit=1000` with `X-Total-Count`, and will omit `keyframe_offsets` unless
