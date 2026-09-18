@@ -240,11 +240,30 @@ level = "info"
 
     # A second process on the same data directory would give two watchers on one
     # folder and two writers on one registry. It must refuse and say why.
-    $secondOut = & $testExe run --data-dir $dataDir 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0 -and $secondOut -match "already using this data directory") {
+    #
+    # The refusal is written to stderr, and this script runs under
+    # `$ErrorActionPreference = "Stop"`. Under that preference PowerShell turns
+    # a native command's stderr into a *terminating* NativeCommandError, so
+    # `2>&1` on a command we are deliberately making fail aborts the script --
+    # at the one moment the failure is the expected result. Redirect to a file
+    # instead of merging into the pipeline, which never produces an error
+    # record at all.
+    $secondOutFile = Join-Path $root "second-instance.txt"
+    $proc = Start-Process -FilePath $testExe `
+        -ArgumentList @("run", "--data-dir", $dataDir) `
+        -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput "$secondOutFile.out" `
+        -RedirectStandardError  "$secondOutFile.err"
+
+    $secondOut = @(
+        (Get-Content "$secondOutFile.out" -Raw -ErrorAction SilentlyContinue),
+        (Get-Content "$secondOutFile.err" -Raw -ErrorAction SilentlyContinue)
+    ) -join ""
+
+    if ($proc.ExitCode -ne 0 -and $secondOut -match "already using this data directory") {
         Pass "a second instance on the same data directory was refused"
     } else {
-        Fail "a second instance was not refused (exit $LASTEXITCODE): $secondOut"
+        Fail "a second instance was not refused (exit $($proc.ExitCode)): $secondOut"
     }
 
     Step "Stopping the service"
