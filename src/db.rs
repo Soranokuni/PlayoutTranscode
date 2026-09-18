@@ -17,6 +17,9 @@ pub struct StructuredPurgeResult {
 pub struct MediaAsset {
     pub uuid: String,
     pub fingerprint: i64,
+    /// SHA-256 of the *source* file, hex. `None` for rows written before T2-6,
+    /// which is why dedup treats a missing value as "cannot confirm".
+    pub source_sha256: Option<String>,
     pub current_path: String,
     pub duration_ms: i64,
     pub trim_in_ms: i64,
@@ -99,7 +102,7 @@ impl From<MediaAsset> for AssetResponse {
     }
 }
 
-const SELECT_COLS: &str = "uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder";
+const SELECT_COLS: &str = "uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder";
 
 /// Find all assets with a given status. Used for startup recovery scans.
 pub async fn find_all_with_status(
@@ -179,6 +182,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         "CREATE TABLE IF NOT EXISTS media_assets (
             uuid         TEXT PRIMARY KEY,
             fingerprint  INTEGER NOT NULL,
+            source_sha256 TEXT DEFAULT NULL,
             current_path TEXT NOT NULL,
             duration_ms  INTEGER NOT NULL DEFAULT 0,
             trim_in_ms   INTEGER NOT NULL DEFAULT 0,
@@ -288,6 +292,10 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         ("fps_den", "INTEGER", "0"),
         ("deleted_at", "TEXT", "NULL"),
         ("original_virtual_folder", "TEXT", "NULL"),
+        // T2-6. Nullable on purpose: rows ingested before this column existed
+        // have no full hash, and backfilling would mean re-reading the whole
+        // library from disk at startup.
+        ("source_sha256", "TEXT", "NULL"),
     ] {
         let sql = if default == "NULL" {
             format!(
@@ -366,14 +374,16 @@ pub async fn insert_processing(
     pool: &SqlitePool,
     uuid: &str,
     fingerprint: i64,
+    source_sha256: Option<&str>,
     path: &str,
     display_name: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO media_assets (uuid, fingerprint, current_path, display_name, status) VALUES (?1, ?2, ?3, ?4, 'processing')",
+        "INSERT INTO media_assets (uuid, fingerprint, source_sha256, current_path, display_name, status) VALUES (?1, ?2, ?3, ?4, ?5, 'processing')",
     )
     .bind(uuid)
     .bind(fingerprint)
+    .bind(source_sha256)
     .bind(path)
     .bind(display_name)
     .execute(pool)
@@ -595,15 +605,102 @@ pub async fn purge_row_by_uuid(pool: &SqlitePool, uuid: &str) -> Result<u64, sql
     Ok(result.rows_affected())
 }
 
-pub async fn purge_rows_by_fingerprint(
+/// What a re-ingest did to the rows that shared its fingerprint.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FingerprintPurge {
+    /// Unusable rows deleted: a failed or half-finished ingest of the whole file.
+    pub deleted: u64,
+    /// `ready` rows whose mezzanine has gone missing, demoted to `error` so the
+    /// operator's metadata survives.
+    pub demoted: u64,
+    /// Rows deliberately left alone — subclips, and `ready` rows that are fine.
+    pub protected: u64,
+}
+
+/// Clear the way for a re-ingest of `fingerprint`, without destroying work.
+///
+/// This used to be `DELETE FROM media_assets WHERE fingerprint = ?`, which is
+/// F-26: a subclip carries its **parent's** fingerprint, so re-ingesting a
+/// programme deleted every subclip an operator had cut from it, along with
+/// their ratings, virtual folders and compliance metadata. None of that is
+/// recoverable from the source file.
+///
+/// The rule now:
+///
+/// * a **subclip** (trimmed: `trim_in_ms > 0`, or `trim_out_ms` is neither 0
+///   nor the full duration) is never touched, whatever its status;
+/// * a `ready` full-length row whose file still exists is never touched —
+///   the caller only reaches here when it decided the existing asset is not
+///   usable, and "not usable" must not mean "delete someone's library entry";
+/// * a `ready` full-length row whose file has **gone** is demoted to `error`,
+///   not deleted, so the metadata survives for the re-ingest to be reconciled
+///   against by an operator;
+/// * only `error` / `processing` full-length rows are actually deleted. Those
+///   are the leftovers of a failed ingest and carry nothing worth keeping.
+///
+/// `file_exists` is injected so the decision is unit-testable without a
+/// filesystem.
+pub async fn purge_unusable_rows_by_fingerprint(
     pool: &SqlitePool,
     fingerprint: i64,
-) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM media_assets WHERE fingerprint = ?1")
-        .bind(fingerprint)
-        .execute(pool)
-        .await?;
-    Ok(result.rows_affected())
+    file_exists: impl Fn(&str) -> bool,
+) -> Result<FingerprintPurge, sqlx::Error> {
+    let rows: Vec<(String, String, i64, i64, i64, String)> = sqlx::query_as(
+        "SELECT uuid, status, trim_in_ms, trim_out_ms, duration_ms, current_path
+         FROM media_assets WHERE fingerprint = ?1",
+    )
+    .bind(fingerprint)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = FingerprintPurge::default();
+
+    for (uuid, status, trim_in, trim_out, duration, path) in rows {
+        if is_subclip_row(trim_in, trim_out, duration) {
+            out.protected += 1;
+            continue;
+        }
+        match status.as_str() {
+            "ready" => {
+                if !path.is_empty() && file_exists(&path) {
+                    out.protected += 1;
+                } else {
+                    sqlx::query("UPDATE media_assets SET status = 'error' WHERE uuid = ?1")
+                        .bind(&uuid)
+                        .execute(pool)
+                        .await?;
+                    out.demoted += 1;
+                    tracing::warn!(
+                        "Asset {} was ready but its mezzanine is missing; demoted to 'error' \
+                         rather than deleted, so its metadata survives the re-ingest",
+                        uuid
+                    );
+                }
+            }
+            "error" | "processing" => {
+                sqlx::query("DELETE FROM media_assets WHERE uuid = ?1")
+                    .bind(&uuid)
+                    .execute(pool)
+                    .await?;
+                out.deleted += 1;
+            }
+            // Anything else (a status a later version introduces) is left
+            // alone. Failing safe here costs a duplicate row; failing open
+            // costs an operator's work.
+            _ => out.protected += 1,
+        }
+    }
+
+    Ok(out)
+}
+
+/// Is this row a trimmed excerpt rather than the whole file?
+///
+/// `trim_out_ms == 0` means "unset" in rows written before trimming existed,
+/// and `trim_out_ms == duration_ms` is the full-length case `mark_ready`
+/// writes. Anything else is a cut.
+pub fn is_subclip_row(trim_in_ms: i64, trim_out_ms: i64, duration_ms: i64) -> bool {
+    trim_in_ms > 0 || (trim_out_ms != 0 && trim_out_ms != duration_ms)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2329,7 +2426,7 @@ mod tests {
         std::fs::File::create(&sidecar_path).unwrap();
 
         let uuid = "parent-1";
-        insert_processing(&pool, uuid, 12345, &video_path.to_string_lossy(), "video1")
+        insert_processing(&pool, uuid, 12345, None, &video_path.to_string_lossy(), "video1")
             .await
             .unwrap();
         mark_ready(
@@ -2383,6 +2480,7 @@ mod tests {
             &pool,
             parent_uuid,
             67890,
+        None,
             &video_path.to_string_lossy(),
             "shared",
         )
@@ -2486,6 +2584,7 @@ mod tests {
             &pool,
             parent_uuid,
             11111,
+        None,
             &video_path.to_string_lossy(),
             "multi",
         )
@@ -2547,7 +2646,7 @@ mod tests {
         std::fs::File::create(&staging_path).unwrap();
 
         let uuid = "failed-staging-asset";
-        insert_processing(&pool, uuid, 99999, &staging_path.to_string_lossy(), "video")
+        insert_processing(&pool, uuid, 99999, None, &staging_path.to_string_lossy(), "video")
             .await
             .unwrap();
 
@@ -2725,7 +2824,7 @@ mod tests {
     async fn test_soft_delete_single_asset_and_restore() {
         let (pool, temp_dir) = setup_test_pool().await;
         let uuid = "test-soft-del-1";
-        insert_processing(&pool, uuid, 12345, "D:/target/clip1.mp4", "Clip 1")
+        insert_processing(&pool, uuid, 12345, None, "D:/target/clip1.mp4", "Clip 1")
             .await
             .unwrap();
         mark_ready(&pool, uuid, "D:/target/clip1.mp4", 5000, true, 25.0, 25, 1, 125, 50, 0, &[], "[]")
@@ -2779,13 +2878,13 @@ mod tests {
         // 1: /Shows/Drama
         // 2: /Shows/Drama/Season1
         // 3: /Shows/Dramatic (MUST NOT BE TRASHED BY /Shows/Drama!)
-        insert_processing(&pool, "u1", 1, "D:/target/c1.mp4", "C1").await.unwrap();
+        insert_processing(&pool, "u1", 1, None, "D:/target/c1.mp4", "C1").await.unwrap();
         set_virtual_folder(&pool, "u1", "/Shows/Drama").await.unwrap();
 
-        insert_processing(&pool, "u2", 2, "D:/target/c2.mp4", "C2").await.unwrap();
+        insert_processing(&pool, "u2", 2, None, "D:/target/c2.mp4", "C2").await.unwrap();
         set_virtual_folder(&pool, "u2", "/Shows/Drama/Season1").await.unwrap();
 
-        insert_processing(&pool, "u3", 3, "D:/target/c3.mp4", "C3").await.unwrap();
+        insert_processing(&pool, "u3", 3, None, "D:/target/c3.mp4", "C3").await.unwrap();
         set_virtual_folder(&pool, "u3", "/Shows/Dramatic").await.unwrap();
 
         // Trash /Shows/Drama
@@ -2821,17 +2920,17 @@ mod tests {
 
         // Legacy rows can carry LIKE metacharacters even though the validator
         // now rejects `%` at the API boundary, so the SQL must escape them.
-        insert_processing(&pool, "u1", 1, "D:/target/c1.mp4", "C1").await.unwrap();
+        insert_processing(&pool, "u1", 1, None, "D:/target/c1.mp4", "C1").await.unwrap();
         set_virtual_folder(&pool, "u1", "/promo_2026").await.unwrap();
-        insert_processing(&pool, "u2", 2, "D:/target/c2.mp4", "C2").await.unwrap();
+        insert_processing(&pool, "u2", 2, None, "D:/target/c2.mp4", "C2").await.unwrap();
         set_virtual_folder(&pool, "u2", "/promoX2026").await.unwrap();
-        insert_processing(&pool, "u3", 3, "D:/target/c3.mp4", "C3").await.unwrap();
+        insert_processing(&pool, "u3", 3, None, "D:/target/c3.mp4", "C3").await.unwrap();
         set_virtual_folder(&pool, "u3", "/promo_2026/teasers").await.unwrap();
-        insert_processing(&pool, "u4", 4, "D:/target/c4.mp4", "C4").await.unwrap();
+        insert_processing(&pool, "u4", 4, None, "D:/target/c4.mp4", "C4").await.unwrap();
         set_virtual_folder(&pool, "u4", "/a%b").await.unwrap();
-        insert_processing(&pool, "u5", 5, "D:/target/c5.mp4", "C5").await.unwrap();
+        insert_processing(&pool, "u5", 5, None, "D:/target/c5.mp4", "C5").await.unwrap();
         set_virtual_folder(&pool, "u5", "/a%b/c").await.unwrap();
-        insert_processing(&pool, "u6", 6, "D:/target/c6.mp4", "C6").await.unwrap();
+        insert_processing(&pool, "u6", 6, None, "D:/target/c6.mp4", "C6").await.unwrap();
         set_virtual_folder(&pool, "u6", "/aQb").await.unwrap();
 
         // `_` must not act as a single-character wildcard.
@@ -2886,7 +2985,7 @@ mod tests {
     #[tokio::test]
     async fn test_restore_folder_fallback_to_root() {
         let (pool, temp_dir) = setup_test_pool().await;
-        insert_processing(&pool, "u10", 10, "D:/target/c10.mp4", "C10").await.unwrap();
+        insert_processing(&pool, "u10", 10, None, "D:/target/c10.mp4", "C10").await.unwrap();
         set_virtual_folder(&pool, "u10", "/OldShows/SeriesA").await.unwrap();
 
         trash_folder(&pool, "/OldShows").await.unwrap();
@@ -2977,7 +3076,7 @@ mod tests {
         std::fs::File::create(&source).unwrap();
 
         let uuid = "error-row-uuid";
-        insert_processing(&pool, uuid, 4242, &source.to_string_lossy(), "Source")
+        insert_processing(&pool, uuid, 4242, None, &source.to_string_lossy(), "Source")
             .await
             .unwrap();
         mark_error(&pool, uuid).await.unwrap();
@@ -3019,7 +3118,7 @@ mod tests {
         std::fs::File::create(&sidecar_file).unwrap();
 
         let uuid = "purge-test-uuid";
-        insert_processing(&pool, uuid, 8888, &media_file.to_string_lossy(), "Mezzanine")
+        insert_processing(&pool, uuid, 8888, None, &media_file.to_string_lossy(), "Mezzanine")
             .await
             .unwrap();
         // Only a `ready` row's current_path points at a published mezzanine;
@@ -3068,7 +3167,7 @@ mod tests {
 
         // Old asset deleted 15 days ago
         let old_time = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
-        insert_processing(&pool, "old-asset", 111, "D:/target/old.mp4", "Old").await.unwrap();
+        insert_processing(&pool, "old-asset", 111, None, "D:/target/old.mp4", "Old").await.unwrap();
         sqlx::query("UPDATE media_assets SET deleted_at = ?1 WHERE uuid = 'old-asset'")
             .bind(&old_time)
             .execute(&pool)
@@ -3077,7 +3176,7 @@ mod tests {
 
         // Recent asset deleted 2 days ago
         let recent_time = (chrono::Utc::now() - chrono::Duration::days(2)).to_rfc3339();
-        insert_processing(&pool, "recent-asset", 222, "D:/target/recent.mp4", "Recent").await.unwrap();
+        insert_processing(&pool, "recent-asset", 222, None, "D:/target/recent.mp4", "Recent").await.unwrap();
         sqlx::query("UPDATE media_assets SET deleted_at = ?1 WHERE uuid = 'recent-asset'")
             .bind(&recent_time)
             .execute(&pool)
@@ -3113,14 +3212,14 @@ mod tests {
         let (pool, temp_dir) = setup_test_pool().await;
 
         // 1. Insert master clip
-        insert_processing(&pool, "asset-master", 1001, "D:/target/master.mp4", "Master 1").await.unwrap();
+        insert_processing(&pool, "asset-master", 1001, None, "D:/target/master.mp4", "Master 1").await.unwrap();
         mark_ready(&pool, "asset-master", "D:/target/master.mp4", 10000, true, 25.0, 25, 1, 250, 50, 0, &["warning1".into()], "[]").await.unwrap();
 
         // 2. Insert subclip
         create_subclip(&pool, "asset-sub", "asset-master", "Subclip 1", 1000, 5000, true, "[]").await.unwrap();
 
         // 3. Insert trashed asset
-        insert_processing(&pool, "asset-trashed", 1002, "D:/target/trashed.mp4", "Trashed 1").await.unwrap();
+        insert_processing(&pool, "asset-trashed", 1002, None, "D:/target/trashed.mp4", "Trashed 1").await.unwrap();
         trash_asset(&pool, "asset-trashed").await.unwrap();
 
         // 4. Test Overview
@@ -3188,6 +3287,158 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
+    // ---- T2-6: re-ingest must not destroy operator work (F-26) ----
+
+    /// Give `uuid` a `ready` row with an explicit trim window.
+    ///
+    /// `trim_out == duration` is the full-length case `mark_ready` writes;
+    /// anything narrower is a subclip an operator cut by hand.
+    async fn ready_row(
+        pool: &SqlitePool,
+        uuid: &str,
+        fingerprint: i64,
+        path: &str,
+        duration_ms: i64,
+        trim_in_ms: i64,
+        trim_out_ms: i64,
+    ) {
+        insert_processing(pool, uuid, fingerprint, None, path, uuid)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE media_assets SET status = 'ready', mezzanine_ok = 1, current_path = ?1,
+             duration_ms = ?2, trim_in_ms = ?3, trim_out_ms = ?4 WHERE uuid = ?5",
+        )
+        .bind(path)
+        .bind(duration_ms)
+        .bind(trim_in_ms)
+        .bind(trim_out_ms)
+        .bind(uuid)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[test]
+    fn a_trim_window_identifies_a_subclip() {
+        // Full length, two spellings: trim_out unset (legacy rows) and
+        // trim_out == duration (what mark_ready writes).
+        assert!(!is_subclip_row(0, 0, 10_000));
+        assert!(!is_subclip_row(0, 10_000, 10_000));
+        // Cuts.
+        assert!(is_subclip_row(500, 10_000, 10_000));
+        assert!(is_subclip_row(0, 4_000, 10_000));
+        assert!(is_subclip_row(1_000, 4_000, 10_000));
+    }
+
+    #[tokio::test]
+    async fn re_ingesting_a_parent_does_not_delete_its_subclips() {
+        let (pool, dir) = setup_test_pool().await;
+        let parent_file = dir.join("parent.mp4");
+
+        // The parent's mezzanine has gone missing -- the case that sends the
+        // processor down the purge path in the first place.
+        let fp = 777_001;
+        ready_row(
+            &pool,
+            "parent",
+            fp,
+            &parent_file.to_string_lossy(),
+            60_000,
+            0,
+            60_000,
+        )
+        .await;
+        // Subclips carry the PARENT's fingerprint. That is what made the old
+        // blanket DELETE destroy them.
+        ready_row(&pool, "clip-a", fp, "D:/target/clip-a.mp4", 60_000, 1_000, 5_000).await;
+        ready_row(&pool, "clip-b", fp, "D:/target/clip-b.mp4", 60_000, 0, 9_000).await;
+        // And a genuinely dead leftover, which should go.
+        insert_processing(&pool, "dead", fp, None, "D:/watch/x.mxf", "dead")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media_assets SET status = 'error' WHERE uuid = 'dead'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = purge_unusable_rows_by_fingerprint(&pool, fp, |p| {
+            std::path::Path::new(p).exists()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.deleted, 1, "only the failed-ingest row is deleted");
+        assert_eq!(
+            outcome.demoted, 1,
+            "the parent was ready but its file is gone -- demote, do not delete"
+        );
+        assert_eq!(outcome.protected, 2, "both subclips survive");
+
+        let survivors: Vec<(String, String)> =
+            sqlx::query_as("SELECT uuid, status FROM media_assets ORDER BY uuid")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<&str> = survivors.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(names, vec!["clip-a", "clip-b", "parent"]);
+
+        // The parent kept its row -- and therefore its rating, virtual folder
+        // and compliance metadata -- it just is not ready any more.
+        let parent_status = &survivors.iter().find(|(u, _)| u == "parent").unwrap().1;
+        assert_eq!(parent_status, "error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_ready_asset_whose_file_still_exists_is_never_purged() {
+        let (pool, dir) = setup_test_pool().await;
+        let file = dir.join("live.mp4");
+        std::fs::File::create(&file).unwrap();
+
+        let fp = 777_002;
+        ready_row(&pool, "live", fp, &file.to_string_lossy(), 1_000, 0, 1_000).await;
+
+        let outcome = purge_unusable_rows_by_fingerprint(&pool, fp, |p| {
+            std::path::Path::new(p).exists()
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(outcome, FingerprintPurge { deleted: 0, demoted: 0, protected: 1 });
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM media_assets")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn the_source_hash_round_trips_and_is_null_for_legacy_rows() {
+        let (pool, dir) = setup_test_pool().await;
+
+        insert_processing(&pool, "hashed", 1, Some("deadbeef"), "D:/w/a.mxf", "A")
+            .await
+            .unwrap();
+        insert_processing(&pool, "legacy", 2, None, "D:/w/b.mxf", "B")
+            .await
+            .unwrap();
+
+        let a = find_by_fingerprint(&pool, 1).await.unwrap().unwrap();
+        let b = find_by_fingerprint(&pool, 2).await.unwrap().unwrap();
+        assert_eq!(a.source_sha256.as_deref(), Some("deadbeef"));
+        assert_eq!(
+            b.source_sha256, None,
+            "a row with no stored hash must read back as None, which is what \
+             makes dedup refuse to confirm rather than guess"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }
 
 
@@ -3217,4 +3468,6 @@ mod rating_tests {
         assert!(!is_valid_rating("K|line\nbreak"));
         assert!(!is_valid_rating("NOT-A-RATING"));
     }
+
+
 }

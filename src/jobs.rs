@@ -56,13 +56,24 @@ pub enum JobPhase {
     CancelRequested,
     Cancelled,
     Recoverable,
+    /// Terminal, and **not** an error: the file was already ingested, confirmed
+    /// byte-identical to an existing asset, so no work was needed (T2-6).
+    ///
+    /// Before this existed the only terminal state reachable from a queued job
+    /// was `Failed`, so a duplicate was reported as a failure and PlayOut had
+    /// to key on `error_category` to avoid showing it as one. It maps to the
+    /// v1 `Completed` state, so the wire contract does not change.
+    Skipped,
 }
 
 impl JobPhase {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobPhase::Completed | JobPhase::Cancelled | JobPhase::Failed
+            JobPhase::Completed
+                | JobPhase::Cancelled
+                | JobPhase::Failed
+                | JobPhase::Skipped
         )
     }
 
@@ -80,6 +91,7 @@ impl JobPhase {
             JobPhase::CancelRequested => "cancel_requested",
             JobPhase::Cancelled => "cancelled",
             JobPhase::Recoverable => "recoverable",
+            JobPhase::Skipped => "skipped",
         }
     }
 
@@ -94,7 +106,9 @@ impl JobPhase {
             | JobPhase::Publishing
             | JobPhase::CancelRequested
             | JobPhase::Recoverable => JobState::Processing,
-            JobPhase::Completed => JobState::Completed,
+            // Deliberately `Completed`: no work was needed and nothing went
+            // wrong. A client that only reads `state` sees a job that finished.
+            JobPhase::Completed | JobPhase::Skipped => JobState::Completed,
             JobPhase::Failed => JobState::Failed,
             JobPhase::Cancelled => JobState::Cancelled,
         }
@@ -111,6 +125,7 @@ impl JobPhase {
                     | JobPhase::CancelRequested
                     | JobPhase::Cancelled
                     | JobPhase::Failed
+                    | JobPhase::Skipped
             ),
             JobPhase::Probing => matches!(
                 next,
@@ -119,6 +134,7 @@ impl JobPhase {
                     | JobPhase::Failed
                     | JobPhase::CancelRequested
                     | JobPhase::Cancelled
+                    | JobPhase::Skipped
             ),
             JobPhase::NormalizingAudio => matches!(
                 next,
@@ -162,6 +178,9 @@ impl JobPhase {
             ),
             JobPhase::CancelRequested => matches!(next, JobPhase::Cancelled | JobPhase::Failed),
             JobPhase::Failed => matches!(next, JobPhase::Queued),
+            // A skip is re-triable: the operator may have purged the asset that
+            // caused it, and then the file genuinely does need ingesting.
+            JobPhase::Skipped => matches!(next, JobPhase::Queued),
             JobPhase::Completed | JobPhase::Cancelled => false,
         }
     }
@@ -183,6 +202,7 @@ impl std::str::FromStr for JobPhase {
             "cancel_requested" => Ok(JobPhase::CancelRequested),
             "cancelled" => Ok(JobPhase::Cancelled),
             "recoverable" => Ok(JobPhase::Recoverable),
+            "skipped" => Ok(JobPhase::Skipped),
             other => Err(format!("Unknown JobPhase: {}", other)),
         }
     }

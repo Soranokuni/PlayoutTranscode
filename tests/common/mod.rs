@@ -332,6 +332,7 @@ pub async fn insert_ready_asset(
         pool,
         uuid,
         fingerprint,
+        None,
         &path.to_string_lossy(),
         display_name,
     )
