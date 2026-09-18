@@ -29,8 +29,17 @@
       </button>
     </div>
 
-    <nav class="tab-bar">
-      <button v-for="t in tabs" :key="t.id" :class="['tab-btn', { active: activeTab === t.id }]" @click="activeTab = t.id">
+    <nav class="tab-bar" role="tablist" aria-label="Sections" @keydown="onTabKeydown">
+      <button
+        v-for="t in tabs"
+        :id="`tab-${t.id}`"
+        :key="t.id"
+        role="tab"
+        :aria-selected="activeTab === t.id"
+        :tabindex="activeTab === t.id ? 0 : -1"
+        :class="['tab-btn', { active: activeTab === t.id }]"
+        @click="activeTab = t.id"
+      >
         {{ t.label }}
       </button>
     </nav>
@@ -84,12 +93,12 @@
             <div class="panel-header"><span class="panel-title text-accent">MEDIA PATHS</span></div>
             <p class="hint">Where source files arrive, and where finished mezzanine files go.</p>
             <div class="form-row">
-              <label>Watch Folder</label>
-              <input v-model="editWatchFolder" class="input" style="flex:1" placeholder="e.g. D:\media\incoming" />
+              <label for="f-watch-folder">Watch Folder</label>
+              <input id="f-watch-folder" v-model="editWatchFolder" class="input" style="flex:1" placeholder="e.g. D:\media\incoming" />
             </div>
             <div class="form-row">
-              <label>Target Folder</label>
-              <input v-model="editTargetFolder" class="input" style="flex:1" placeholder="e.g. D:\media\mezzanine" />
+              <label for="f-target-folder">Target Folder</label>
+              <input id="f-target-folder" v-model="editTargetFolder" class="input" style="flex:1" placeholder="e.g. D:\media\mezzanine" />
             </div>
           </div>
 
@@ -97,14 +106,14 @@
             <div class="panel-header"><span class="panel-title text-warning">QUALITY</span></div>
             <p class="hint">Higher CRF = smaller files, lower quality. Range 0-51. Defaults are broadcast-grade.</p>
             <div class="form-row">
-              <label>HD Progressive CRF</label>
-              <input type="range" min="18" max="51" v-model.number="editCrfA" />
+              <label for="f-hd-progressive-crf">HD Progressive CRF</label>
+              <input id="f-hd-progressive-crf" type="range" min="18" max="51" v-model.number="editCrfA" />
               <span class="mono">{{ editCrfA }}</span>
-              <label style="margin-left:16px">HD Interlaced CRF</label>
-              <input type="range" min="18" max="51" v-model.number="editCrfB" />
+              <label style="margin-left:16px" for="f-hd-interlaced-crf">HD Interlaced CRF</label>
+              <input id="f-hd-interlaced-crf" type="range" min="18" max="51" v-model.number="editCrfB" />
               <span class="mono">{{ editCrfB }}</span>
-              <label style="margin-left:16px">SD PAL CRF</label>
-              <input type="range" min="18" max="51" v-model.number="editCrfC" />
+              <label style="margin-left:16px" for="f-sd-pal-crf">SD PAL CRF</label>
+              <input id="f-sd-pal-crf" type="range" min="18" max="51" v-model.number="editCrfC" />
               <span class="mono">{{ editCrfC }}</span>
             </div>
           </div>
@@ -143,77 +152,77 @@
           <div class="panel config-section">
             <div class="panel-header"><span class="panel-title text-accent">FILE PATHS</span></div>
             <div class="form-row">
-              <label>Watch Folder</label>
-              <input v-model="editWatchFolder" class="input" style="flex:1" />
+              <label for="f-watch-folder-2">Watch Folder</label>
+              <input id="f-watch-folder-2" v-model="editWatchFolder" class="input" style="flex:1" />
             </div>
             <div class="form-row">
-              <label>Target Folder</label>
-              <input v-model="editTargetFolder" class="input" style="flex:1" />
+              <label for="f-target-folder-2">Target Folder</label>
+              <input id="f-target-folder-2" v-model="editTargetFolder" class="input" style="flex:1" />
             </div>
           </div>
 
           <div class="panel config-section">
             <div class="panel-header"><span class="panel-title text-warning">ENCODING</span></div>
             <div class="form-row">
-              <label>x264 Preset</label>
-              <select v-model="editPreset">
+              <label for="f-x264-preset">x264 Preset</label>
+              <select id="f-x264-preset" v-model="editPreset">
                 <option v-for="p in PRESETS" :key="p" :value="p">{{ p }}</option>
               </select>
-              <label style="margin-left:16px">Tune</label>
-              <select v-model="editTune">
+              <label style="margin-left:16px" for="f-tune">Tune</label>
+              <select id="f-tune" v-model="editTune">
                 <option v-for="t in TUNES" :key="t" :value="t">{{ t }}</option>
               </select>
-              <label style="margin-left:16px">Audio</label>
-              <select v-model="editAudioCodec">
+              <label style="margin-left:16px" for="f-audio">Audio</label>
+              <select id="f-audio" v-model="editAudioCodec">
                 <option v-for="a in AUDIO_CODECS" :key="a" :value="a">{{ a }}</option>
               </select>
             </div>
             <div class="form-row">
-              <label>Audio Bitrate</label>
-              <input v-model="editAudioBitrate" class="input" style="width:80px" />
+              <label for="f-audio-bitrate">Audio Bitrate</label>
+              <input id="f-audio-bitrate" v-model="editAudioBitrate" class="input" style="width:80px" />
             </div>
             <div class="form-row">
-              <label>Profile A CRF</label>
-              <input type="range" min="0" max="51" v-model.number="editCrfA" />
+              <label for="f-profile-a-crf">Profile A CRF</label>
+              <input id="f-profile-a-crf" type="range" min="0" max="51" v-model.number="editCrfA" />
               <span class="mono">{{ editCrfA }}</span>
-              <label style="margin-left:16px">Profile B CRF</label>
-              <input type="range" min="0" max="51" v-model.number="editCrfB" />
+              <label style="margin-left:16px" for="f-profile-b-crf">Profile B CRF</label>
+              <input id="f-profile-b-crf" type="range" min="0" max="51" v-model.number="editCrfB" />
               <span class="mono">{{ editCrfB }}</span>
-              <label style="margin-left:16px">Profile C CRF</label>
-              <input type="range" min="0" max="51" v-model.number="editCrfC" />
+              <label style="margin-left:16px" for="f-profile-c-crf">Profile C CRF</label>
+              <input id="f-profile-c-crf" type="range" min="0" max="51" v-model.number="editCrfC" />
               <span class="mono">{{ editCrfC }}</span>
             </div>
             <div class="form-row">
-              <label>CPU cores budget</label>
-              <input type="number" min="0" max="128" v-model.number="editCpuCores" class="input" style="width:70px" />
-              <span class="text-muted" style="font-size:11px">0 = auto (half of available cores). Split across concurrent encodes.</span>
+              <label for="f-cpu-cores-budget">CPU cores budget</label>
+              <input id="f-cpu-cores-budget" type="number" min="0" max="128" v-model.number="editCpuCores" class="input" style="width:70px" />
+              <span class="text-muted field-note">0 = auto (half of available cores). Split across concurrent encodes.</span>
             </div>
             <div class="form-row">
-              <label>Threads per encode</label>
-              <input type="number" min="0" max="128" v-model.number="editThreads" class="input" style="width:70px" />
-              <span class="text-muted" style="font-size:11px">0 = auto (cores ÷ max_concurrency). Non-zero overrides.</span>
+              <label for="f-threads-per-encode">Threads per encode</label>
+              <input id="f-threads-per-encode" type="number" min="0" max="128" v-model.number="editThreads" class="input" style="width:70px" />
+              <span class="text-muted field-note">0 = auto (cores ÷ max_concurrency). Non-zero overrides.</span>
             </div>
-            <div class="form-row" v-if="effectiveThreadsDisplay" style="font-size:11px;color:var(--accent-cyan)">
+            <div class="form-row thread-summary" v-if="effectiveThreadsDisplay">
               <span class="mono">{{ effectiveThreadsDisplay }}</span>
               <span v-if="oversubscribed" style="color:var(--accent-amber);margin-left:12px">⚠ oversubscribed vs {{ availableCores }} logical cores</span>
             </div>
             <div class="form-row">
-              <label>HD Maxrate</label>
-              <input v-model="editMaxrateAB" class="input" style="width:80px" />
-              <label style="margin-left:16px">HD Bufsize</label>
-              <input v-model="editBufsizeAB" class="input" style="width:80px" />
-              <label style="margin-left:16px">SD Maxrate</label>
-              <input v-model="editMaxrateC" class="input" style="width:80px" />
-              <label style="margin-left:16px">SD Bufsize</label>
-              <input v-model="editBufsizeC" class="input" style="width:80px" />
+              <label for="f-hd-maxrate">HD Maxrate</label>
+              <input id="f-hd-maxrate" v-model="editMaxrateAB" class="input" style="width:80px" />
+              <label style="margin-left:16px" for="f-hd-bufsize">HD Bufsize</label>
+              <input id="f-hd-bufsize" v-model="editBufsizeAB" class="input" style="width:80px" />
+              <label style="margin-left:16px" for="f-sd-maxrate">SD Maxrate</label>
+              <input id="f-sd-maxrate" v-model="editMaxrateC" class="input" style="width:80px" />
+              <label style="margin-left:16px" for="f-sd-bufsize">SD Bufsize</label>
+              <input id="f-sd-bufsize" v-model="editBufsizeC" class="input" style="width:80px" />
             </div>
           </div>
 
           <div class="panel config-section">
             <div class="panel-header"><span class="panel-title" style="color:var(--accent-emerald)">AUDIO NORMALIZATION &amp; QC</span></div>
             <div class="form-row">
-              <label>Loudness Mode</label>
-              <select v-model="editAudioMode">
+              <label for="f-loudness-mode">Loudness Mode</label>
+              <select id="f-loudness-mode" v-model="editAudioMode">
                 <option value="legacy_v1_encode">Legacy (Preserve / Pass-through)</option>
                 <option value="ebu_r128">EBU R128 (-23 LUFS / -1 dBTP / 7 LRA)</option>
                 <option value="atsc_a85">ATSC A/85 (-24 LUFS / -2 dBTP / 7 LRA)</option>
@@ -222,12 +231,12 @@
               </select>
             </div>
             <div class="form-row" v-if="editAudioMode === 'ebu_r128' || editAudioMode === 'atsc_a85'">
-              <label>Target LUFS</label>
-              <input type="number" step="0.5" v-model.number="editAudioTargetLufs" class="input" style="width:80px" :placeholder="editAudioMode === 'ebu_r128' ? '-23.0' : '-24.0'" />
-              <label style="margin-left:16px">True Peak (dBTP)</label>
-              <input type="number" step="0.5" v-model.number="editAudioTruePeak" class="input" style="width:80px" :placeholder="editAudioMode === 'ebu_r128' ? '-1.0' : '-2.0'" />
-              <label style="margin-left:16px">LRA Target</label>
-              <input type="number" step="0.5" v-model.number="editAudioLra" class="input" style="width:80px" placeholder="7.0" />
+              <label for="f-target-lufs">Target LUFS</label>
+              <input id="f-target-lufs" type="number" step="0.5" v-model.number="editAudioTargetLufs" class="input" style="width:80px" :placeholder="editAudioMode === 'ebu_r128' ? '-23.0' : '-24.0'" />
+              <label style="margin-left:16px" for="f-true-peak-dbtp">True Peak (dBTP)</label>
+              <input id="f-true-peak-dbtp" type="number" step="0.5" v-model.number="editAudioTruePeak" class="input" style="width:80px" :placeholder="editAudioMode === 'ebu_r128' ? '-1.0' : '-2.0'" />
+              <label style="margin-left:16px" for="f-lra-target">LRA Target</label>
+              <input id="f-lra-target" type="number" step="0.5" v-model.number="editAudioLra" class="input" style="width:80px" placeholder="7.0" />
             </div>
             <div class="form-row">
               <label class="checkbox-label">
@@ -240,18 +249,18 @@
           <div class="panel config-section">
             <div class="panel-header"><span class="panel-title" style="color:var(--text-secondary)">SERVICE</span></div>
             <div class="form-row">
-              <label>Max concurrent</label>
-              <input type="number" min="1" max="16" v-model.number="editConcurrency" class="input" style="width:70px" />
-              <label style="margin-left:16px">Poll interval (s)</label>
-              <input v-model="editPollSecs" class="input" style="width:70px" />
-              <label style="margin-left:16px">Settle time (s)</label>
-              <input v-model="editSettleSecs" class="input" style="width:70px" />
+              <label for="f-max-concurrent">Max concurrent</label>
+              <input id="f-max-concurrent" type="number" min="1" max="16" v-model.number="editConcurrency" class="input" style="width:70px" />
+              <label style="margin-left:16px" for="f-poll-interval-s">Poll interval (s)</label>
+              <input id="f-poll-interval-s" v-model="editPollSecs" class="input" style="width:70px" />
+              <label style="margin-left:16px" for="f-settle-time-s">Settle time (s)</label>
+              <input id="f-settle-time-s" v-model="editSettleSecs" class="input" style="width:70px" />
             </div>
             <div class="form-row">
-              <label>Stable polls</label>
-              <input type="number" min="1" max="20" v-model.number="editStablePolls" class="input" style="width:70px" />
-              <label style="margin-left:16px">Retry policy</label>
-              <select v-model="editRetryPolicy">
+              <label for="f-stable-polls">Stable polls</label>
+              <input id="f-stable-polls" type="number" min="1" max="20" v-model.number="editStablePolls" class="input" style="width:70px" />
+              <label style="margin-left:16px" for="f-retry-policy">Retry policy</label>
+              <select id="f-retry-policy" v-model="editRetryPolicy">
                 <option v-for="r in RETRY_POLICIES" :key="r" :value="r">{{ r }}</option>
               </select>
             </div>
@@ -260,26 +269,42 @@
                 <input type="checkbox" v-model="editAutoRetryOnStart" />
                 Auto-purge &amp; retry failed jobs on startup
               </label>
-              <span class="text-muted" style="font-size:11px">Purges error rows whose source is still in the watch folder; the watcher re-queues them.</span>
+              <span class="text-muted field-note">Purges error rows whose source is still in the watch folder; the watcher re-queues them.</span>
             </div>
             <div class="form-row">
-              <label>Max attempts</label>
-              <input type="number" min="1" max="10" v-model.number="editMaxAttempts" class="input" style="width:70px" />
-              <label style="margin-left:16px">Retry delay (ms)</label>
-              <input type="number" min="0" max="60000" v-model.number="editRetryDelayMs" class="input" style="width:90px" />
+              <label for="f-max-attempts">Max attempts</label>
+              <input id="f-max-attempts" type="number" min="1" max="10" v-model.number="editMaxAttempts" class="input" style="width:70px" />
+              <label style="margin-left:16px" for="f-retry-delay-ms">Retry delay (ms)</label>
+              <input id="f-retry-delay-ms" type="number" min="0" max="60000" v-model.number="editRetryDelayMs" class="input" style="width:90px" />
             </div>
             <div class="form-row" style="margin-top:8px">
               <label class="checkbox-label">
                 <input type="checkbox" v-model="editCleanSourceAfterSuccess" />
                 Delete source file after verified transcode &amp; publication
               </label>
-              <span class="text-muted" style="font-size:11px">Destructive opt-in: safely removed from watch folder only after QC pass and DB mark_ready.</span>
+              <span class="text-muted field-note">Destructive opt-in: safely removed from watch folder only after QC pass and DB mark_ready.</span>
             </div>
           </div>
 
-          <div style="display:flex;gap:12px;align-items:center;margin-top:16px">
-            <button class="btn btn-primary" style="padding:10px 32px;font-size:14px" @click="saveConfig">Save Configuration</button>
-            <span v-if="saveMsg" :class="['save-msg', saveOk ? 'save-ok' : 'save-err']">{{ saveMsg }}</span>
+          <div class="config-actions">
+            <button
+              class="btn btn-primary btn-save"
+              :disabled="saving"
+              @click="saveConfig"
+            >{{ saving ? 'Saving…' : 'Save Configuration' }}</button>
+            <button v-if="configDirty" class="btn btn-discard" :disabled="saving" @click="discardChanges">
+              Discard changes
+            </button>
+            <span v-if="configDirty" class="dirty-chip">Unsaved changes</span>
+            <span class="text-muted config-hint">Ctrl+S saves</span>
+            <!-- The result used to vanish after 4 s even if the operator had
+                 looked away; it now stays until the next edit (UX-06). -->
+            <span
+              v-if="saveMsg"
+              :class="['save-msg', saveOk ? 'save-ok' : 'save-err']"
+              role="status"
+              aria-live="polite"
+            >{{ saveMsg }}</span>
           </div>
         </div>
 
@@ -288,15 +313,41 @@
         </div>
 
         <div v-if="activeTab === 'logs'" class="tab-panel">
-          <div class="panel" style="padding:12px;display:flex;flex-direction:column;height:calc(100vh - 220px)">
-            <div style="display:flex;gap:8px;margin-bottom:8px">
-              <button class="btn" style="font-size:12px" @click="clearLogs">Clear</button>
-              <span class="text-muted" style="font-size:12px;line-height:28px">{{ logs.length }} entries</span>
+          <div class="panel log-panel">
+            <div class="log-toolbar">
+              <div class="log-filters" role="group" aria-label="Log level filter">
+                <button
+                  v-for="f in LOG_FILTERS"
+                  :key="f.id"
+                  class="btn log-chip"
+                  :class="{ active: logFilter === f.id }"
+                  :aria-pressed="logFilter === f.id"
+                  @click="logFilter = f.id"
+                >{{ f.label }}</button>
+              </div>
+              <button
+                class="btn log-chip"
+                :class="{ active: logPaused }"
+                :aria-pressed="logPaused"
+                @click="logPaused = !logPaused"
+              >{{ logPaused ? '▶ Resume' : '⏸ Pause' }}</button>
+              <button class="btn log-chip" @click="clearLogs">Clear</button>
+              <span class="text-muted log-count mono">{{ visibleLogLines.length }} / {{ logLines.length }}</span>
             </div>
-            <div class="log-viewer" ref="logViewerRef">
-              <div v-if="!logs.length" class="text-muted" style="padding:20px;text-align:center">No log entries</div>
-              <div v-for="line in logLines" :key="line.seq" class="log-line" :class="logLevel(line.text)">{{ line.text }}</div>
+            <div class="log-viewer" ref="logViewerRef" @scroll="onLogScroll">
+              <div v-if="!visibleLogLines.length" class="text-muted log-empty">No log entries</div>
+              <div
+                v-for="line in visibleLogLines"
+                :key="line.seq"
+                class="log-line"
+                :class="logLevel(line.text)"
+              >{{ line.text }}</div>
             </div>
+            <!-- An operator scrolled up to read an error used to be yanked
+                 back to the bottom every 2 s (UX-05). -->
+            <button v-if="newLineCount > 0" class="log-jump" @click="jumpToLatest">
+              {{ newLineCount }} new line{{ newLineCount === 1 ? '' : 's' }} ↓
+            </button>
           </div>
         </div>
       </template>
@@ -316,7 +367,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted, computed, defineAsyncComponent } from 'vue'
+import { ref, watch, nextTick, onMounted, onUnmounted, computed, defineAsyncComponent } from 'vue'
 import { useEventStream, type ConfigPayload } from './composables/useEventStream'
 import BroadcastTopBar from './components/BroadcastTopBar.vue'
 import IngestQueuePanel from './components/IngestQueuePanel.vue'
@@ -551,6 +602,61 @@ async function onRetryAll() {
   ingestPanelRef.value?.showRetryMsg(msg, ok)
 }
 
+const LOG_FILTERS = [
+  { id: 'all', label: 'All' },
+  { id: 'warn', label: 'Warn' },
+  { id: 'error', label: 'Error' },
+  { id: 'audit', label: 'Audit' },
+] as const
+type LogFilter = (typeof LOG_FILTERS)[number]['id']
+
+const logFilter = ref<LogFilter>('all')
+const logPaused = ref(false)
+/** Snapshot held while paused, so the view does not move under the operator. */
+const frozenLines = ref<{ seq: number; text: string }[]>([])
+const stickToBottom = ref(true)
+const newLineCount = ref(0)
+
+const visibleLogLines = computed(() => {
+  const source = logPaused.value ? frozenLines.value : logLines.value
+  if (logFilter.value === 'all') return source
+  if (logFilter.value === 'audit') {
+    return source.filter((l) => l.text.includes('[AUDIT]') || l.text.includes('audit'))
+  }
+  return source.filter((l) => logLevel(l.text) === logFilter.value)
+})
+
+watch(logPaused, (paused) => {
+  frozenLines.value = paused ? logLines.value.slice() : []
+  if (!paused) {
+    newLineCount.value = 0
+    void nextTick(scrollLogsToBottom)
+  }
+})
+
+/** Within a couple of lines of the bottom counts as "following". */
+const STICK_THRESHOLD_PX = 24
+
+function onLogScroll() {
+  const el = logViewerRef.value
+  if (!el) return
+  const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+  stickToBottom.value = distance <= STICK_THRESHOLD_PX
+  if (stickToBottom.value) newLineCount.value = 0
+}
+
+function scrollLogsToBottom() {
+  const el = logViewerRef.value
+  if (el) el.scrollTop = el.scrollHeight
+}
+
+function jumpToLatest() {
+  logPaused.value = false
+  stickToBottom.value = true
+  newLineCount.value = 0
+  void nextTick(scrollLogsToBottom)
+}
+
 function logLevel(line: string): string {
   if (line.includes('[ERROR]') || line.includes('error:')) return 'error'
   if (line.includes('[WARN]')) return 'warn'
@@ -592,6 +698,39 @@ function populateFromConfig(cfg: ConfigPayload) {
   }
   availableCores.value = cfg.system?.available_logical_cores ?? 0
   recomputeThreads()
+  loadedSnapshot.value = editSnapshot()
+}
+
+/**
+ * The values as last loaded from the service, for comparison.
+ *
+ * `watch(config, populateFromConfig)` overwrote every edit field whenever
+ * `config` changed -- a tab switch, any future refresh -- silently discarding
+ * unsaved work (UX-06).
+ */
+const loadedSnapshot = ref('')
+
+/** Everything the Configuration tab can change, in a stable order. */
+function editSnapshot(): string {
+  return JSON.stringify([
+    editWatchFolder.value, editTargetFolder.value, editPreset.value, editTune.value,
+    editAudioCodec.value, editAudioBitrate.value,
+    editCrfA.value, editCrfB.value, editCrfC.value,
+    editMaxrateAB.value, editBufsizeAB.value, editMaxrateC.value, editBufsizeC.value,
+    editConcurrency.value, editPollSecs.value, editSettleSecs.value, editStablePolls.value,
+    editRetryPolicy.value, editThreads.value, editCpuCores.value,
+    editAutoRetryOnStart.value, editMaxAttempts.value, editRetryDelayMs.value,
+    editCleanSourceAfterSuccess.value,
+    editAudioMode.value, editAudioTargetLufs.value, editAudioTruePeak.value,
+    editAudioLra.value, editAudioDualMono.value,
+  ])
+}
+
+const configDirty = computed(() => editSnapshot() !== loadedSnapshot.value)
+const saving = ref(false)
+
+function discardChanges() {
+  if (config.value) populateFromConfig(config.value)
 }
 
 async function loadAndDecideWizard() {
@@ -606,6 +745,8 @@ async function loadAndDecideWizard() {
 }
 
 async function saveConfig() {
+  if (saving.value) return
+  saving.value = true
   saveMsg.value = ''
   saveOk.value = false
   try {
@@ -646,14 +787,17 @@ async function saveConfig() {
         clean_source_after_success: editCleanSourceAfterSuccess.value,
       },
     } as unknown as Partial<ConfigPayload>)
-    saveMsg.value = 'Configuration saved successfully'
+    saveMsg.value = 'Configuration saved'
     saveOk.value = true
     showWizard.value = false
-    setTimeout(() => { saveMsg.value = '' }, 4000)
+    loadedSnapshot.value = editSnapshot()
   } catch (e: unknown) {
+    // A 422 from put_config carries `{"error": …}`; apiPut already unwraps it.
     const msg = e instanceof Error ? e.message : String(e)
     saveMsg.value = `Failed to save: ${msg}`
     saveOk.value = false
+  } finally {
+    saving.value = false
   }
 }
 
@@ -691,14 +835,66 @@ watch(activeTab, (tab) => {
 watch([editThreads, editCpuCores, editConcurrency], recomputeThreads)
 
 watch(config, (cfg) => {
-  if (cfg) populateFromConfig(cfg)
+  // Never overwrite edits that have not been saved. "Discard changes" is how
+  // an operator asks for the loaded values back.
+  if (cfg && !configDirty.value) populateFromConfig(cfg)
 })
 
-watch(logs, async (newLogs) => {
-  await nextTick()
-  if (newLogs.length && logViewerRef.value) {
-    logViewerRef.value.scrollTop = logViewerRef.value.scrollHeight
+// Keyboard-first: Ctrl+S saves the Configuration tab.
+function onGlobalKeydown(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    if (activeTab.value !== 'config' || showWizard.value) return
+    e.preventDefault()
+    void saveConfig()
   }
+}
+
+function onBeforeUnload(e: BeforeUnloadEvent) {
+  if (!configDirty.value) return
+  e.preventDefault()
+  // Chrome ignores the string but needs returnValue set to show its own prompt.
+  e.returnValue = ''
+}
+
+/** Arrow-key navigation across the tab bar, as a tablist is expected to have. */
+function onTabKeydown(e: KeyboardEvent) {
+  const index = tabs.findIndex((t) => t.id === activeTab.value)
+  let next = index
+  if (e.key === 'ArrowRight') next = (index + 1) % tabs.length
+  else if (e.key === 'ArrowLeft') next = (index - 1 + tabs.length) % tabs.length
+  else if (e.key === 'Home') next = 0
+  else if (e.key === 'End') next = tabs.length - 1
+  else return
+  e.preventDefault()
+  const target = tabs[next]
+  if (!target) return
+  activeTab.value = target.id
+  void nextTick(() => {
+    document.getElementById(`tab-${target.id}`)?.focus()
+  })
+}
+
+onMounted(() => {
+  window.addEventListener('keydown', onGlobalKeydown)
+  window.addEventListener('beforeunload', onBeforeUnload)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', onGlobalKeydown)
+  window.removeEventListener('beforeunload', onBeforeUnload)
+})
+
+// Follow the tail only if the operator was already at the tail. Forcing
+// scrollTop = scrollHeight on every update yanked anyone reading an error back
+// to the bottom every 2 s (UX-05).
+watch(logLines, async (lines, previous) => {
+  const added = Math.max(0, lines.length - (previous?.length ?? 0))
+  if (logPaused.value || !stickToBottom.value) {
+    newLineCount.value += added
+    return
+  }
+  await nextTick()
+  scrollLogsToBottom()
 })
 </script>
 
@@ -867,7 +1063,7 @@ watch(logs, async (newLogs) => {
 }
 
 .hint {
-  font-size: 12px;
+  font-size: 12.5px;
   color: var(--text-secondary);
   margin-bottom: 10px;
 }
@@ -907,4 +1103,104 @@ watch(logs, async (newLogs) => {
 .log-line.error { color: var(--accent-crimson); }
 .log-line.warn { color: var(--accent-amber); }
 .log-line.success { color: var(--accent-emerald); }
+
+.log-panel {
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 220px);
+  position: relative;
+}
+
+.log-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.log-filters {
+  display: flex;
+  gap: 4px;
+}
+
+.log-chip {
+  font-size: 12px;
+  padding: 4px 12px;
+}
+
+.log-chip.active {
+  border-color: var(--accent-cyan);
+  color: var(--accent-cyan);
+}
+
+.log-count {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.log-empty {
+  padding: 20px;
+  text-align: center;
+}
+
+.log-jump {
+  position: absolute;
+  right: 24px;
+  bottom: 22px;
+  padding: 5px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--bg-primary);
+  background: var(--accent-cyan);
+  border: none;
+  border-radius: 14px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+}
+
+.config-actions {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+.btn-save {
+  padding: 10px 32px;
+  font-size: 14px;
+}
+
+.btn-discard {
+  padding: 8px 18px;
+  font-size: 13px;
+}
+
+.dirty-chip {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-amber);
+  background: rgba(245, 166, 35, 0.1);
+  padding: 4px 10px;
+  border-radius: 4px;
+}
+
+/* Explanatory text beside a field. 11px was unreadable on an MCR monitor at
+   arm's length; 12px keeps it secondary without being a squint. */
+.field-note {
+  font-size: 12px;
+}
+
+.thread-summary {
+  font-size: 12px;
+  color: var(--accent-cyan);
+  font-variant-numeric: tabular-nums;
+}
+
+.config-hint {
+  /* 11px was too small to read on an MCR monitor at arm's length. */
+  font-size: 12px;
+}
 </style>

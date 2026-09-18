@@ -12,7 +12,13 @@
         <span v-if="retryingAll">Retrying…</span>
         <span v-else>Retry all failed ({{ failed.length }})</span>
       </button>
-      <span v-if="retryMsg" class="retry-msg" :class="retryOk ? 'ok' : 'err'">{{ retryMsg }}</span>
+      <span
+        v-if="retryMsg"
+        class="retry-msg"
+        :class="retryOk ? 'ok' : 'err'"
+        role="status"
+        aria-live="polite"
+      >{{ retryMsg }}</span>
     </div>
 
     <div v-if="!processing.length && !failed.length" class="empty">
