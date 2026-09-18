@@ -1,7 +1,8 @@
 # PlayoutTranscode — client integration guide for PlayOut
 
 **Audience:** whoever is changing the PlayOut (Tauri/Vue) client.
-**Service version:** 1.0.0, `main` @ `2ea33a3`, 2026-09-18.
+**Service version:** 1.0.0, PR #1 (`remediation/tier-2-and-3`) @ `be843ad`,
+2026-09-18.
 **Status of this document:** complete and current. It supersedes
 `docs/audit-2026-09-15/PLAYOUT-CLIENT-CHANGES.md`, which was written
 incrementally as each remediation step landed and is now only useful as history.
@@ -294,6 +295,17 @@ The three `db_*` / `sidecar_*` categories mean an encoded file exists in
 `<target>\quarantine\` that nothing references. An operator needs to know that,
 because the work was done and only the bookkeeping failed.
 
+> **If you have ever seen `path_outside_watch_folder` for a file that was
+> plainly inside the watch folder, that was a bug and it is fixed.** The
+> containment check compared the input path against the watch root, and a file
+> deleted between the watcher offering it and the worker picking it up could not
+> be resolved to the same spelling — so it was reported as a path-traversal
+> attempt rather than a missing source. It only misfired where the environment's
+> spelling of a directory differs from its canonical one (8.3 short names,
+> junctions, mapped drives), which is why it survived so long. Those cases now
+> correctly report `fingerprint_failure`. If you special-cased or suppressed
+> `path_outside_watch_folder`, you can stop.
+
 ### 5.3 A duplicate is no longer reported as a failure
 
 An earlier step reported a skipped duplicate as `state: "Failed"` with
@@ -420,6 +432,19 @@ guarantee behind your client-side validation.
 ### 7.5 `folder_path` is validated and `LIKE`-escaped
 
 `/%` returns 422 instead of matching the entire library.
+
+### 7.6 Media roots cannot be system or profile directories
+
+Not a PlayOut concern today — you do not call `PUT /api/config` — but if you
+ever add an ingest-settings screen that writes the watch or target folder, know
+that `C:\`, `C:\Users`, `C:\Users\<name>`, `C:\Windows`, `C:\Program Files`,
+`%ProgramData%` and the service's own data directory are all refused with 422.
+A folder *inside* a profile (`C:\Users\op\Media\Ingest`) is fine — that is
+where most people keep media.
+
+The reason is blunt: `clean_source_after_success` deletes sources after a
+successful encode, so a watch folder pointed at a profile container was a
+remote-driven mass-deletion primitive (F-03).
 
 ---
 
@@ -593,7 +618,34 @@ from the media files.
 `POST /api/db/backup` takes one on demand (token required, no confirmation
 header). `GET /api/db/overview` lists them.
 
-### 9.6 Disk preflight is sized from the job
+### 9.6 A green status light does not prove ingest is running
+
+Worth knowing because it is a support call PlayOut fields, not the service.
+
+`/api/health` answers 200 as soon as the HTTP server is up. That is deliberate —
+it is how PlayOut's status light works before anything is configured — but it
+means a **green light only says the service is reachable**, not that the
+processing loop is running. The two are separate, and
+`GET /api/service/status` is what distinguishes them:
+
+```json
+{ "running": true, "state": "running", "generation": 1, "restart_required": false }
+```
+
+This mattered because of a bug now fixed: a `config.toml` missing an optional
+section (`[server]` or `[encoding]`) failed validation, and the auto-start path
+only runs when validation succeeds — and reported the failure to the web UI's
+log panel rather than the service log. So the service started, answered health,
+showed green, and silently ingested nothing, with nothing in the log to explain
+it. Any partial config file could trigger it, and the README documents which
+sections are optional, so partial files are normal.
+
+**If you surface ingest status at all, read `state` from
+`/api/service/status`, not just `/api/health`.** An operator reporting "it says
+it is running but nothing is being transcoded" is answered instantly by that
+field, and not at all by the health endpoint.
+
+### 9.7 Disk preflight is sized from the job
 
 The preflight was a flat 500 MB for every job. A two-hour feature at 15 Mbit/s
 needs about 16.5 GB; it passed the check, encoded for an hour, and died on
