@@ -114,10 +114,12 @@ const eta = computed(() => {
 
 .progress-eta {
   color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
 }
 
 .progress-speed {
   color: var(--accent-cyan);
   font-weight: 500;
+  font-variant-numeric: tabular-nums;
 }
 </style>

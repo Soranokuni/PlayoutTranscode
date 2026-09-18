@@ -1,5 +1,3 @@
-@import url('https://fonts.googleapis.com/css2?family=Inter:ital,opsz,wght@0,14..32,100..900;1,14..32,100..900&display=swap');
-
 :root {
   --bg-primary: #0C0D0F;
   --bg-secondary: #16171A;
@@ -39,7 +37,7 @@ html, body, #app {
   min-height: 100vh;
   background: var(--bg-primary);
   color: var(--text-primary);
-  font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   font-size: 14px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
@@ -158,6 +156,10 @@ input[type="range"] {
 .mono {
   font-family: 'Cascadia Code', 'Consolas', monospace;
   font-size: 12px;
+  /* Timecodes, percentages and ETAs tick at 4 Hz; proportional digits make
+     them jitter sideways on every frame. */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
 }
 
 .status-dot {
