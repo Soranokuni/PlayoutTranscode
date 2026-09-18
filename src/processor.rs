@@ -538,6 +538,103 @@ pub fn process_file_sync_with_runner_and_measurer(
     }
 }
 
+/// Where a mezzanine goes when the registry will not accept it (T2-8).
+///
+/// Not a temp directory and not the bin: an operator has to be able to find it
+/// and decide. The name is preserved so it is obvious what the file was.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
+/// Retry a fallible blocking operation with a fixed backoff.
+///
+/// `op` receives the 1-based attempt number. Returns the first success, or the
+/// last error once `attempts` have been spent.
+fn retry_blocking<T, E: std::fmt::Display>(
+    attempts: u32,
+    backoff: std::time::Duration,
+    what: &str,
+    mut op: impl FnMut(u32) -> Result<T, E>,
+) -> Result<T, E> {
+    let attempts = attempts.max(1);
+    let mut last: Option<E> = None;
+    for attempt in 1..=attempts {
+        match op(attempt) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < attempts {
+                    tracing::warn!(
+                        "{} failed on attempt {}/{}: {} -- retrying in {}ms",
+                        what,
+                        attempt,
+                        attempts,
+                        e,
+                        backoff.as_millis()
+                    );
+                    std::thread::sleep(backoff);
+                }
+                last = Some(e);
+            }
+        }
+    }
+    // `attempts >= 1`, so the loop ran and `last` is populated on this path.
+    Err(last.expect("retry_blocking ran at least one attempt"))
+}
+
+/// Move a published mezzanine out of the library into `<target>/quarantine/`.
+///
+/// Called when the file encoded fine but the registry would not record it. It
+/// must not stay in `videos/`: nothing references it, the next ingest of the
+/// same source would collide with it, and a listing built from the filesystem
+/// rather than the registry would show an asset PlayOut cannot resolve.
+///
+/// Returns where the file ended up. A name collision in `quarantine/` is
+/// resolved by suffixing, because a repeated failure must not overwrite the
+/// evidence from the first one.
+fn quarantine_published(
+    target_root: &Path,
+    published: &Path,
+) -> Result<std::path::PathBuf, String> {
+    let dir = target_root.join(QUARANTINE_DIR);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("cannot create the quarantine directory: {}", e))?;
+
+    let file_name = published
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unnamed".to_string());
+
+    let mut dest: std::path::PathBuf = dir.join(&file_name);
+    if dest.exists() {
+        let stem = published
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "unnamed".into());
+        let ext = published
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        for n in 1..1000 {
+            let candidate = dir.join(format!("{}.{}{}", stem, n, ext));
+            if !candidate.exists() {
+                dest = candidate;
+                break;
+            }
+        }
+    }
+
+    // Same volume, so a rename is atomic and cheap. Fall back to copy+delete
+    // only if it is not (a target folder spanning volumes is unsupported, but
+    // losing the file over it would be worse than a slow move).
+    match std::fs::rename(published, &dest) {
+        Ok(()) => Ok(dest),
+        Err(_) => {
+            std::fs::copy(published, &dest)
+                .map_err(|e| format!("cannot move the file to quarantine: {}", e))?;
+            let _ = std::fs::remove_file(published);
+            Ok(dest)
+        }
+    }
+}
+
 /// Is a sampled-fingerprint match a *real* duplicate?
 ///
 /// The sampled fingerprint is a prefilter, never a verdict — see
@@ -814,11 +911,24 @@ fn process_file_inner(
         &input_path.to_string_lossy(),
         &raw_stem,
     )) {
+        // This used to log and carry on, which is F-18 at its worst: the encode
+        // ran to completion, wrote a mezzanine into the library, and then
+        // `mark_ready` updated a row that had never been inserted -- zero rows
+        // affected, `Ok(())`. The result was a published file no registry knew
+        // about, and therefore an hour of CPU spent on an asset PlayOut could
+        // never see. Fail here instead, before any of that work happens.
         tracing::error!(
-            "DB insert processing failed for {}: {}",
+            "DB insert processing failed for {}: {} -- refusing to transcode a file \
+             the registry has no row for",
             input_path.display(),
             e
         );
+        publisher.cleanup_staging(&staged_output_path);
+        close_job(
+            "db_insert_failed",
+            "Could not create the registry entry for this file",
+        );
+        return;
     }
 
     // Reuse the adopted record where there is one. Creating a fresh JobRecord
@@ -1246,6 +1356,56 @@ fn process_file_inner(
                 },
             );
 
+            // Everything after a successful `publish` that can still fail has
+            // the same remedy: get the orphaned mezzanine out of the library,
+            // drop its sidecar, mark the row `error` and fail the job visibly
+            // (T2-8). Leaving it in `videos/` is the silent loss F-18 is about.
+            let fail_after_publish = |category: &str, message: &str| {
+                match quarantine_published(target_root, &final_output_path) {
+                    Ok(dest) => tracing::error!(
+                        "Quarantined {} -> {} ({})",
+                        final_output_path.display(),
+                        dest.display(),
+                        category
+                    ),
+                    Err(e) => tracing::error!(
+                        "Could not quarantine {}: {} -- it is still in the library and \
+                         nothing references it",
+                        final_output_path.display(),
+                        e
+                    ),
+                }
+                let sidecar = identity::sidecar_path_for(&final_output_path);
+                if sidecar.exists() {
+                    if let Err(e) = std::fs::remove_file(&sidecar) {
+                        tracing::warn!("Could not remove {}: {}", sidecar.display(), e);
+                    }
+                }
+                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                let msg = message.to_string();
+                let cat = category.to_string();
+                let _ = queue.transition(
+                    &job.id,
+                    jobs::JobPhase::Failed,
+                    Some("Failed".into()),
+                    |j| {
+                        j.error = Some(msg);
+                        j.error_category = Some(cat);
+                    },
+                );
+                queue.broadcast(
+                    "failed",
+                    &serde_json::json!({
+                        "id": job.id,
+                        "uuid": metadata_uuid,
+                        "error": message,
+                        "error_category": category,
+                    })
+                    .to_string(),
+                );
+                queue.prune_old(500);
+            };
+
             let sha256 = compute_file_sha256(&staged_output_path).ok();
             let file_size_bytes = std::fs::metadata(&staged_output_path).ok().map(|m| m.len());
 
@@ -1321,31 +1481,69 @@ fn process_file_inner(
                 sha256,
                 file_size_bytes,
             ) {
+                // Used to log and continue to `mark_ready`, which published a
+                // `ready` asset with no sidecar -- and the sidecar is the
+                // contract PlayOut hydrates from, so the asset was broken in a
+                // way only PlayOut would discover (F-18). Quarantine it.
                 tracing::error!(
                     "Failed to write metadata sidecar for '{}': {}",
                     final_output_path.display(),
                     e
                 );
+                fail_after_publish(
+                    "sidecar_write_failed",
+                    "The mezzanine encoded but its sidecar could not be written",
+                );
+                return;
             }
 
             let keyframe_offsets_json =
                 serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
 
-            let _ = handle.block_on(db::mark_ready(
-                pool,
-                &metadata_uuid,
-                &final_output_path.to_string_lossy(),
-                duration_ms,
-                mezzanine_ok,
-                fps,
-                output_probe.fps_num,
-                output_probe.fps_den,
-                total_frames,
-                gop_frames,
-                keyframe_safe_start_ms,
-                &warnings_list,
-                &keyframe_offsets_json,
-            ));
+            // Retried, because this is the last write of a job that may have
+            // cost an hour of CPU and a transient `database is locked` must not
+            // throw it away.
+            let ready = retry_blocking(
+                3,
+                std::time::Duration::from_millis(500),
+                "mark_ready",
+                |_| {
+                    handle.block_on(db::mark_ready(
+                        pool,
+                        &metadata_uuid,
+                        &final_output_path.to_string_lossy(),
+                        duration_ms,
+                        mezzanine_ok,
+                        fps,
+                        output_probe.fps_num,
+                        output_probe.fps_den,
+                        total_frames,
+                        gop_frames,
+                        keyframe_safe_start_ms,
+                        &warnings_list,
+                        &keyframe_offsets_json,
+                    ))
+                },
+            );
+
+            if let Err(e) = ready {
+                // The file is encoded, validated and published, and the
+                // registry will not record it. `let _ =` here left exactly that
+                // on disk: a mezzanine in `videos/` that nothing references,
+                // which the next ingest of the same source would collide with.
+                tracing::error!(
+                    uuid = %metadata_uuid,
+                    path = %final_output_path.display(),
+                    "mark_ready failed after 3 attempts: {} -- quarantining the mezzanine",
+                    e
+                );
+                fail_after_publish(
+                    "db_mark_ready_failed",
+                    "The mezzanine encoded but the registry could not record it",
+                );
+                return;
+            }
+
             let _ = queue.transition(
                 &job.id,
                 jobs::JobPhase::Completed,
@@ -2299,6 +2497,124 @@ mod tests {
             "a terminal job must carry a finish time"
         );
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- T2-8: a publish that the registry refuses must not leave the file ----
+
+    #[test]
+    fn retry_blocking_returns_the_first_success() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<&str, String> = retry_blocking(
+            3,
+            std::time::Duration::from_millis(0),
+            "test",
+            |attempt| {
+                calls.set(calls.get() + 1);
+                if attempt < 2 {
+                    Err("locked".to_string())
+                } else {
+                    Ok("ok")
+                }
+            },
+        );
+        assert_eq!(out.unwrap(), "ok");
+        assert_eq!(calls.get(), 2, "must stop as soon as it succeeds");
+    }
+
+    #[test]
+    fn retry_blocking_surfaces_the_last_error_after_exhausting_attempts() {
+        let calls = std::cell::Cell::new(0u32);
+        let out: Result<(), String> = retry_blocking(
+            3,
+            std::time::Duration::from_millis(0),
+            "test",
+            |attempt| {
+                calls.set(calls.get() + 1);
+                Err(format!("failure {}", attempt))
+            },
+        );
+        assert_eq!(calls.get(), 3);
+        assert_eq!(
+            out.unwrap_err(),
+            "failure 3",
+            "the caller needs the most recent error, not the first"
+        );
+    }
+
+    #[test]
+    fn retry_blocking_always_runs_at_least_once() {
+        let calls = std::cell::Cell::new(0u32);
+        let _: Result<(), String> = retry_blocking(0, std::time::Duration::from_millis(0), "t", |_| {
+            calls.set(calls.get() + 1);
+            Err("e".into())
+        });
+        assert_eq!(calls.get(), 1, "zero attempts must not mean zero work");
+    }
+
+    fn quarantine_fixture(name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "pt-quar-{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("videos")).unwrap();
+        root
+    }
+
+    #[test]
+    fn an_orphaned_mezzanine_is_moved_out_of_the_library() {
+        let root = quarantine_fixture("move");
+        let published = root.join("videos").join("programme.mp4");
+        std::fs::write(&published, b"mezzanine").unwrap();
+
+        let dest = quarantine_published(&root, &published).expect("quarantine");
+
+        assert!(!published.exists(), "it must not stay where PlayOut looks");
+        assert!(dest.exists());
+        assert_eq!(dest.parent().unwrap(), root.join(QUARANTINE_DIR));
+        assert_eq!(
+            dest.file_name().unwrap(),
+            "programme.mp4",
+            "the name is preserved so an operator can tell what it was"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), b"mezzanine");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_repeated_failure_does_not_overwrite_the_first_ones_evidence() {
+        let root = quarantine_fixture("collide");
+        let videos = root.join("videos");
+
+        std::fs::write(videos.join("clip.mp4"), b"first").unwrap();
+        let a = quarantine_published(&root, &videos.join("clip.mp4")).unwrap();
+
+        std::fs::write(videos.join("clip.mp4"), b"second").unwrap();
+        let b = quarantine_published(&root, &videos.join("clip.mp4")).unwrap();
+
+        assert_ne!(a, b, "the second must not land on the first");
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn quarantining_creates_the_directory_on_first_use() {
+        let root = quarantine_fixture("mkdir");
+        assert!(!root.join(QUARANTINE_DIR).exists());
+
+        let published = root.join("videos").join("x.mp4");
+        std::fs::write(&published, b"x").unwrap();
+        quarantine_published(&root, &published).unwrap();
+
+        assert!(root.join(QUARANTINE_DIR).is_dir());
         let _ = std::fs::remove_dir_all(&root);
     }
 
