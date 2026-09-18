@@ -120,7 +120,14 @@ fn forbidden_roots() -> Vec<(String, bool)> {
             }
         }
     }
-    for var in ["ProgramData", "USERPROFILE", "PUBLIC"] {
+    // `HOME` is here for the same reason as `USERPROFILE`: `watch_folder=/home`
+    // with `clean_source_after_success` is the same mass-deletion primitive as
+    // `watch_folder=C:\Users`. This list was Windows-only, which left the rule
+    // inert on any non-Windows host even though `forbidden_roots` already
+    // carries a `/bin`, `/etc`, `/usr` branch -- inconsistent with its own
+    // intent, and the reason `config_patch_pointing_at_a_system_root_is_rejected`
+    // returned 200 on Linux CI.
+    for var in ["ProgramData", "USERPROFILE", "PUBLIC", "HOME"] {
         if let Ok(v) = std::env::var(var) {
             if !v.trim().is_empty() {
                 let norm = normalize_dir(Path::new(&v));
@@ -1787,6 +1794,52 @@ mod validation_tests {
         let dir = tmp_dir("baseline");
         assert_eq!(good_config(&dir).validate(), Ok(()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The profile container must be refused on every platform.
+    ///
+    /// `PUT /api/config` reaches `validate_media_root`, and
+    /// `clean_source_after_success` deletes sources after a successful encode,
+    /// so `watch_folder` pointed at the directory that holds every user's home
+    /// is a remote-driven mass-deletion primitive (F-03). The rule existed but
+    /// consulted only Windows environment variables, so it did nothing on a
+    /// non-Windows host -- caught by CI, not by any local run.
+    #[test]
+    fn the_profile_container_is_refused_on_this_platform() {
+        let profile = std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok());
+        let Some(profile) = profile else {
+            // Neither variable set (a bare container). Nothing to assert.
+            return;
+        };
+        let Some(container) = Path::new(&profile).parent() else {
+            return;
+        };
+        let container = container.to_string_lossy().to_string();
+        if container.trim().is_empty() {
+            return;
+        }
+
+        assert!(
+            validate_media_root("watch_folder", &container).is_err(),
+            "the profile container ({}) must be refused as a media root",
+            container
+        );
+        assert!(
+            validate_media_root("watch_folder", &profile).is_err(),
+            "the profile directory itself ({}) must be refused too",
+            profile
+        );
+
+        // ...but an ordinary folder inside the profile is fine. That is where
+        // most people actually keep media, and refusing it would be useless.
+        let inside = Path::new(&profile).join("Media").join("Ingest");
+        assert!(
+            validate_media_root("watch_folder", &inside.to_string_lossy()).is_ok(),
+            "a folder inside the profile must still be allowed: {}",
+            inside.display()
+        );
     }
 
     #[test]
