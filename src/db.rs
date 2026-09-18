@@ -362,6 +362,17 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await;
 
+    // T2-7. Every paginated listing filters on (status, deleted_at) or orders
+    // within a virtual folder; without these the LIMIT/OFFSET still scans the
+    // whole table and paging buys nothing but a smaller response.
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_status_deleted ON media_assets(status, deleted_at)",
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_virtual_folder ON media_assets(virtual_folder)",
+        "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_created_at ON transcode_jobs(created_at)",
+    ] {
+        let _ = sqlx::query(idx).execute(&pool).await;
+    }
+
     tracing::info!(
         "Database initialized at {} (WAL mode, media_assets ready)",
         db_path.display()
@@ -1341,6 +1352,88 @@ pub fn like_prefix(norm: &str) -> String {
     out
 }
 
+/// The default page size for `GET /api/assets` (T2-7).
+///
+/// Chosen to be larger than most stations' whole library, so the common case
+/// is still a single request, while a library that has grown past it degrades
+/// into paging rather than into a multi-hundred-megabyte response.
+pub const ASSETS_DEFAULT_LIMIT: i64 = 1000;
+
+/// The most rows one request may ask for, whatever `?limit=` says.
+///
+/// An unbounded `limit` is the same unbounded response F-06 is about, just
+/// spelled by the caller instead of the server.
+pub const ASSETS_MAX_LIMIT: i64 = 5000;
+
+/// Clamp a caller-supplied page size into `1..=ASSETS_MAX_LIMIT`.
+///
+/// `None` is the default, not "no limit" — there is no way to ask for the whole
+/// library in one response any more, deliberately.
+pub fn clamp_asset_limit(requested: Option<i64>) -> i64 {
+    match requested {
+        None => ASSETS_DEFAULT_LIMIT,
+        Some(n) if n < 1 => 1,
+        Some(n) => n.min(ASSETS_MAX_LIMIT),
+    }
+}
+
+/// One page of assets, plus how many there are in total.
+pub struct AssetPage {
+    pub assets: Vec<MediaAsset>,
+    /// Matching rows ignoring `limit`/`offset` — served as `X-Total-Count`, so
+    /// a client knows whether to ask for another page.
+    pub total: i64,
+}
+
+/// A bounded page of live assets, ordered stably by uuid.
+///
+/// `find_all` used to fetch every row and let the handler serialise all of
+/// them. With `keyframe_offsets` on each row that is tens of kilobytes per
+/// asset, and a 5 000-asset library produced a response PlayOut's 16 MiB cap
+/// rejected outright (F-06). `LIMIT`/`OFFSET` are applied in SQL, so the cost
+/// is paid by the database, not by materialising the library in memory first.
+pub async fn find_page(
+    pool: &SqlitePool,
+    status_filter: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<AssetPage, sqlx::Error> {
+    let limit = clamp_asset_limit(Some(limit));
+    let offset = offset.max(0);
+
+    // ORDER BY uuid, not rowid: paging has to be stable across requests, and a
+    // concurrent ingest must not shuffle a row the client has already seen onto
+    // the next page.
+    let (where_clause, bind_status) = match status_filter {
+        Some(_) => ("status = ?1 AND deleted_at IS NULL", true),
+        None => ("deleted_at IS NULL", false),
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM media_assets WHERE {}", where_clause);
+    let mut count_q = sqlx::query_as::<_, (i64,)>(&count_sql);
+    if bind_status {
+        count_q = count_q.bind(status_filter.unwrap_or_default());
+    }
+    let (total,) = count_q.fetch_one(pool).await?;
+
+    let sql = format!(
+        "SELECT {} FROM media_assets WHERE {} ORDER BY uuid LIMIT {} OFFSET {}",
+        SELECT_COLS, where_clause, limit, offset
+    );
+    let mut q = sqlx::query_as::<_, MediaAsset>(&sql);
+    if bind_status {
+        q = q.bind(status_filter.unwrap_or_default());
+    }
+    let assets = q.fetch_all(pool).await?;
+
+    Ok(AssetPage { assets, total })
+}
+
+/// Every live asset, unbounded.
+///
+/// Retained for internal callers that genuinely need the whole set (recovery
+/// sweeps, folder reconciliation). **Not** reachable from the HTTP surface —
+/// `GET /api/assets` goes through [`find_page`].
 pub async fn find_all(
     pool: &SqlitePool,
     status_filter: Option<&str>,

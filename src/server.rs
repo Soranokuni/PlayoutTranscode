@@ -1864,16 +1864,57 @@ struct SubclipRequest {
 
 const MAX_BATCH_UUIDS: usize = 500;
 
+/// `GET /api/assets` — a bounded page of the library (T2-7).
+///
+/// Three things changed and all three are about response size (F-06):
+///
+/// * `?limit=` / `?offset=`, defaulting to 1 000 and clamped to 5 000. There is
+///   no way to ask for the whole library in one response any more.
+/// * `keyframe_offsets` is `[]` unless `?fields=full`. It is the single largest
+///   field on a row — tens of kilobytes for a feature — and a listing never
+///   needs it. `GET /assets/{uuid}` and `POST /assets/batch` still send the
+///   real array, which is what PlayOut's per-asset hydration reads.
+/// * `X-Total-Count` says how many rows match, so a client knows whether there
+///   is another page without asking for one.
+///
+/// The body is still a bare JSON array, so a client that ignores all of this
+/// keeps parsing the response — it just stops at 1 000 rows.
 async fn list_assets(
     State(state): State<ServerState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let status_filter = params.get("status").map(|s| s.as_str());
-    match db::find_all(&state.pool, status_filter).await {
-        Ok(assets) => {
-            let response: Vec<AssetResponse> =
-                assets.into_iter().map(AssetResponse::from).collect();
-            (StatusCode::OK, Json(response)).into_response()
+    let limit = db::clamp_asset_limit(params.get("limit").and_then(|v| v.parse::<i64>().ok()));
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(0);
+    let full = params.get("fields").map(|f| f == "full").unwrap_or(false);
+
+    match db::find_page(&state.pool, status_filter, limit, offset).await {
+        Ok(page) => {
+            let response: Vec<AssetResponse> = page
+                .assets
+                .into_iter()
+                .map(|a| {
+                    let mut r = AssetResponse::from(a);
+                    if !full {
+                        r.keyframe_offsets = Vec::new();
+                    }
+                    r
+                })
+                .collect();
+            (
+                StatusCode::OK,
+                [
+                    ("X-Total-Count", page.total.to_string()),
+                    ("X-Limit", limit.to_string()),
+                    ("X-Offset", offset.to_string()),
+                ],
+                Json(response),
+            )
+                .into_response()
         }
         Err(e) => {
             tracing::error!("DB error on list_assets: {}", e);

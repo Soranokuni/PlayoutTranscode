@@ -326,10 +326,55 @@ export function useEventStream() {
     }
   }
 
+  /**
+   * Fetch the whole library, a page at a time.
+   *
+   * Since T2-7 `GET /api/assets` is capped (1000 by default, 5000 maximum) and
+   * reports the real total in `X-Total-Count`. Asking once and keeping whatever
+   * came back would silently truncate the library at 1000 assets, which looks
+   * exactly like assets having gone missing.
+   */
   async function fetchAssets(statusFilter?: string) {
-    const url = statusFilter ? `/assets?status=${encodeURIComponent(statusFilter)}` : '/assets'
-    const list = await apiGet<AssetRecord[]>(url)
-    if (list) assets.value = list
+    const PAGE = 1000
+    const base = statusFilter ? `/assets?status=${encodeURIComponent(statusFilter)}&` : '/assets?'
+    const collected: AssetRecord[] = []
+    let offset = 0
+    let total = Infinity
+
+    // Bounded, so a server that keeps reporting a total it never delivers
+    // cannot spin here forever.
+    for (let page = 0; page < 100 && offset < total; page++) {
+      let r: Response
+      try {
+        r = await apiFetch(`/api${base}limit=${PAGE}&offset=${offset}`)
+      } catch (error) {
+        console.error('[useEventStream] fetchAssets request failed:', error)
+        return
+      }
+      if (!r.ok) return
+
+      const header = r.headers.get('X-Total-Count')
+      if (header !== null) {
+        const parsed = Number(header)
+        if (Number.isFinite(parsed)) total = parsed
+      }
+
+      let batch: AssetRecord[]
+      try {
+        batch = (await r.json()) as AssetRecord[]
+      } catch (error) {
+        console.error('[useEventStream] fetchAssets JSON parse failed:', error)
+        return
+      }
+      collected.push(...batch)
+
+      // A server that predates T2-7 sends no header and no limit, so the first
+      // response is already the whole library.
+      if (header === null || batch.length < PAGE) break
+      offset += batch.length
+    }
+
+    assets.value = collected
   }
 
   function handleSSEEvent(eventType: string, data: unknown) {
