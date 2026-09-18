@@ -176,3 +176,115 @@ fn the_limit_clamp_is_total() {
     assert_eq!(db::clamp_asset_limit(Some(50)), 50);
     assert_eq!(db::clamp_asset_limit(Some(i64::MAX)), db::ASSETS_MAX_LIMIT);
 }
+
+/// PC-01: the listing carries an ETag and honours `If-None-Match`, so a client
+/// that refetches the whole library after every mutation pays for the transfer
+/// only when something actually changed. Additive: a client that sends no
+/// validator sees exactly the response it always saw.
+#[tokio::test]
+async fn the_listing_is_conditional_and_still_unconditional_for_old_clients() {
+    let s = common::spawn_test_server().await;
+    seed(&s.pool, 5).await;
+
+    let first = s.get("/api/assets").await;
+    assert_eq!(first.status(), 200);
+    assert_eq!(
+        first.headers().get("content-type").unwrap(),
+        "application/json"
+    );
+    let total = first
+        .headers()
+        .get("x-total-count")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(total, "5");
+    let etag = first
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag on the listing")
+        .to_string();
+    let body = first.text().await.unwrap();
+    // The body is still a bare JSON array of assets.
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed.len(), 5);
+
+    // Same request, no validator: still a 200 with the same body.
+    let again = s.get("/api/assets").await;
+    assert_eq!(again.status(), 200);
+    assert_eq!(again.text().await.unwrap(), body);
+
+    // With the validator: 304, no body, and the paging headers still present
+    // because a client reusing its cached page still needs them.
+    let conditional = s
+        .client()
+        .get(s.url("/api/assets"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .expect("conditional GET");
+    assert_eq!(conditional.status(), 304);
+    assert_eq!(
+        conditional
+            .headers()
+            .get("x-total-count")
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    assert_eq!(conditional.text().await.unwrap(), "");
+
+    // Mutate one asset: the validator must change and the client gets a 200.
+    let uuid = parsed[0]["uuid"].as_str().unwrap().to_string();
+    let r = s
+        .put_json(
+            &format!("/api/assets/{}/rating", uuid),
+            serde_json::json!({ "rating": "16" }),
+        )
+        .await;
+    assert_eq!(r.status(), 200, "rating update should succeed");
+
+    let after = s
+        .client()
+        .get(s.url("/api/assets"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .expect("conditional GET");
+    assert_eq!(after.status(), 200, "a mutated library must not answer 304");
+    let new_etag = after
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_ne!(new_etag, etag);
+
+    // A different page is a different resource and must not collide.
+    let page = s.get("/api/assets?limit=2&offset=0").await;
+    let page_etag = page
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_ne!(page_etag, new_etag);
+
+    // Single-asset reads are conditional too.
+    let one = s.get(&format!("/api/assets/{}", uuid)).await;
+    assert_eq!(one.status(), 200);
+    let one_etag = one
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    let one_again = s
+        .client()
+        .get(s.url(&format!("/api/assets/{}", uuid)))
+        .header("if-none-match", &one_etag)
+        .send()
+        .await
+        .expect("conditional GET");
+    assert_eq!(one_again.status(), 304);
+}

@@ -2040,8 +2040,61 @@ const MAX_BATCH_UUIDS: usize = 500;
 ///
 /// The body is still a bare JSON array, so a client that ignores all of this
 /// keeps parsing the response — it just stops at 1 000 rows.
+/// A weak validator for a JSON body: its length and a 64-bit FNV-1a hash.
+///
+/// Derived from the body rather than from a "library changed" counter on
+/// purpose. A counter has to be incremented by every mutator, and the one
+/// mutator someone forgets to touch is a client that never sees its own edit
+/// -- a silent, hard-to-reproduce staleness bug in the registry PlayOut treats
+/// as its source of truth. Hashing the body cannot go stale by construction:
+/// if the bytes differ, the validator differs. The server still runs the query
+/// and serialises the page; what a 304 saves is the transfer, which is the
+/// expensive part for a client that refetches a whole library after every
+/// trim or rename.
+fn weak_etag_for_body(bytes: &[u8]) -> String {
+    use std::hash::Hasher;
+    let mut hasher = fnv::FnvHasher::default();
+    hasher.write(bytes);
+    format!("W/\"{:x}-{:x}\"", bytes.len(), hasher.finish())
+}
+
+/// Answer a GET whose body is already serialised, honouring `If-None-Match`.
+///
+/// `extra` headers (the `X-Total-Count` family) are sent on both the 200 and
+/// the 304, because a client that reuses its cached page still needs them.
+fn json_with_etag(
+    headers: &header::HeaderMap,
+    body: Vec<u8>,
+    extra: Vec<(&'static str, String)>,
+) -> Response {
+    let etag = weak_etag_for_body(&body);
+
+    let mut builder = Response::builder();
+    for (name, value) in &extra {
+        builder = builder.header(*name, value);
+    }
+    builder = builder
+        .header(header::ETAG, &etag)
+        // A validator is only useful if the client is allowed to revalidate.
+        .header(header::CACHE_CONTROL, "no-cache");
+
+    if if_none_match_matches(headers, &etag) {
+        return builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(axum::body::Body::empty())
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
+    builder
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from(body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 async fn list_assets(
     State(state): State<ServerState>,
+    headers: header::HeaderMap,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let status_filter = params.get("status").map(|s| s.as_str());
@@ -2066,16 +2119,24 @@ async fn list_assets(
                     r
                 })
                 .collect();
-            (
-                StatusCode::OK,
-                [
-                    ("X-Total-Count", page.total.to_string()),
-                    ("X-Limit", limit.to_string()),
-                    ("X-Offset", offset.to_string()),
-                ],
-                Json(response),
-            )
-                .into_response()
+            let extra = vec![
+                ("X-Total-Count", page.total.to_string()),
+                ("X-Limit", limit.to_string()),
+                ("X-Offset", offset.to_string()),
+            ];
+            match serde_json::to_vec(&response) {
+                // Additive: a client that sends no `If-None-Match` gets the
+                // same 200 and the same body it always did.
+                Ok(body) => json_with_etag(&headers, body, extra),
+                Err(e) => {
+                    tracing::error!("failed to serialise the asset page: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": "serialization error"})),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(e) => {
             tracing::error!("DB error on list_assets: {}", e);
@@ -2090,10 +2151,21 @@ async fn list_assets(
 
 async fn get_asset(
     State(state): State<ServerState>,
+    headers: header::HeaderMap,
     AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
     match db::find_by_uuid(&state.pool, &uuid).await {
-        Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
+        Ok(Some(asset)) => match serde_json::to_vec(&AssetResponse::from(asset)) {
+            Ok(body) => json_with_etag(&headers, body, Vec::new()),
+            Err(e) => {
+                tracing::error!("failed to serialise an asset: {}", e);
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "serialization error"})),
+                )
+                    .into_response()
+            }
+        },
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "asset not found"})),

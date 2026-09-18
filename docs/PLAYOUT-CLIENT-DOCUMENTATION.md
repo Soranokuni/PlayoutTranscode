@@ -50,8 +50,8 @@ From `src-tauri/src/ingestor_api.rs`:
 | Endpoint | Method | Changed? |
 |---|---|---|
 | `/api/health` | GET | No. Still cheap, still exempt from auth |
-| `/api/assets` | GET | **Yes — now paginated (§4)** |
-| `/api/assets/{uuid}` | GET | No |
+| `/api/assets` | GET | **Yes — now paginated (§4)**; optional `ETag` (§4.1) |
+| `/api/assets/{uuid}` | GET | No; optional `ETag` (§4.1) |
 | `/api/assets/batch` | POST | No |
 | `/api/assets/{uuid}/rating` | PUT | Bounded at 4 KiB (§7.2) |
 | `/api/assets/{uuid}/tp` | PUT | Grammar-checked (§7.1) |
@@ -253,6 +253,28 @@ cannot shuffle a row you have already seen onto the next page.
 Out-of-range and unparseable values clamp rather than erroring: `?limit=0`
 becomes 1, `?limit=999999` becomes 5000, `?limit=abc` becomes the default. A
 request always returns data.
+
+### 4.1 Optional: `ETag` and `If-None-Match`
+
+`GET /api/assets` and `GET /api/assets/{uuid}` now send a weak `ETag` and
+`Cache-Control: no-cache`. **Nothing is required of a client.** Ignore the
+header and you get the same 200 and the same body as before.
+
+If you do use it: keep the last `ETag` per request URL, send it back as
+`If-None-Match`, and on `304 Not Modified` reuse the page you already have. The
+304 carries no body but does carry `X-Total-Count`, `X-Limit` and `X-Offset`,
+so paging still works from a cached page.
+
+The validator is derived from the response body itself, so it changes exactly
+when the bytes change -- a rating, trim, rename, move, trash or a finished
+ingest all produce a new one. A different `limit`/`offset`/`status`/`fields`
+combination is a different resource with its own validator; do not share one
+across URLs.
+
+This is worth wiring up where PlayOut force-refetches the whole library after
+every single-asset mutation (`MediaLibrary.vue`, after trim/rating/rename/move).
+Better still, patch that one asset from `GET /api/assets/{uuid}` and leave the
+library listing alone.
 
 ---
 
