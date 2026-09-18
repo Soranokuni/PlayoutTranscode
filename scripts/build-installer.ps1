@@ -40,6 +40,23 @@ Write-Host "[3/5] Building Rust release binary..." -ForegroundColor Yellow
 cargo build --release
 Copy-Item -Path "target\release\PlayoutTranscode.exe" -Destination "$OutputDir\" -Force
 
+# Debug symbols, kept OUT of the installer payload (T3-6).
+#
+# The release profile no longer strips, so a panic backtrace names functions
+# instead of hex addresses -- but only if the matching .pdb is available when
+# someone reads it, months later. It goes beside the installer rather than
+# inside it: the shipped payload stays the same size, and the symbols are
+# archived with the build so a crash report from it can still be symbolised.
+$symbolDir = Join-Path (Split-Path -Parent $OutputDir) "symbols"
+New-Item -ItemType Directory -Path $symbolDir -Force | Out-Null
+$pdb = "target\release\PlayoutTranscode.pdb"
+if (Test-Path -LiteralPath $pdb) {
+    Copy-Item -LiteralPath $pdb -Destination $symbolDir -Force
+    Write-Host "Symbols archived to $symbolDir (not shipped in the installer)" -ForegroundColor Green
+} else {
+    Write-Warning "No PDB at $pdb - a crash report from this build will not symbolise."
+}
+
 # Build Vue SPA
 Write-Host "[4/5] Building Vue SPA..." -ForegroundColor Yellow
 Push-Location "web-ui"

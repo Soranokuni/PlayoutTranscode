@@ -262,6 +262,56 @@ impl Visit for MessageVisitor {
     }
 }
 
+/// Route panics through `tracing` before the default handler runs (T3-6).
+///
+/// A panic on a worker thread previously went to stderr, which a service
+/// started by the SCM does not have: the thread died, ingest silently stopped,
+/// and the log held nothing at all. The message and location now reach every
+/// sink the service has -- the rotated JSON file included -- so an incident an
+/// hour later still has evidence.
+///
+/// The default hook is chained rather than replaced, so an interactive run
+/// keeps its familiar stderr output and `RUST_BACKTRACE` still works.
+/// Idempotent: safe to call more than once.
+pub fn install_panic_hook() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+
+    ONCE.call_once(|| {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "unknown location".to_string());
+
+            let message = info
+                .payload()
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic payload".to_string());
+
+            let thread = std::thread::current();
+            let thread_name = thread.name().unwrap_or("unnamed").to_string();
+
+            // `Backtrace::capture` honours RUST_BACKTRACE; without it this is
+            // `disabled` and costs nothing.
+            let backtrace = std::backtrace::Backtrace::capture();
+
+            tracing::error!(
+                panic.location = %location,
+                panic.thread = %thread_name,
+                panic.backtrace = %backtrace,
+                "PANIC: {}",
+                message
+            );
+
+            default_hook(info);
+        }));
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

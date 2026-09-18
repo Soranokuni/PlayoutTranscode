@@ -1,0 +1,52 @@
+# cargo-deny configuration (T3-2).
+#
+# Run by the `audit` CI job. The point is that a dependency advisory reaches
+# someone before it reaches a broadcast host, not that the policy is strict for
+# its own sake.
+
+[graph]
+# Only the target that actually ships. Auditing Linux-only transitive crates
+# would produce findings nobody can act on, because the product is a Windows
+# service.
+targets = [
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "x86_64-unknown-linux-gnu" },
+]
+
+[advisories]
+# An advisory with no fix available still has to be visible; `deny` is the
+# default and is what makes the job meaningful. Add an `ignore` entry with a
+# dated comment when one genuinely cannot be actioned.
+yanked = "warn"
+ignore = []
+
+[licenses]
+# Permissive licences only. This ships as a binary to broadcast customers, so a
+# copyleft dependency is a legal question rather than a technical one, and it
+# should surface at the moment it is added.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Duplicate versions of one crate are noise, not a defect, in a tree this size.
+multiple-versions = "warn"
+wildcards = "deny"
+# The release binary is what customers run; a build script pulling an unvetted
+# crate is the supply-chain shape worth blocking outright.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

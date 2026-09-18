@@ -1551,6 +1551,14 @@ struct WatchfolderInfo {
     stable_polls_min: u32,
     retry_policy: String,
     max_concurrency: usize,
+    /// Additive (T3-7).
+    include_extensions: Vec<String>,
+    exclude_extensions: Vec<String>,
+    /// How often the watcher does a full reconciliation walk, in seconds. Not
+    /// the same as `poll_secs` since T3-7: with a healthy filesystem watcher
+    /// the walk backs off, because `notify` already reports changes in
+    /// milliseconds and the walk is O(files in the watch folder).
+    reconcile_secs: u64,
 }
 
 async fn get_watchfolder(State(state): State<ServerState>) -> Json<WatchfolderInfo> {
@@ -1563,6 +1571,14 @@ async fn get_watchfolder(State(state): State<ServerState>) -> Json<WatchfolderIn
         stable_polls_min: config.ingestion.stable_polls_min,
         retry_policy: config.ingestion.retry_policy.clone(),
         max_concurrency: config.ingestion.max_concurrency,
+        // Additive (T3-7). "Why was my .avi never picked up?" is a support call
+        // that these three answer without anyone opening config.toml.
+        include_extensions: config.ingestion.include_extensions.clone(),
+        exclude_extensions: config.ingestion.exclude_extensions.clone(),
+        reconcile_secs: crate::watcher::effective_poll_interval_secs(
+            config.ingestion.poll_secs,
+            true,
+        ),
     })
 }
 
@@ -2547,16 +2563,16 @@ async fn post_regenerate_sidecar(
                 )
                     .into_response();
             }
-            // `exists()` and the sidecar write both block; PlayOut writes
-            // error bodies verbatim into its diagnostics log, so internal
-            // paths and OS error strings stay in `tracing` (F-07, F-09).
+            // ffprobe, `exists()` and the sidecar write all block; PlayOut
+            // writes error bodies verbatim into its diagnostics log, so
+            // internal paths and OS error strings stay in `tracing`
+            // (F-07, F-09).
             let asset_for_task = asset.clone();
             let outcome = tokio::task::spawn_blocking(move || {
-                let media_path = std::path::Path::new(&asset_for_task.current_path);
-                if !media_path.exists() {
-                    return Err(None);
-                }
-                crate::identity::build_sidecar_from_db_asset(&asset_for_task).map_err(Some)
+                // Re-probes the mezzanine rather than filling the payload from
+                // the registry row and hard-coding the rest (T3-5, F-27).
+                let (tools, _) = crate::bootstrap::audit_toolchain();
+                crate::identity::rebuild_sidecar_from_media(&asset_for_task, &tools)
             })
             .await;
 
@@ -2572,7 +2588,7 @@ async fn post_regenerate_sidecar(
                     )
                         .into_response()
                 }
-                Ok(Err(None)) => {
+                Ok(Err(crate::identity::SidecarRebuildError::MezzanineMissing)) => {
                     tracing::warn!(
                         "Sidecar regen for '{}': mezzanine missing at {}",
                         uuid,
@@ -2584,7 +2600,24 @@ async fn post_regenerate_sidecar(
                     )
                         .into_response()
                 }
-                Ok(Err(Some(e))) => {
+                Ok(Err(crate::identity::SidecarRebuildError::ProbeUnavailable(e))) => {
+                    // 503, not 500: the request is fine and will work once
+                    // ffprobe is available. The alternative -- writing the
+                    // sidecar with fabricated stream properties -- is what T3-5
+                    // removed, and a plausible wrong sidecar is worse than a
+                    // missing one because nothing downstream can tell.
+                    tracing::error!(
+                        "Sidecar regen for '{}' could not probe the mezzanine: {}",
+                        uuid,
+                        e
+                    );
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(serde_json::json!({"error": "probe_unavailable"})),
+                    )
+                        .into_response()
+                }
+                Ok(Err(crate::identity::SidecarRebuildError::WriteFailed(e))) => {
                     tracing::error!("Failed to rebuild sidecar for '{}': {}", uuid, e);
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
