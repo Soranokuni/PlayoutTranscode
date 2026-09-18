@@ -102,8 +102,14 @@ pub fn collect_candidates(root: &Path) -> Vec<WatchCandidate> {
             if is_temp_file_name(&path) {
                 return None;
             }
-            let metadata = fs::metadata(&path).ok()?;
+            // Extension first: rejecting a .txt must not cost a syscall.
             let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+            // `entry.metadata()` is served from what FindNextFileW already
+            // returned for this directory; `fs::metadata` would issue a fresh
+            // open per file, which on an SMB watch folder is a round trip.
+            // walkdir does not follow links here, and `file_type().is_file()`
+            // above already excluded symlinks, so the two agree.
+            let metadata = entry.metadata().ok()?;
             if SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
                 let modified = metadata
                     .modified()

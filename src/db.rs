@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -323,13 +323,31 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let _ = std::fs::create_dir_all(db_dir);
 
+    // The pragmas belong on the connect options, not on a query after
+    // connecting: a `PRAGMA` statement reaches exactly one of the five pooled
+    // connections. `journal_mode` happened to work anyway because WAL is
+    // recorded in the file; `cache_size` and friends are per connection.
+    //
+    // `synchronous` is deliberately left at FULL. Under WAL, NORMAL can lose
+    // the last committed transactions on power loss, and a lost `mark_ready`
+    // leaves a published mezzanine with no `ready` row -- the F-18 orphan
+    // class. The registry is the playout source of truth.
+    let options = std::str::FromStr::from_str(&format!(
+        "sqlite:{}?mode=rwc",
+        db_path.display()
+    ))
+    .map(|o: SqliteConnectOptions| {
+        o.pragma("journal_mode", "WAL")
+            // 16 MB page cache instead of the 2 MB default.
+            .pragma("cache_size", "-16384")
+            .pragma("temp_store", "MEMORY")
+            // 128 MB read-only mapping; safe under WAL.
+            .pragma("mmap_size", "134217728")
+    })?;
+
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
-        .await?;
-
-    sqlx::query("PRAGMA journal_mode=WAL")
-        .execute(&pool)
+        .connect_with(options)
         .await?;
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS media_assets (
@@ -521,6 +539,9 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     for idx in [
         "CREATE INDEX IF NOT EXISTS idx_media_assets_status_deleted ON media_assets(status, deleted_at)",
         "CREATE INDEX IF NOT EXISTS idx_media_assets_virtual_folder ON media_assets(virtual_folder)",
+        // Reference-counted purge and subclip protection both ask
+        // `WHERE current_path = ?`, which was a full scan.
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_current_path ON media_assets(current_path)",
         "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_created_at ON transcode_jobs(created_at)",
     ] {
         let _ = sqlx::query(idx).execute(&pool).await;
@@ -2670,6 +2691,43 @@ mod tests {
         let db_path = temp_dir.join("test.db");
         let pool = init_pool(&db_path).await.expect("init_pool failed");
         (pool, temp_dir)
+    }
+
+    /// SB-09: the pragmas moved onto the connect options so every pooled
+    /// connection gets them, and `synchronous` stays at FULL -- NORMAL under
+    /// WAL can lose the last commits on power loss, which would leave a
+    /// published mezzanine with no `ready` row (the F-18 orphan class).
+    #[tokio::test]
+    async fn every_pooled_connection_gets_the_pragmas_and_synchronous_stays_full() {
+        let (pool, _temp_dir) = setup_test_pool().await;
+
+        // More round trips than the pool has connections, so at least one
+        // answer comes from a connection other than the first.
+        for _ in 0..12 {
+            let journal: String = sqlx::query_scalar("PRAGMA journal_mode")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(journal.to_ascii_lowercase(), "wal");
+
+            let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(synchronous, 2, "synchronous must stay FULL");
+
+            let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(cache_size, -16384);
+
+            let temp_store: i64 = sqlx::query_scalar("PRAGMA temp_store")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(temp_store, 2, "temp_store MEMORY");
+        }
     }
 
     /// A freshly ingested asset must not claim a suitability mark. PlayOut is
