@@ -1394,17 +1394,19 @@ fn process_file_inner(
 
         if validation_ok {
             let output_probe = final_probe.unwrap();
-            let keyframe_safe_start_ms =
-                probe::get_keyframe_safe_start_ms(&tools.ffprobe, &result.output_path);
             let total_frames = output_probe.frame_count;
             let fps = output_probe.fps();
             let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
             let gop_frames = compute_gop_from_fps(fps);
 
+            // One keyframe scan, not two. `-skip_frame nokey` still demuxes
+            // every packet, so this reads the whole mezzanine; the safe start
+            // is simply the first offset that scan already returned.
             let keyframe_offsets = extract_keyframe_offsets_ms(
                 tools.ffprobe.to_str().unwrap_or(""),
                 &result.output_path,
             );
+            let keyframe_safe_start_ms = keyframe_offsets.first().copied().unwrap_or(0);
             let closed_gop_ok = verify_closed_gop(&keyframe_offsets, gop_frames, fps);
             let faststart_ok = verify_faststart(&result.output_path);
 
@@ -2327,8 +2329,16 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
         return Vec::new();
     }
 
-    let stdout_str = String::from_utf8_lossy(&output.stdout);
-    stdout_str
+    parse_keyframe_pts_ms(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Turn ffprobe's `frame=pts_time` CSV into milliseconds.
+///
+/// Split out so the offsets list and the safe-start value can never be
+/// produced by two subtly different parsers: the safe start is just the first
+/// element of this list.
+fn parse_keyframe_pts_ms(stdout: &str) -> Vec<i64> {
+    stdout
         .lines()
         .map(|line| line.trim())
         .filter(|line| !line.is_empty() && *line != "N/A")
@@ -2342,6 +2352,50 @@ mod tests {
     use super::*;
     use crate::probe::LoudnessMeasurer;
     use std::path::PathBuf;
+
+    /// SB-02: the safe start is now the first element of the offsets list
+    /// instead of a second full scan of the mezzanine. The two must agree on
+    /// every shape of ffprobe output, including the empty and `N/A` lines the
+    /// old pair of parsers each skipped separately.
+    #[test]
+    fn the_safe_start_equals_the_first_keyframe_offset() {
+        // What the old probe::get_keyframe_safe_start_ms did: first line that
+        // is neither empty nor N/A and parses as a float, rounded to ms.
+        fn legacy_safe_start(stdout: &str) -> i64 {
+            for line in stdout.lines() {
+                let trimmed = line.trim();
+                if trimmed.is_empty() || trimmed == "N/A" {
+                    continue;
+                }
+                if let Ok(t_sec) = trimmed.parse::<f64>() {
+                    return (t_sec * 1000.0).round() as i64;
+                }
+            }
+            0
+        }
+
+        for stdout in [
+            "0.000000\n2.000000\n4.000000\n",
+            "N/A\n\n0.040000\n2.040000\n",
+            "  1.500000  \n3.000000\n",
+            "0.083333\n",
+            "",
+            "N/A\nN/A\n",
+            "garbage\n1.000000\n",
+        ] {
+            let offsets = parse_keyframe_pts_ms(stdout);
+            assert_eq!(
+                offsets.first().copied().unwrap_or(0),
+                legacy_safe_start(stdout),
+                "diverged on {:?}",
+                stdout
+            );
+        }
+
+        // And the rounding is the one written to the DB and the sidecar.
+        assert_eq!(parse_keyframe_pts_ms("0.083333\n"), vec![83]);
+        assert_eq!(parse_keyframe_pts_ms("2.0405\n"), vec![2041]);
+    }
 
     #[test]
     fn test_verify_closed_gop_uniform() {

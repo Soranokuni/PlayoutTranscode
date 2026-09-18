@@ -350,42 +350,6 @@ pub fn snap_fps_rational(num: i64, den: i64) -> (i64, i64) {
     (num, den)
 }
 
-pub fn get_keyframe_safe_start_ms(ffprobe_path: &Path, path: &Path) -> i64 {
-    let mut command = Command::new(ffprobe_path);
-    command.args([
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-skip_frame",
-        "nokey",
-        "-show_entries",
-        "frame=pts_time",
-        "-of",
-        "csv=p=0",
-    ]);
-    command.arg(path);
-
-    #[cfg(target_os = "windows")]
-    command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
-
-    let out = command.output();
-
-    if let Ok(output) = out {
-        let text = String::from_utf8_lossy(&output.stdout);
-        for line in text.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed == "N/A" {
-                continue;
-            }
-            if let Ok(t_sec) = trimmed.parse::<f64>() {
-                return (t_sec * 1000.0).round() as i64;
-            }
-        }
-    }
-    0
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MeasuredLoudness {
     pub input_i: f64,
