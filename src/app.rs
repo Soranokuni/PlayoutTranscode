@@ -8,7 +8,7 @@
 //! and not as Ctrl-C.
 
 use crate::{
-    bootstrap, config, db, instance_lock, jobs, logging, paths, profiles, server,
+    bootstrap, config, db, identity, instance_lock, jobs, logging, paths, profiles, server,
     service_handle,
 };
 
@@ -111,6 +111,10 @@ pub async fn run_service(
     let _instance_lock = instance_lock::acquire(&paths::data_dir())
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
+    // After the subscriber is installed, so a panic during the rest of startup
+    // reaches the log files rather than a stderr nobody is reading (T3-6).
+    logging::install_panic_hook();
+
     profiles::validate_color_constants()
         .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
 
@@ -163,6 +167,21 @@ pub async fn run_service(
     let watch_root = PathBuf::from(&app_config.paths.watch_folder);
     let target_root = PathBuf::from(&app_config.paths.target_folder);
     let _ = std::fs::create_dir_all(&target_root);
+
+    // One-time move of sidecars written beside their media by earlier versions
+    // into the canonical `<target>/sidecars/` directory (T3-5). Idempotent, so
+    // it costs one directory listing per start after the first.
+    {
+        let report = identity::migrate_legacy_sidecars(&target_root.join("videos"));
+        if report.moved > 0 || report.failed > 0 {
+            tracing::info!(
+                "Sidecar migration: {} moved, {} already current, {} failed",
+                report.moved,
+                report.already_current,
+                report.failed
+            );
+        }
+    }
 
     let config_initialized = app_config.initialized;
 

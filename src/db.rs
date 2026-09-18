@@ -2668,6 +2668,7 @@ mod tests {
         let video_path = temp_dir.join("video1.mp4");
         let sidecar_path = crate::identity::sidecar_path_for(&video_path);
 
+        std::fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
         std::fs::File::create(&video_path).unwrap();
         std::fs::File::create(&sidecar_path).unwrap();
 
@@ -2716,6 +2717,7 @@ mod tests {
         let video_path = temp_dir.join("shared_mezzanine.mp4");
         let sidecar_path = crate::identity::sidecar_path_for(&video_path);
 
+        std::fs::create_dir_all(sidecar_path.parent().unwrap()).unwrap();
         std::fs::File::create(&video_path).unwrap();
         std::fs::File::create(&sidecar_path).unwrap();
 
@@ -3360,6 +3362,8 @@ mod tests {
         let (pool, temp_dir) = setup_test_pool().await;
         let media_file = temp_dir.join("mezzanine_video.mp4");
         let sidecar_file = crate::identity::sidecar_path_for(&media_file);
+        // Since T3-5 the resolver always answers `<root>/sidecars/...`.
+        std::fs::create_dir_all(sidecar_file.parent().unwrap()).unwrap();
         std::fs::File::create(&media_file).unwrap();
         std::fs::File::create(&sidecar_file).unwrap();
 

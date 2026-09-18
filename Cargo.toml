@@ -63,4 +63,10 @@ panic = "unwind"
 codegen-units = 1
 lto = true
 opt-level = "s"
-strip = true
+# Symbols are kept (T3-6). `strip = true` produced a binary whose panic
+# backtraces were a list of hex addresses, which on a broadcast host that has
+# crashed once in three months is the difference between a diagnosis and a
+# shrug. `build-installer.ps1` copies the .pdb into a `symbols/` artifact beside
+# the installer rather than into it, so the shipped payload is unchanged.
+strip = false
+debug = 1

@@ -23,6 +23,40 @@ static TEMP_EXTENSIONS: &[&str] = &[
     "json",
 ];
 
+/// Bound on the filesystem-event channel (T3-7).
+///
+/// Sized for a bulk copy: a few thousand files landing at once fills it, and
+/// the overflow is reconciled by the poll walk rather than buffered forever.
+pub const NOTIFY_CHANNEL_CAPACITY: usize = 4096;
+
+/// Minimum interval between full directory walks when `notify` is healthy.
+///
+/// The walk is O(files in the watch folder) and ran every `poll_secs` -- 10 s
+/// by default -- whether or not anything had changed. On a watch folder holding
+/// thousands of files that is a continuous disk scan for no benefit, since
+/// `notify` already reports changes within milliseconds. It stays a
+/// *reconciliation* pass: events can be dropped, and a file dropped from the
+/// channel has to be found eventually.
+pub const RECONCILE_MIN_SECS: u64 = 60;
+
+/// Events the OS reported that the channel could not hold. Purely diagnostic:
+/// correctness comes from the reconciliation walk, not from this counter.
+pub static NOTIFY_DROPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How long to wait before the next full walk.
+///
+/// With a healthy `notify` the walk only has to reconcile, so it backs off to
+/// `RECONCILE_MIN_SECS`. Without one, polling is the only way a file is ever
+/// noticed and `poll_secs` is honoured exactly.
+pub fn effective_poll_interval_secs(poll_secs: u64, notify_healthy: bool) -> u64 {
+    let configured = poll_secs.max(1);
+    if notify_healthy {
+        configured.max(RECONCILE_MIN_SECS)
+    } else {
+        configured
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WatchCandidate {
     pub path: PathBuf,
@@ -153,7 +187,14 @@ pub async fn watch_loop(
     );
 
     let mut tick_count: u64 = 0;
-    let poll_ticks = poll_secs.max(1);
+    // Backs off to a reconciliation cadence while `notify` is delivering.
+    let poll_ticks = effective_poll_interval_secs(poll_secs, notify_rx.is_some());
+    tracing::info!(
+        "Watcher reconciliation walk every {}s (notify {})",
+        poll_ticks,
+        if notify_rx.is_some() { "healthy" } else { "unavailable" },
+    );
+    let mut last_dropped_report: u64 = 0;
 
     loop {
         if let Some(ref mut rx) = notify_rx {
@@ -200,7 +241,31 @@ pub async fn watch_loop(
         if tick_count >= poll_ticks {
             tick_count = 0;
 
-            let current_candidates = collect_candidates(&watch_root);
+            // `collect_candidates` is a recursive `WalkDir` with a `metadata`
+            // call per entry -- blocking syscalls, on the runtime that also
+            // serves HTTP. On a large watch folder that stalled request
+            // handling for the length of the walk (T3-7).
+            let root_for_walk = watch_root.clone();
+            let current_candidates =
+                match tokio::task::spawn_blocking(move || collect_candidates(&root_for_walk)).await
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::error!("Watch: directory walk task failed: {}", e);
+                        continue;
+                    }
+                };
+
+            let dropped = NOTIFY_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+            if dropped > last_dropped_report {
+                tracing::warn!(
+                    "Watcher dropped {} filesystem event(s) since the last walk; \
+                     the reconciliation pass has picked them up",
+                    dropped - last_dropped_report
+                );
+                last_dropped_report = dropped;
+            }
+
             let now_secs = std::time::SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -293,17 +358,27 @@ fn create_notify_watcher(
 ) -> Result<
     (
         notify::RecommendedWatcher,
-        tokio::sync::mpsc::UnboundedReceiver<notify::Event>,
+        tokio::sync::mpsc::Receiver<notify::Event>,
     ),
     String,
 > {
     use notify::Watcher;
 
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    // Bounded (T3-7). An unbounded channel fed by the OS during a bulk copy of
+    // a few thousand files grows without limit while the loop is busy, and the
+    // only backstop was the process running out of memory. A full channel now
+    // drops the event and the reconciliation walk picks the file up instead --
+    // latency, not loss.
+    let (tx, rx) = tokio::sync::mpsc::channel(NOTIFY_CHANNEL_CAPACITY);
     let mut watcher = notify::RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
-                let _ = tx.send(event);
+                // `try_send` rather than `send`: this callback runs on the
+                // notify backend's own thread and must never block it. A
+                // dropped event is reconciled by the poll walk.
+                if tx.try_send(event).is_err() {
+                    NOTIFY_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         },
         notify::Config::default(),
