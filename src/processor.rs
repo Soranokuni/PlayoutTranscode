@@ -820,21 +820,27 @@ fn process_file_inner(
     };
 
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
-    // Both sides go through `strip_verbatim_prefix`, because only a path
-    // that canonicalizes successfully picks up the Windows \\?\ prefix. A
-    // file deleted between the watcher seeing it and this worker picking it
-    // up does not, so the comparison used to fail: every vanished file was
-    // logged as a path-traversal attempt and given the wrong error category.
-    let canonical_input = crate::paths::strip_verbatim_prefix(
-        &input_path
-            .canonicalize()
-            .unwrap_or_else(|_| input_path.to_path_buf()),
-    );
-    let canonical_watch = crate::paths::strip_verbatim_prefix(
-        &watch_root
-            .canonicalize()
-            .unwrap_or_else(|_| watch_root.to_path_buf()),
-    );
+    // Both sides must end up spelled the same way or the containment check is
+    // meaningless.
+    //
+    // The previous version canonicalized each side and fell back to the raw
+    // path on failure. That is not enough: a file deleted between the watcher
+    // offering it and this worker picking it up cannot be canonicalized, so its
+    // side kept whatever spelling the watcher produced while the watch root was
+    // resolved to its true form. Wherever those differ the comparison fails and
+    // a missing file is reported as a path-traversal attempt.
+    //
+    // They differ more often than it looks. Windows hands out 8.3 short names
+    // (`C:\Users\RUNNER~1\...` for `C:\Users\runneradmin\...`) through the
+    // environment, and junctions and mapped drives resolve elsewhere again. CI
+    // on a GitHub Windows runner is exactly that case, which is how this was
+    // caught.
+    //
+    // `canonicalize_existing_prefix` resolves the deepest ancestor that exists
+    // -- normally the watch folder itself -- and re-joins the rest, so both
+    // sides are canonical even when the file is gone.
+    let canonical_input = crate::paths::canonicalize_existing_prefix(input_path);
+    let canonical_watch = crate::paths::canonicalize_existing_prefix(watch_root);
     if !canonical_input.starts_with(&canonical_watch) {
         tracing::warn!("Rejected path traversal attempt: {}", input_path.display());
         close_job("path_outside_watch_folder", "Input is outside the watch folder");
@@ -3532,6 +3538,11 @@ mod tests {
     }
 
     #[test]
+    // `check_disk_space` is a deliberate no-op off Windows -- it has no
+    // GetDiskFreeSpaceEx equivalent wired up, and the product is a Windows
+    // service -- so the "insufficient space" half of this can only be asserted
+    // there. Running it on Linux asserted that a no-op returns an error.
+    #[cfg(windows)]
     fn test_check_disk_space_current_dir() {
         let cwd = std::env::current_dir().unwrap();
         // Request 1 byte (should succeed on any working volume)
