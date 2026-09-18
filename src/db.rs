@@ -1524,6 +1524,25 @@ pub fn is_valid_virtual_folder(path: &str) -> bool {
 /// `folder_path = "/%"` matched every asset in any sub-folder and a legitimate
 /// folder named `/promo_2026` also matched `/promoX2026` (F-05). The returned
 /// pattern must always be used with `ESCAPE '\'`.
+/// Build the `LIKE` pattern matching everything *containing* `term`.
+///
+/// The DB viewer's search box used to filter in Rust with `contains`, so a `%`
+/// or `_` an operator typed was a literal. Pushing the search into SQL must not
+/// quietly turn it into a wildcard, so the term is escaped the same way
+/// `like_prefix` escapes a folder name and used with `ESCAPE '\'`.
+pub fn like_contains(term: &str) -> String {
+    let mut out = String::with_capacity(term.len() + 4);
+    out.push('%');
+    for ch in term.chars() {
+        if ch == '\\' || ch == '%' || ch == '_' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('%');
+    out
+}
+
 pub fn like_prefix(norm: &str) -> String {
     let mut out = String::with_capacity(norm.len() + 4);
     for ch in norm.chars() {
@@ -2165,8 +2184,22 @@ pub struct DbAssetSummary {
     pub sidecar_exists: bool,
 }
 
+/// Does the identity sidecar for this asset still exist on disk?
+///
+/// A blocking `stat`, and on an SMB target folder a 1-10 ms round trip, so it
+/// must never run on the async runtime for more than a page of rows (F-07).
+fn sidecar_exists_for(current_path: &str) -> bool {
+    if current_path.is_empty() {
+        return false;
+    }
+    crate::identity::sidecar_path_for(std::path::Path::new(current_path)).exists()
+}
+
 impl DbAssetSummary {
-    pub fn from_asset(a: MediaAsset) -> Self {
+    /// Everything derivable from the row alone. `sidecar_exists` is left
+    /// `false` for the caller to fill in, off the runtime, for the page it is
+    /// actually going to return.
+    fn from_asset_row(a: MediaAsset) -> Self {
         let is_subclip = a.trim_in_ms > 0
             || (a.trim_out_ms > 0 && a.trim_out_ms < a.duration_ms)
             || a.display_name.to_ascii_lowercase().contains("subclip")
@@ -2187,13 +2220,6 @@ impl DbAssetSummary {
             .unwrap_or(0);
 
         let warnings = serde_json::from_str::<Vec<String>>(&a.warnings).unwrap_or_default();
-
-        let sidecar_exists = if !a.current_path.is_empty() {
-            let p = std::path::Path::new(&a.current_path);
-            crate::identity::sidecar_path_for(p).exists()
-        } else {
-            false
-        };
 
         Self {
             uuid: a.uuid,
@@ -2221,10 +2247,27 @@ impl DbAssetSummary {
             is_subclip,
             parent_uuid: None,
             deleted_at: a.deleted_at,
-            sidecar_exists,
+            sidecar_exists: false,
         }
     }
+
+    /// The single-row path (`get_db_asset_detail`), where one `stat` is fine.
+    pub fn from_asset(a: MediaAsset) -> Self {
+        let current_path = a.current_path.clone();
+        let mut summary = Self::from_asset_row(a);
+        summary.sidecar_exists = sidecar_exists_for(&current_path);
+        summary
+    }
 }
+
+/// An asset counts as a subclip when it carries a trim window or says so in
+/// its name. Kept here as one string because the SQL listing and the Rust
+/// projection must not drift: both `DbAssetSummary::is_subclip` and the
+/// `master`/`subclip` filters are this predicate.
+const SUBCLIP_PREDICATE: &str = "(trim_in_ms > 0 \
+     OR (trim_out_ms > 0 AND trim_out_ms < duration_ms) \
+     OR lower(display_name) LIKE '%subclip%' \
+     OR lower(display_name) LIKE '%sub-clip%')";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DbAssetsPage {
@@ -2234,6 +2277,17 @@ pub struct DbAssetsPage {
     pub offset: i64,
 }
 
+/// List assets for the DB viewer, filtered, searched and paged **in SQL**.
+///
+/// This used to `SELECT` the whole table with no `WHERE` and no `LIMIT`, map
+/// every row through `DbAssetSummary::from_asset` -- which parsed the
+/// keyframe-offsets JSON and issued a filesystem `stat` per row -- and then
+/// filter and page the result in memory. With 5 000 assets one keystroke in
+/// the search box (debounced at 300 ms) cost 5 000 row decodes, 5 000 JSON
+/// parses and 5 000 stats, on the async runtime that also answers
+/// `/api/health`.
+///
+/// The response shape is unchanged, so the DB tab needs no change.
 pub async fn query_db_assets(
     pool: &SqlitePool,
     filter: Option<&str>,
@@ -2244,49 +2298,80 @@ pub async fn query_db_assets(
     let lim = limit.unwrap_or(25).clamp(1, 100);
     let off = offset.unwrap_or(0).max(0);
 
-    let all_assets: Vec<MediaAsset> = sqlx::query_as(&format!(
-        "SELECT {} FROM media_assets ORDER BY COALESCE(deleted_at, '9999') ASC, display_name ASC, uuid ASC",
-        SELECT_COLS
-    ))
-    .fetch_all(pool)
-    .await?;
-
     let filter_mode = filter.unwrap_or("all").to_ascii_lowercase();
-    let search_term = search.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let search_term = search
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
 
-    let mut filtered: Vec<DbAssetSummary> = all_assets
-        .into_iter()
-        .map(DbAssetSummary::from_asset)
-        .filter(|a| {
-            // Apply filter
-            let matches_filter = match filter_mode.as_str() {
-                "master" => !a.is_subclip && a.deleted_at.is_none(),
-                "subclip" => a.is_subclip && a.deleted_at.is_none(),
-                "ready" => a.status == "ready" && a.deleted_at.is_none(),
-                "processing" => a.status == "processing" && a.deleted_at.is_none(),
-                "error" => a.status == "error" && a.deleted_at.is_none(),
-                "trashed" => a.deleted_at.is_some(),
-                _ => true,
-            };
-            if !matches_filter {
-                return false;
-            }
+    // The filter arm is chosen from a fixed set, never interpolated from the
+    // request; only the search term is bound, and it is bound, never formatted.
+    let mut clauses: Vec<String> = Vec::new();
+    match filter_mode.as_str() {
+        "master" => clauses.push(format!("deleted_at IS NULL AND NOT {}", SUBCLIP_PREDICATE)),
+        "subclip" => clauses.push(format!("deleted_at IS NULL AND {}", SUBCLIP_PREDICATE)),
+        "ready" => clauses.push("status = 'ready' AND deleted_at IS NULL".to_string()),
+        "processing" => clauses.push("status = 'processing' AND deleted_at IS NULL".to_string()),
+        "error" => clauses.push("status = 'error' AND deleted_at IS NULL".to_string()),
+        "trashed" => clauses.push("deleted_at IS NOT NULL".to_string()),
+        _ => {}
+    }
 
-            // Apply search
-            if search_term.is_empty() {
-                return true;
-            }
-            a.display_name.to_ascii_lowercase().contains(&search_term)
-                || a.uuid.to_ascii_lowercase().contains(&search_term)
-                || a.virtual_folder.to_ascii_lowercase().contains(&search_term)
-                || a.current_path.to_ascii_lowercase().contains(&search_term)
-        })
-        .collect();
+    let mut binds: Vec<String> = Vec::new();
+    if !search_term.is_empty() {
+        clauses.push(
+            "(lower(display_name) LIKE ? ESCAPE '\\' \
+              OR lower(uuid) LIKE ? ESCAPE '\\' \
+              OR lower(virtual_folder) LIKE ? ESCAPE '\\' \
+              OR lower(current_path) LIKE ? ESCAPE '\\')"
+                .to_string(),
+        );
+        let pattern = like_contains(&search_term);
+        binds.extend(std::iter::repeat_n(pattern, 4));
+    }
 
-    let total = filtered.len() as i64;
-    let start = (off as usize).min(filtered.len());
-    let end = (start + lim as usize).min(filtered.len());
-    let items = filtered.drain(start..end).collect();
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM media_assets{}", where_sql);
+    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds {
+        count_q = count_q.bind(b);
+    }
+    let total = count_q.fetch_one(pool).await?;
+
+    let page_sql = format!(
+        "SELECT {} FROM media_assets{} ORDER BY COALESCE(deleted_at, '9999') ASC, display_name ASC, uuid ASC LIMIT ? OFFSET ?",
+        SELECT_COLS, where_sql
+    );
+    let mut page_q = sqlx::query_as::<_, MediaAsset>(&page_sql);
+    for b in &binds {
+        page_q = page_q.bind(b);
+    }
+    let rows: Vec<MediaAsset> = page_q.bind(lim).bind(off).fetch_all(pool).await?;
+
+    let mut items: Vec<DbAssetSummary> =
+        rows.into_iter().map(DbAssetSummary::from_asset_row).collect();
+
+    // Operators use `sidecar_exists` to spot F-28-style drift, so it stays --
+    // but only for the <=100 rows being returned, and off the runtime.
+    let paths: Vec<String> = items.iter().map(|i| i.current_path.clone()).collect();
+    let flags = tokio::task::spawn_blocking(move || {
+        paths
+            .iter()
+            .map(|p| sidecar_exists_for(p))
+            .collect::<Vec<bool>>()
+    })
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!("sidecar existence check failed: {}", e);
+        Vec::new()
+    });
+    for (item, exists) in items.iter_mut().zip(flags) {
+        item.sidecar_exists = exists;
+    }
 
     Ok(DbAssetsPage {
         items,
@@ -2423,6 +2508,11 @@ pub struct DbJobsPage {
     pub offset: i64,
 }
 
+/// List jobs for the DB viewer, filtered, searched and paged **in SQL**.
+///
+/// Same shape of fix as `query_db_assets`: this used to `SELECT *` the whole
+/// `transcode_jobs` table -- `stderr_log_json` and all, up to 200 lines per
+/// failed job -- and filter it in memory for a 25-row page.
 pub async fn query_db_jobs(
     pool: &SqlitePool,
     state: Option<&str>,
@@ -2433,49 +2523,62 @@ pub async fn query_db_jobs(
     let lim = limit.unwrap_or(25).clamp(1, 100);
     let off = offset.unwrap_or(0).max(0);
 
-    let rows: Vec<DurableJobRow> =
-        sqlx::query_as("SELECT * FROM transcode_jobs ORDER BY created_at DESC")
-            .fetch_all(pool)
-            .await?;
+    let state_term = state
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let search_term = search
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
 
-    let state_term = state.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
-    let search_term = search.map(|s| s.trim().to_ascii_lowercase()).unwrap_or_default();
+    let mut clauses: Vec<String> = Vec::new();
+    let mut binds: Vec<String> = Vec::new();
 
-    let mut filtered: Vec<DbJobSummary> = rows
-        .into_iter()
-        .map(DbJobSummary::from_row)
-        .filter(|j| {
-            if !state_term.is_empty() && state_term != "all" {
-                if j.state.to_ascii_lowercase() != state_term
-                    && j.phase.to_ascii_lowercase() != state_term
-                {
-                    return false;
-                }
-            }
-            if search_term.is_empty() {
-                return true;
-            }
-            j.id.to_ascii_lowercase().contains(&search_term)
-                || j.uuid
-                    .as_ref()
-                    .map(|u| u.to_ascii_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-                || j.input_path.to_ascii_lowercase().contains(&search_term)
-                || j.output_path
-                    .as_ref()
-                    .map(|o| o.to_ascii_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-                || j.error
-                    .as_ref()
-                    .map(|e| e.to_ascii_lowercase().contains(&search_term))
-                    .unwrap_or(false)
-        })
-        .collect();
+    // A job matches on either its state or its phase, as it did in memory --
+    // that is what lets the viewer filter on `skipped`, which is a phase.
+    if !state_term.is_empty() && state_term != "all" {
+        clauses.push("(lower(state) = ? OR lower(phase) = ?)".to_string());
+        binds.push(state_term.clone());
+        binds.push(state_term.clone());
+    }
 
-    let total = filtered.len() as i64;
-    let start = (off as usize).min(filtered.len());
-    let end = (start + lim as usize).min(filtered.len());
-    let items = filtered.drain(start..end).collect();
+    if !search_term.is_empty() {
+        clauses.push(
+            "(lower(id) LIKE ? ESCAPE '\\' \
+              OR lower(uuid) LIKE ? ESCAPE '\\' \
+              OR lower(input_path) LIKE ? ESCAPE '\\' \
+              OR lower(output_path) LIKE ? ESCAPE '\\' \
+              OR lower(error) LIKE ? ESCAPE '\\')"
+                .to_string(),
+        );
+        let pattern = like_contains(&search_term);
+        binds.extend(std::iter::repeat_n(pattern, 5));
+    }
+
+    let where_sql = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", clauses.join(" AND "))
+    };
+
+    let count_sql = format!("SELECT COUNT(*) FROM transcode_jobs{}", where_sql);
+    let mut count_q = sqlx::query_scalar::<_, i64>(&count_sql);
+    for b in &binds {
+        count_q = count_q.bind(b);
+    }
+    let total = count_q.fetch_one(pool).await?;
+
+    // idx_transcode_jobs_created_at already covers the ordering.
+    let page_sql = format!(
+        "SELECT * FROM transcode_jobs{} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        where_sql
+    );
+    let mut page_q = sqlx::query_as::<_, DurableJobRow>(&page_sql);
+    for b in &binds {
+        page_q = page_q.bind(b);
+    }
+    let rows: Vec<DurableJobRow> = page_q.bind(lim).bind(off).fetch_all(pool).await?;
+
+    let items: Vec<DbJobSummary> = rows.into_iter().map(DbJobSummary::from_row).collect();
 
     Ok(DbJobsPage {
         items,
@@ -3076,6 +3179,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
+
+    /// SB-01: the jobs listing filters and pages in SQL too. The state filter
+    /// still matches either `state` or `phase` -- that is what makes `skipped`
+    /// (a phase, not a state) selectable -- and the search term is still a
+    /// literal, not a LIKE pattern.
+    #[tokio::test]
+    async fn job_listing_filters_on_state_or_phase_and_pages_in_sql() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        let mut batch: Vec<crate::jobs::JobRecord> = Vec::new();
+        for i in 0..6 {
+            let mut j = crate::jobs::JobRecord::new(&format!("D:/media/clip_{}.mov", i), "ProfileA");
+            j.id = format!("job-{}", i);
+            batch.push(j);
+        }
+        batch[0].state = crate::jobs::JobState::Completed;
+        batch[0].phase = crate::jobs::JobPhase::Skipped;
+        batch[1].state = crate::jobs::JobState::Completed;
+        batch[1].phase = crate::jobs::JobPhase::Completed;
+        batch[2].state = crate::jobs::JobState::Failed;
+        batch[2].error = Some("disk full while writing".to_string());
+        // A name with a LIKE metacharacter in it.
+        batch[3].input_path = "D:/media/100% final.mov".to_string();
+        persist_jobs(&pool, &batch).await.unwrap();
+
+        let all = query_db_jobs(&pool, Some("all"), None, Some(100), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(all.total, 6);
+
+        // `skipped` is a phase; selecting it must still work.
+        let skipped = query_db_jobs(&pool, Some("skipped"), None, Some(100), Some(0))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = skipped.items.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec!["job-0"]);
+
+        // `Completed` is a state, and matching is case-insensitive as before.
+        let completed = query_db_jobs(&pool, Some("completed"), None, Some(100), Some(0))
+            .await
+            .unwrap();
+        assert_eq!(completed.total, 2);
+
+        // Search reaches the error text and the input path.
+        let by_error = query_db_jobs(&pool, None, Some("DISK FULL"), Some(100), Some(0))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = by_error.items.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec!["job-2"]);
+
+        // `_` stays literal: "clip_1" must not also match "clipX1".
+        let underscore = query_db_jobs(&pool, None, Some("clip_1"), Some(100), Some(0))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = underscore.items.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec!["job-1"]);
+
+        let percent = query_db_jobs(&pool, None, Some("100%"), Some(100), Some(0))
+            .await
+            .unwrap();
+        let ids: Vec<&str> = percent.items.iter().map(|j| j.id.as_str()).collect();
+        assert_eq!(ids, vec!["job-3"]);
+
+        // Paging tiles the filter.
+        let first = query_db_jobs(&pool, None, None, Some(4), Some(0)).await.unwrap();
+        let second = query_db_jobs(&pool, None, None, Some(4), Some(4)).await.unwrap();
+        assert_eq!(first.items.len(), 4);
+        assert_eq!(second.items.len(), 2);
+        assert_eq!(first.total, 6);
+        assert_eq!(second.total, 6);
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
     #[tokio::test]
     async fn persist_jobs_writes_a_whole_batch_in_one_transaction() {
         let (pool, temp_dir) = setup_test_pool().await;
@@ -3540,6 +3717,169 @@ mod tests {
         // Recent asset is still in recycle bin
         let recent_check = find_by_uuid_raw(&pool, "recent-asset").await.unwrap();
         assert!(recent_check.is_some());
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+
+    /// SB-01: filtering, searching and paging moved from Rust into SQL. This
+    /// runs the old in-memory implementation and the new query over the same
+    /// fixture and asserts they select the same uuids, in the same order, for
+    /// every filter and for searches containing LIKE metacharacters.
+    #[tokio::test]
+    async fn sql_filtering_selects_exactly_what_the_in_memory_filter_did() {
+        let (pool, temp_dir) = setup_test_pool().await;
+
+        // Names chosen to exercise the subclip heuristics and the LIKE
+        // metacharacters an operator can type into the search box.
+        let fixture: &[(&str, &str, &str)] = &[
+            ("a-plain", "Evening News", "D:/target/news.mp4"),
+            ("a-subclip-name", "Promo subclip 2", "D:/target/promo.mp4"),
+            ("a-sub-clip-name", "Trailer SUB-CLIP", "D:/target/trailer.mp4"),
+            ("a-percent", "100% Crete", "D:/target/100%25.mp4"),
+            ("a-underscore", "wild_card", "D:/target/wild_card.mp4"),
+            ("a-wildish", "wildXcard", "D:/target/wildXcard.mp4"),
+            ("a-folderish", "Doc", "D:/target/docs/doc.mp4"),
+        ];
+        for (uuid, name, path) in fixture {
+            insert_processing(&pool, uuid, 1, None, path, name)
+                .await
+                .unwrap();
+        }
+        // A mix of statuses and one trashed row.
+        mark_ready(
+            &pool, "a-plain", "D:/target/news.mp4", 10_000, true, 25.0, 25, 1, 250, 50, 0, &[], "[]",
+        )
+        .await
+        .unwrap();
+        mark_ready(
+            &pool,
+            "a-percent",
+            "D:/target/100%25.mp4",
+            10_000,
+            true,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &[],
+            "[]",
+        )
+        .await
+        .unwrap();
+        mark_error(&pool, "a-underscore").await.unwrap();
+        trash_asset(&pool, "a-folderish").await.unwrap();
+        // A real trim window, so `is_subclip` is true for a reason other than
+        // the display name.
+        sqlx::query("UPDATE media_assets SET trim_in_ms = 500 WHERE uuid = 'a-wildish'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        /// The filter exactly as it was written before this change.
+        fn reference(
+            all: &[MediaAsset],
+            filter_mode: &str,
+            search_term: &str,
+        ) -> Vec<String> {
+            let mut rows: Vec<&MediaAsset> = all.iter().collect();
+            rows.sort_by(|a, b| {
+                let ka = a.deleted_at.clone().unwrap_or_else(|| "9999".to_string());
+                let kb = b.deleted_at.clone().unwrap_or_else(|| "9999".to_string());
+                ka.cmp(&kb)
+                    .then(a.display_name.cmp(&b.display_name))
+                    .then(a.uuid.cmp(&b.uuid))
+            });
+            rows.into_iter()
+                .map(|a| DbAssetSummary::from_asset_row(a.clone()))
+                .filter(|a| {
+                    let matches_filter = match filter_mode {
+                        "master" => !a.is_subclip && a.deleted_at.is_none(),
+                        "subclip" => a.is_subclip && a.deleted_at.is_none(),
+                        "ready" => a.status == "ready" && a.deleted_at.is_none(),
+                        "processing" => a.status == "processing" && a.deleted_at.is_none(),
+                        "error" => a.status == "error" && a.deleted_at.is_none(),
+                        "trashed" => a.deleted_at.is_some(),
+                        _ => true,
+                    };
+                    if !matches_filter {
+                        return false;
+                    }
+                    if search_term.is_empty() {
+                        return true;
+                    }
+                    a.display_name.to_ascii_lowercase().contains(search_term)
+                        || a.uuid.to_ascii_lowercase().contains(search_term)
+                        || a.virtual_folder.to_ascii_lowercase().contains(search_term)
+                        || a.current_path.to_ascii_lowercase().contains(search_term)
+                })
+                .map(|a| a.uuid)
+                .collect()
+        }
+
+        let all: Vec<MediaAsset> = sqlx::query_as(&format!(
+            "SELECT {} FROM media_assets",
+            SELECT_COLS
+        ))
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        for filter in [
+            "all",
+            "master",
+            "subclip",
+            "ready",
+            "processing",
+            "error",
+            "trashed",
+        ] {
+            for search in ["", "wild", "%", "_", "100%", "wild_card", "TARGET", "nope"] {
+                let expected = reference(&all, filter, &search.to_ascii_lowercase());
+                let page = query_db_assets(&pool, Some(filter), Some(search), Some(100), Some(0))
+                    .await
+                    .unwrap();
+                let got: Vec<String> = page.items.iter().map(|i| i.uuid.clone()).collect();
+                assert_eq!(
+                    got, expected,
+                    "filter={:?} search={:?} diverged",
+                    filter, search
+                );
+                assert_eq!(page.total, expected.len() as i64, "total for {:?}", filter);
+            }
+        }
+
+        // A `_` stays a literal: it must not match `wildXcard` the way an
+        // unescaped LIKE wildcard would (the F-05 class of bug).
+        let page = query_db_assets(&pool, None, Some("wild_card"), Some(100), Some(0))
+            .await
+            .unwrap();
+        let got: Vec<String> = page.items.iter().map(|i| i.uuid.clone()).collect();
+        assert_eq!(got, vec!["a-underscore".to_string()]);
+
+        // Paging is done in SQL now; the pages must still tile the filter.
+        let first = query_db_assets(&pool, Some("all"), None, Some(3), Some(0))
+            .await
+            .unwrap();
+        let second = query_db_assets(&pool, Some("all"), None, Some(3), Some(3))
+            .await
+            .unwrap();
+        assert_eq!(first.total, 7);
+        assert_eq!(second.total, 7);
+        assert_eq!(first.items.len(), 3);
+        let full = query_db_assets(&pool, Some("all"), None, Some(100), Some(0))
+            .await
+            .unwrap();
+        let tiled: Vec<String> = first
+            .items
+            .iter()
+            .chain(second.items.iter())
+            .map(|i| i.uuid.clone())
+            .collect();
+        let expected: Vec<String> = full.items[..6].iter().map(|i| i.uuid.clone()).collect();
+        assert_eq!(tiled, expected);
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
