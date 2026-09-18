@@ -4,6 +4,8 @@
       :watch="watchfolder"
       :tool="toolchain"
       :running="serviceRunning"
+      :service-state="serviceStatus?.state"
+      :link="linkState"
       :dl="downloading"
       :uptime="uptimeMs"
       @start="onStart"
@@ -39,9 +41,13 @@
               placeholder="API token"
               style="width:100%;margin-bottom:12px"
             />
-            <button class="btn btn-primary" type="submit" :disabled="!tokenInput.trim()">
-              Connect
+            <p v-if="tokenError" class="token-error" role="alert">{{ tokenError }}</p>
+            <button class="btn btn-primary" type="submit" :disabled="!tokenInput.trim() || tokenChecking">
+              {{ tokenChecking ? 'Checking…' : 'Connect' }}
             </button>
+            <p class="text-muted" style="font-size:12px;margin-top:10px">
+              The token is kept for this browser tab only — closing the tab forgets it.
+            </p>
           </form>
         </div>
       </div>
@@ -273,7 +279,7 @@
             </div>
             <div class="log-viewer" ref="logViewerRef">
               <div v-if="!logs.length" class="text-muted" style="padding:20px;text-align:center">No log entries</div>
-              <div v-for="(line, i) in logs" :key="i" class="log-line" :class="logLevel(line)">{{ line }}</div>
+              <div v-for="line in logLines" :key="line.seq" class="log-line" :class="logLevel(line.text)">{{ line.text }}</div>
             </div>
           </div>
         </div>
@@ -308,20 +314,34 @@ const activeTab = ref('dashboard')
 
 const {
   jobs, assets, watchfolder, stats, config, toolchain,
-  serviceRunning, downloading, logs, uptimeMs,
+  serviceRunning, serviceStatus, downloading, logs, logLines, linkState, uptimeMs,
   fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
-  clearLogs, retryJob, cancelJob, retryAllFailed,
+  setLogPolling, clearLogs, retryJob, cancelJob, retryAllFailed,
   authRequired, applyApiToken,
 } = useEventStream()
 
 const tokenInput = ref('')
+const tokenError = ref('')
+const tokenChecking = ref(false)
 
-function onSubmitToken() {
+async function onSubmitToken() {
   const value = tokenInput.value.trim()
-  if (!value) return
-  applyApiToken(value)
-  tokenInput.value = ''
-  void loadAndDecideWizard()
+  if (!value || tokenChecking.value) return
+  tokenError.value = ''
+  tokenChecking.value = true
+  try {
+    const result = await applyApiToken(value)
+    if (!result.ok) {
+      // Keep what they typed: it is usually a paste that lost a character,
+      // not a value they want to retype from scratch (UX-08).
+      tokenError.value = result.error || 'Token rejected by the service'
+      return
+    }
+    tokenInput.value = ''
+    await loadAndDecideWizard()
+  } finally {
+    tokenChecking.value = false
+  }
 }
 
 const configStatus = ref<'loading' | 'ready'>('loading')
@@ -531,9 +551,12 @@ async function onStart() {
 
 onMounted(loadAndDecideWizard)
 
-watch(activeTab, () => {
-  if (activeTab.value === 'config') fetchConfig()
-})
+watch(activeTab, (tab) => {
+  if (tab === 'config') fetchConfig()
+  // The log ring is only polled while the tab that shows it is on screen
+  // (SF-01): it was 500 lines every 2 s from every open tab, forever.
+  setLogPolling(tab === 'logs')
+}, { immediate: true })
 
 watch([editThreads, editCpuCores, editConcurrency], recomputeThreads)
 
@@ -550,6 +573,12 @@ watch(logs, async (newLogs) => {
 </script>
 
 <style scoped>
+.token-error {
+  color: var(--accent-crimson);
+  font-size: 12px;
+  margin-bottom: 10px;
+}
+
 .app-shell {
   min-height: 100vh;
   display: flex;

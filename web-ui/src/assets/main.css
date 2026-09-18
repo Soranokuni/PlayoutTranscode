@@ -173,6 +173,7 @@ input[type="range"] {
 .status-dot.ok { background: var(--accent-emerald); box-shadow: 0 0 4px rgba(63,185,80,0.5); }
 .status-dot.err { background: var(--accent-crimson); }
 .status-dot.idle { background: var(--text-secondary); }
+.status-dot.warn { background: var(--accent-amber); box-shadow: 0 0 4px rgba(245,166,35,0.5); }
 
 .glass-panel {
   background: var(--bg-panel);

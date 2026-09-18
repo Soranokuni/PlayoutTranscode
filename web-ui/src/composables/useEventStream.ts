@@ -1,4 +1,4 @@
-import { ref, onMounted, onUnmounted } from 'vue'
+import { ref, shallowRef, computed, triggerRef, onMounted, onUnmounted } from 'vue'
 import {
   apiFetch,
   apiFetchDestructive,
@@ -90,6 +90,26 @@ export interface StatsPayload {
   total: number
 }
 
+/** `GET /api/service/status`. `state` distinguishes the transitional states
+ *  that the boolean `running` collapses; `restart_required` is true when the
+ *  processing loop predates the saved configuration. */
+export interface ServiceStatusPayload {
+  running: boolean
+  state: 'running' | 'starting' | 'stopping' | 'stopped' | string
+  generation: number
+  restart_required: boolean
+}
+
+/** One line of the log ring, keyed by the server's monotonic cursor. */
+export interface LogLine {
+  seq: number
+  text: string
+}
+
+/** How the UI is currently getting its data. Shown in the top bar, because a
+ *  dead stream behind a working poll used to look exactly like a live one. */
+export type LinkState = 'live' | 'reconnecting' | 'offline'
+
 export interface AudioPolicyPayload {
   mode: 'legacy_v1_encode' | 'ebu_r128' | 'atsc_a85' | 'passthrough_validate' | 'analyze_only'
   codec: string
@@ -149,17 +169,41 @@ function shortFileName(path: string) {
 }
 
 export function useEventStream() {
-  const jobs = ref<Map<string, JobRecord>>(new Map())
+  // `shallowRef` + explicit `triggerRef`: a progress event mutates the record
+  // in place instead of rebuilding the whole Map, so a tick no longer
+  // invalidates every computed that reads `jobs` and re-renders every row.
+  const jobs = shallowRef<Map<string, JobRecord>>(new Map())
   const assets = ref<AssetRecord[]>([])
   const health = ref<HealthPayload | null>(null)
   const watchfolder = ref<WatchfolderPayload | null>(null)
-  const stats = ref<StatsPayload>({ pending: 0, active: 0, completed: 0, failed: 0, total: 0 })
   const config = ref<ConfigPayload | null>(null)
   const toolchain = ref<ToolchainPayload>({ ffmpeg_found: false, ffprobe_found: false, ffmpeg_version: null, ffprobe_version: null, bin_dir: '' })
+  const serviceStatus = ref<ServiceStatusPayload | null>(null)
   const serviceRunning = ref(false)
   const downloading = ref(false)
-  const logs = ref<string[]>([])
+  const logLines = shallowRef<LogLine[]>([])
   const uptimeMs = ref(0)
+  const linkState = ref<LinkState>('reconnecting')
+
+  /** The five counters `/api/stats` reports, derived from the job list the UI
+   *  already holds. Both are `state.jobs` on the server, so polling the second
+   *  endpoint only ever confirmed the first. */
+  const stats = computed<StatsPayload>(() => {
+    const counts: StatsPayload = { pending: 0, active: 0, completed: 0, failed: 0, total: 0 }
+    for (const job of jobs.value.values()) {
+      counts.total++
+      switch (job.state) {
+        case 'Pending': counts.pending++; break
+        case 'Processing': counts.active++; break
+        case 'Completed': counts.completed++; break
+        case 'Failed': counts.failed++; break
+      }
+    }
+    return counts
+  })
+
+  /** Kept as plain strings for every existing consumer. */
+  const logs = computed<string[]>(() => logLines.value.map((l) => l.text))
 
   // True once the service has answered 401: the operator must enter the token
   // configured in `server.api_token` (T1-1).
@@ -169,17 +213,54 @@ export function useEventStream() {
     authRequired.value = required
   })
 
-  function applyApiToken(value: string) {
+  /**
+   * Try a token and say whether the service accepted it.
+   *
+   * This used to apply the token, reconnect and refetch without waiting: a
+   * wrong token produced a 401 that set `authRequired` back to true, so the
+   * same empty form reappeared with no message and the operator could not tell
+   * "rejected" from "nothing happened" (UX-08).
+   */
+  async function applyApiToken(value: string): Promise<{ ok: boolean; error?: string }> {
+    const previous = getApiToken()
     setApiToken(value)
     apiToken.value = getApiToken()
+
+    let accepted = false
+    try {
+      const r = await apiFetch('/api/stats')
+      accepted = r.ok
+      if (!accepted && r.status !== 401) {
+        setApiToken(previous ?? '')
+        apiToken.value = getApiToken()
+        return { ok: false, error: `Service answered ${r.status}` }
+      }
+    } catch {
+      setApiToken(previous ?? '')
+      apiToken.value = getApiToken()
+      return { ok: false, error: 'Could not reach the service' }
+    }
+
+    if (!accepted) {
+      setApiToken(previous ?? '')
+      apiToken.value = getApiToken()
+      return { ok: false, error: 'Token rejected by the service' }
+    }
+
     // The SSE stream carries the token in its URL, so it has to be rebuilt.
     connectSSE()
-    void fetchAll()
+    await fetchAll()
+    return { ok: true }
   }
 
   let sseConnection: EventSource | null = null
-  let pollInterval: number = 0
+  let liveTimer = 0
+  let staticTimer = 0
+  let downloadTimer = 0
+  let logTimer = 0
   let reconnectDelay = 500
+  let logCursor = 0
+  let logPollingEnabled = false
 
   async function apiGet<T = unknown>(path: string): Promise<T | null> {
     try {
@@ -225,29 +306,79 @@ export function useEventStream() {
     }
   }
 
-  async function fetchAll() {
-    const [h, t, s, j, l, w] = await Promise.all([
+  /** Everything that changes while work is running. */
+  async function fetchLive() {
+    const [h, j, st] = await Promise.all([
       apiGet<HealthPayload>('/health'),
-      apiGet<ToolchainPayload>('/toolchain'),
-      apiGet<StatsPayload>('/stats'),
       apiGet<JobRecord[]>('/jobs'),
-      apiGet<string[]>('/logs'),
-      apiGet<WatchfolderPayload>('/watchfolder'),
+      apiGet<ServiceStatusPayload>('/service/status'),
     ])
     if (h) {
       serviceRunning.value = h.service_running
       uptimeMs.value = h.uptime_ms
       health.value = h
     }
-    if (t) toolchain.value = t
-    if (s) stats.value = s
     if (j) {
       const map = new Map<string, JobRecord>()
       for (const job of j) map.set(job.id, job)
       jobs.value = map
     }
-    if (l) logs.value = l
+    if (st) {
+      serviceStatus.value = st
+      serviceRunning.value = st.running
+    }
+  }
+
+  /** Everything that only changes when an operator changes it. `/toolchain` is
+   *  cached server-side for 60 s, and `/watchfolder` only moves on a save. */
+  async function fetchStatic() {
+    const [t, w] = await Promise.all([
+      apiGet<ToolchainPayload>('/toolchain'),
+      apiGet<WatchfolderPayload>('/watchfolder'),
+    ])
+    if (t) toolchain.value = t
     if (w) watchfolder.value = w
+  }
+
+  /** Just the service lifecycle, for right after a save/start/stop. */
+  async function fetchServiceStatus() {
+    const st = await apiGet<ServiceStatusPayload>('/service/status')
+    if (st) {
+      serviceStatus.value = st
+      serviceRunning.value = st.running
+    }
+    return st
+  }
+
+  async function fetchAll() {
+    await Promise.all([fetchLive(), fetchStatic()])
+  }
+
+  /**
+   * Pull only the log lines added since the last poll.
+   *
+   * The ring shifts by one on every line, so refetching all 500 on every poll changed
+   * the content at every index and made the viewer repaint every row (UX-05).
+   */
+  async function fetchLogs(force = false) {
+    if (force) logCursor = 0
+    const page = await apiGet<{ lines: LogLine[]; next: number; dropped: boolean }>(
+      `/logs?since=${logCursor}`,
+    )
+    if (!page) return
+    if (page.dropped || logCursor === 0) {
+      logLines.value = page.lines
+    } else if (page.lines.length > 0) {
+      const merged = logLines.value.concat(page.lines)
+      logLines.value = merged.length > 500 ? merged.slice(merged.length - 500) : merged
+    }
+    logCursor = page.next
+  }
+
+  /** Called by the Logs tab so the ring is only polled while it is on screen. */
+  function setLogPolling(enabled: boolean) {
+    logPollingEnabled = enabled
+    if (enabled) void fetchLogs(true)
   }
 
   async function apiPut<T = unknown>(
@@ -283,6 +414,10 @@ export function useEventStream() {
     // PUT /config requires X-Confirm-Destructive (T1-5).
     await apiPut('/config', body, true)
     await fetchConfig()
+    // The running loop kept its old clone of the config (F-23), so the save
+    // may have left the service running on stale values. UX-01 turns this into
+    // a visible banner instead of nothing happening.
+    await fetchServiceStatus()
   }
   async function fetchConfig() {
     const c = await apiGet<ConfigPayload>('/config')
@@ -377,15 +512,57 @@ export function useEventStream() {
     assets.value = collected
   }
 
+  /**
+   * Replace one asset in the library instead of re-paging all of it.
+   *
+   * A `completed` or `skipped` payload already carries the uuid, so a bulk drop
+   * of 30 files no longer reloads a 5 000-asset library 30 times (SF-02).
+   */
+  async function refreshAsset(uuid: string) {
+    const a = await apiGet<AssetRecord>(`/assets/${encodeURIComponent(uuid)}`)
+    if (!a) return
+    const index = assets.value.findIndex((x) => x.uuid === a.uuid)
+    if (index >= 0) {
+      assets.value.splice(index, 1, a)
+    } else {
+      assets.value.push(a)
+    }
+  }
+
+  // Terminal events arrive in bursts -- several encodes finishing within a
+  // second used to fire several concurrent full refreshes. Collect them and do
+  // one pass on the trailing edge.
+  let terminalTimer = 0
+  const pendingUuids = new Set<string>()
+  const TERMINAL_DEBOUNCE_MS = 750
+
+  function scheduleTerminalRefresh(uuid?: string) {
+    if (uuid) pendingUuids.add(uuid)
+    if (terminalTimer) return
+    terminalTimer = window.setTimeout(async () => {
+      terminalTimer = 0
+      const uuids = Array.from(pendingUuids)
+      pendingUuids.clear()
+      await fetchLive()
+      if (uuids.length === 0) {
+        // No uuid to aim at (a plain `failed`), so nothing in the library
+        // changed shape -- the status came down with fetchLive.
+        return
+      }
+      await Promise.all(uuids.map((u) => refreshAsset(u)))
+    }, TERMINAL_DEBOUNCE_MS)
+  }
+
   function handleSSEEvent(eventType: string, data: unknown) {
     switch (eventType) {
       case 'progress': {
         const p = data as ProgressPayload
-        const map = new Map(jobs.value)
-        const existing = map.get(p.id)
+        const existing = jobs.value.get(p.id)
         if (existing) {
-          map.set(p.id, {
-            ...existing,
+          // In place: rebuilding the Map on every tick invalidated every
+          // computed reading `jobs` and re-rendered every row, including the
+          // failed list with its <pre> stderr blocks (SF-03).
+          Object.assign(existing, {
             progress: p.percent,
             current_stage: p.stage,
             current_frame: 0,
@@ -395,19 +572,26 @@ export function useEventStream() {
             current_time_ms: p.current_time_ms,
             duration_ms: p.duration_ms,
           })
-          jobs.value = map
+          triggerRef(jobs)
         }
         break
       }
       case 'completed':
-      case 'failed':
       case 'skipped': {
-        fetchAll()
-        fetchAssets()
+        const payload = data as { uuid?: string }
+        scheduleTerminalRefresh(payload?.uuid)
+        break
+      }
+      case 'failed': {
+        // The asset is `error`; nothing to fetch unless the payload names one.
+        const payload = data as { uuid?: string }
+        scheduleTerminalRefresh(payload?.uuid)
         break
       }
       case 'connected': {
+        linkState.value = 'live'
         fetchAll()
+        fetchAssets()
         break
       }
       // The server dropped events for this subscriber -- a throttled background
@@ -418,6 +602,7 @@ export function useEventStream() {
         console.warn('[useEventStream] missed', r?.dropped ?? '?', 'event(s); resynchronising')
         fetchAll()
         fetchAssets()
+        if (logPollingEnabled) void fetchLogs(true)
         break
       }
     }
@@ -452,13 +637,73 @@ export function useEventStream() {
 
     sseConnection.onopen = () => {
       reconnectDelay = 500
+      linkState.value = 'live'
+      schedulePolling()
     }
 
     sseConnection.onerror = () => {
       sseConnection?.close()
+      // The stream is the primary channel, so losing it is what makes the poll
+      // speed up -- and it is what the top bar reports, because a dead stream
+      // behind a working poll used to look identical to a live one.
+      linkState.value = 'reconnecting'
+      schedulePolling()
       reconnectDelay = Math.min(reconnectDelay * 2, 5000)
       setTimeout(connectSSE, reconnectDelay)
     }
+  }
+
+  // With the stream healthy the poll is only a safety net; without it, it is
+  // the data path.
+  const LIVE_MS_SSE_OK = 15_000
+  const LIVE_MS_SSE_DOWN = 2_000
+  const STATIC_MS = 60_000
+  const LOG_MS = 2_000
+
+  function stopPolling() {
+    window.clearInterval(liveTimer)
+    window.clearInterval(staticTimer)
+    window.clearInterval(logTimer)
+    liveTimer = 0
+    staticTimer = 0
+    logTimer = 0
+  }
+
+  function schedulePolling() {
+    stopPolling()
+    // A hidden tab has nobody looking at it; `connected`/`resync` cover
+    // whatever it missed when it comes back.
+    if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return
+
+    const liveMs = linkState.value === 'live' ? LIVE_MS_SSE_OK : LIVE_MS_SSE_DOWN
+    liveTimer = window.setInterval(() => { void fetchLive() }, liveMs)
+    staticTimer = window.setInterval(() => { void fetchStatic() }, STATIC_MS)
+    logTimer = window.setInterval(() => {
+      if (logPollingEnabled) void fetchLogs()
+    }, LOG_MS)
+  }
+
+  /** Poll `/download/status` only while a download is actually running. */
+  function startDownloadPolling() {
+    if (downloadTimer) return
+    downloadTimer = window.setInterval(async () => {
+      const ds = await apiGet<{ status: string }>('/download/status')
+      downloading.value = ds?.status === 'downloading'
+      if (!downloading.value) {
+        window.clearInterval(downloadTimer)
+        downloadTimer = 0
+        // A finished download changes the toolchain.
+        void fetchStatic()
+      }
+    }, 2000)
+  }
+
+  function onVisibilityChange() {
+    if (document.visibilityState === 'visible') {
+      void fetchLive()
+      if (logPollingEnabled) void fetchLogs()
+    }
+    schedulePolling()
   }
 
   async function startService() {
@@ -467,17 +712,23 @@ export function useEventStream() {
       serviceRunning.value = true
       await fetchAll()
     }
+    await fetchServiceStatus()
     return r
   }
 
   async function stopService() {
-    await apiPost('/service/stop', true)
+    const r = await apiPost<{ success?: boolean; error?: string }>('/service/stop', true)
     serviceRunning.value = false
+    await fetchServiceStatus()
+    return r
   }
 
   async function downloadFFmpeg() {
     const r = await apiPost<{ success: boolean }>('/download/start')
-    if (r?.success) downloading.value = true
+    if (r?.success) {
+      downloading.value = true
+      startDownloadPolling()
+    }
     return r
   }
 
@@ -502,7 +753,7 @@ export function useEventStream() {
   }
 
   function clearLogs() {
-    logs.value = []
+    logLines.value = []
   }
 
   onMounted(() => {
@@ -510,16 +761,24 @@ export function useEventStream() {
     fetchConfig()
     fetchAssets()
     connectSSE()
+    schedulePolling()
+    document.addEventListener('visibilitychange', onVisibilityChange)
 
-    pollInterval = window.setInterval(async () => {
-      await fetchAll()
-      const ds = await apiGet<{ status: string }>('/download/status')
-      downloading.value = ds?.status === 'downloading'
-    }, 2000)
+    // A download already in flight when the tab opened still has to be
+    // followed to its end.
+    void apiGet<{ status: string }>('/download/status').then((ds) => {
+      if (ds?.status === 'downloading') {
+        downloading.value = true
+        startDownloadPolling()
+      }
+    })
   })
 
   onUnmounted(() => {
-    clearInterval(pollInterval)
+    stopPolling()
+    window.clearInterval(downloadTimer)
+    window.clearTimeout(terminalTimer)
+    document.removeEventListener('visibilitychange', onVisibilityChange)
     sseConnection?.close()
   })
 
@@ -531,11 +790,18 @@ export function useEventStream() {
     stats,
     config,
     toolchain,
+    serviceStatus,
     serviceRunning,
     downloading,
     logs,
+    logLines,
+    linkState,
     uptimeMs,
     fetchAll,
+    fetchLive,
+    fetchServiceStatus,
+    fetchLogs,
+    setLogPolling,
     fetchConfig,
     putConfig,
     fetchAssets,

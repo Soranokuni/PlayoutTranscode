@@ -41,13 +41,32 @@
     </div>
 
     <div class="tb-right">
-      <div class="tb-service">
-        <span class="status-dot" :class="running ? 'ok' : 'idle'" />
-        <span :class="running ? 'text-success' : 'text-muted'" style="font-size:12px;font-weight:600">
-          {{ running ? 'Running' : 'Stopped' }}
+      <!-- How the page is getting its data. A dead stream behind a working
+           poll used to look exactly like a live one. -->
+      <div class="tb-link" :title="linkTitle">
+        <span class="status-dot" :class="link === 'live' ? 'ok' : 'warn'" />
+        <span :class="link === 'live' ? 'text-muted' : 'text-warning'" class="tb-link-label">
+          {{ link === 'live' ? 'Live' : 'Reconnecting' }}
         </span>
-        <button v-if="!running" class="btn btn-primary" style="padding:4px 14px;font-size:12px" @click="$emit('start')">Start</button>
-        <button v-else class="btn btn-danger" style="padding:4px 14px;font-size:12px" @click="$emit('stop')">Stop</button>
+      </div>
+
+      <div class="tb-service">
+        <span class="status-dot" :class="serviceDot" />
+        <span :class="serviceTextClass" class="tb-service-label">
+          {{ serviceGlyph }} {{ serviceLabel }}
+        </span>
+        <button
+          v-if="!running"
+          class="btn btn-primary tb-action"
+          :disabled="busy || transitioning"
+          @click="$emit('start')"
+        >Start</button>
+        <button
+          v-else
+          class="btn btn-danger tb-action"
+          :disabled="busy || transitioning"
+          @click="$emit('stop')"
+        >Stop</button>
       </div>
     </div>
   </header>
@@ -55,12 +74,19 @@
 
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { ToolchainPayload, WatchfolderPayload } from '../composables/useEventStream'
+import type { LinkState, ToolchainPayload, WatchfolderPayload } from '../composables/useEventStream'
 
 const props = defineProps<{
   watch: WatchfolderPayload | null
   tool: ToolchainPayload
   running: boolean
+  /** The full lifecycle state from `/api/service/status`, which the boolean
+   *  `running` collapses. Undefined until the first status fetch lands. */
+  serviceState?: string
+  /** Whether the SSE stream is up. */
+  link: LinkState
+  /** A start/stop request is in flight. */
+  busy?: boolean
   dl: boolean
   uptime: number
 }>()
@@ -70,6 +96,57 @@ defineEmits<{
   stop: []
   download: []
 }>()
+
+/** `starting` and `stopping` are not states to act on. */
+const transitioning = computed(
+  () => props.serviceState === 'starting' || props.serviceState === 'stopping',
+)
+
+const serviceDot = computed(() => {
+  switch (props.serviceState) {
+    case 'running': return 'ok'
+    case 'starting':
+    case 'stopping': return 'warn'
+    case 'stopped': return 'idle'
+    default: return props.running ? 'ok' : 'idle'
+  }
+})
+
+/** A glyph beside every colour-coded state, for operators who cannot rely on
+ *  the dot (UX-07). */
+const serviceGlyph = computed(() => {
+  switch (serviceDot.value) {
+    case 'ok': return '●'
+    case 'warn': return '◐'
+    default: return '○'
+  }
+})
+
+const serviceLabel = computed(() => {
+  switch (props.serviceState) {
+    case 'running': return 'Ingest running'
+    case 'starting': return 'Starting…'
+    case 'stopping': return 'Stopping…'
+    // The HTTP server answered, so the service is reachable -- what is stopped
+    // is the ingest loop. A bare "Stopped" read as "nothing is up".
+    case 'stopped': return 'Service reachable, ingest stopped'
+    default: return props.running ? 'Ingest running' : 'Ingest stopped'
+  }
+})
+
+const serviceTextClass = computed(() => {
+  switch (serviceDot.value) {
+    case 'ok': return 'text-success'
+    case 'warn': return 'text-warning'
+    default: return 'text-muted'
+  }
+})
+
+const linkTitle = computed(() =>
+  props.link === 'live'
+    ? 'Live: updates arrive over the event stream'
+    : 'The event stream is down; falling back to polling every 2 s',
+)
 
 function toolShortVer(v: string) {
   return v ? v.split(' ').pop() || v : ''
@@ -143,6 +220,25 @@ const uptimeText = computed(() => {
   display: flex;
   align-items: center;
   gap: 4px;
+}
+.tb-link {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 12px;
+}
+.tb-link-label {
+  font-size: 11px;
+  font-weight: 600;
+}
+.tb-service-label {
+  font-size: 12px;
+  font-weight: 600;
+}
+/* Repeated inline styles moved into a class (UX-07). */
+.tb-action {
+  padding: 4px 14px;
+  font-size: 12px;
 }
 .tb-value {
   font-size: 12px;
