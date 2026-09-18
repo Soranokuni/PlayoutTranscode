@@ -168,21 +168,6 @@ pub async fn run_service(
     let target_root = PathBuf::from(&app_config.paths.target_folder);
     let _ = std::fs::create_dir_all(&target_root);
 
-    // One-time move of sidecars written beside their media by earlier versions
-    // into the canonical `<target>/sidecars/` directory (T3-5). Idempotent, so
-    // it costs one directory listing per start after the first.
-    {
-        let report = identity::migrate_legacy_sidecars(&target_root.join("videos"));
-        if report.moved > 0 || report.failed > 0 {
-            tracing::info!(
-                "Sidecar migration: {} moved, {} already current, {} failed",
-                report.moved,
-                report.already_current,
-                report.failed
-            );
-        }
-    }
-
     let config_initialized = app_config.initialized;
 
     let server_cfg = app_config.clone();
@@ -210,6 +195,43 @@ pub async fn run_service(
             async move { server_shutdown.wait().await },
         )
         .await
+    });
+
+    // Everything below this point runs with the listener already accepting, so
+    // PlayOut's health light goes green as soon as the socket is up (SB-07)
+    // rather than after a filesystem walk and a 25 s hash of the toolchain.
+
+    // One-time move of sidecars written beside their media by earlier versions
+    // into the canonical `<target>/sidecars/` directory (T3-5). Idempotent, so
+    // it costs one directory listing per start after the first -- but that
+    // listing is a `WalkDir` over `<target>/videos`, which on an SMB target is
+    // not free, and it is blocking work that has no business on the runtime.
+    //
+    // Both run on detached OS threads rather than `spawn_blocking`, because
+    // dropping the Tokio runtime waits for blocking tasks to finish and a
+    // 25 s hash would eat most of the 30 s the SCM allows for a stop. Both are
+    // idempotent and both write atomically, so being cut short by a shutdown
+    // only means the next start redoes them.
+    let sidecar_root = target_root.join("videos");
+    std::thread::spawn(move || {
+        let report = identity::migrate_legacy_sidecars(&sidecar_root);
+        if report.moved > 0 || report.failed > 0 {
+            tracing::info!(
+                "Sidecar migration: {} moved, {} already current, {} failed",
+                report.moved,
+                report.already_current,
+                report.failed
+            );
+        }
+    });
+
+    // The real SHA-256 of the toolchain, ~25 s for the shipped pair. Until it
+    // lands, `/api/toolchain` reports the cached hash from the last start (or
+    // `null` after a cold start or a changed binary), which the UI tolerates.
+    std::thread::spawn(|| {
+        if bootstrap::refresh_toolchain_hashes() {
+            tracing::info!("Toolchain hashes refreshed");
+        }
     });
 
     if config_initialized

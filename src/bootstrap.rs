@@ -156,15 +156,136 @@ pub fn file_sha256(path: &Path) -> Option<String> {
     Some(format!("{:x}", hasher.finalize()))
 }
 
-/// Resolve and describe the toolchain, hashing both binaries.
+/// One remembered hash, valid only while the file it describes is untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct HashCacheEntry {
+    len: u64,
+    /// Modification time in milliseconds since the Unix epoch.
+    mtime_ms: u128,
+    sha256: String,
+}
+
+type HashCache = std::collections::BTreeMap<String, HashCacheEntry>;
+
+fn hash_cache_path() -> PathBuf {
+    crate::paths::data_dir().join("toolchain-hashes.json")
+}
+
+fn read_hash_cache() -> HashCache {
+    fs::read_to_string(hash_cache_path())
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// `(len, mtime)` of a file, the identity a cached hash is keyed on.
+fn file_identity(path: &Path) -> Option<(u64, u128)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ms = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some((meta.len(), mtime_ms))
+}
+
+/// The remembered SHA-256 of `path`, if the file still has the size and
+/// modification time it had when it was hashed.
+///
+/// This is a *startup latency* optimisation, not a weakening of verification:
+/// `refresh_toolchain_hashes` re-hashes in the background on every start and
+/// overwrites the cache, so a binary swapped in with a forged size and
+/// timestamp is still caught within seconds of boot rather than at boot.
+fn cached_sha256(path: &Path) -> Option<String> {
+    let (len, mtime_ms) = file_identity(path)?;
+    let cache = read_hash_cache();
+    let entry = cache.get(&path.to_string_lossy().into_owned())?;
+    (entry.len == len && entry.mtime_ms == mtime_ms).then(|| entry.sha256.clone())
+}
+
+/// Hash the resolved binaries for real and write the result to the cache.
+///
+/// Blocking and slow by design (~25 s for the shipped 170 MB pair), so it is
+/// called from `spawn_blocking` *after* the listener is bound. Returns whether
+/// anything changed, which is worth a log line.
+pub fn refresh_toolchain_hashes() -> bool {
+    let policy = current_policy();
+    if !policy.verify_on_startup {
+        return false;
+    }
+    let dirs = search_dirs();
+    let mut cache = read_hash_cache();
+    let mut changed = false;
+
+    for (name, configured) in [
+        ("ffmpeg", policy.ffmpeg_path.as_deref()),
+        ("ffprobe", policy.ffprobe_path.as_deref()),
+    ] {
+        let Some(path) = resolve_tool_in(name, configured, &dirs) else {
+            continue;
+        };
+        let Some((len, mtime_ms)) = file_identity(&path) else {
+            continue;
+        };
+        let Some(sha256) = file_sha256(&path) else {
+            continue;
+        };
+        let key = path.to_string_lossy().into_owned();
+        let entry = HashCacheEntry {
+            len,
+            mtime_ms,
+            sha256,
+        };
+        if cache.get(&key) != Some(&entry) {
+            if let Some(previous) = cache.get(&key) {
+                tracing::warn!(
+                    "{} changed since the last start: its SHA-256 is now {} (was {})",
+                    name,
+                    entry.sha256,
+                    previous.sha256
+                );
+            }
+            changed = true;
+            cache.insert(key, entry);
+        }
+    }
+
+    if changed {
+        let path = hash_cache_path();
+        if let Some(dir) = path.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        // Write-then-rename: this runs on a detached thread that a shutdown
+        // may cut short, and a half-written file must not become the cache.
+        match serde_json::to_string_pretty(&cache) {
+            Ok(text) => {
+                let tmp = path.with_extension("json.tmp");
+                if let Err(e) = fs::write(&tmp, text).and_then(|_| fs::rename(&tmp, &path)) {
+                    tracing::warn!("could not write the toolchain hash cache: {}", e);
+                    let _ = fs::remove_file(&tmp);
+                }
+            }
+            Err(e) => tracing::warn!("could not serialise the toolchain hash cache: {}", e),
+        }
+    }
+    changed
+}
+
+/// Resolve and describe the toolchain.
 ///
 /// Honours `toolchain_policy.verify_on_startup`: when false, the SHA-256 of
-/// each binary is skipped and reported as `None`. Hashing a ~170 MB pair costs
-/// around 25 s, and it ran before the HTTP server bound — 25 s of a red status
-/// light in PlayOut every time a broadcast host rebooted (T3-3). Everything
-/// else the audit does (resolution, `-version`) is cheap and still runs, and
-/// `ensure_toolchain` still verifies before an encode, so nothing runs
-/// unverified either way.
+/// each binary is skipped and reported as `None`.
+///
+/// When it is on, the hash is read from the `(path, len, mtime)`-keyed cache
+/// rather than computed here. Computing it inline cost around 25 s for the
+/// shipped ~170 MB pair, and this function runs before the HTTP server binds
+/// and again from `ensure_toolchain` -- so that was 25 s of a red status light
+/// in PlayOut on every reboot (T3-3). `refresh_toolchain_hashes` recomputes
+/// them in the background once the listener is up, so `ffmpeg_sha256` is
+/// `null` for the first few seconds after a cold start instead of the whole
+/// boot being 25 s longer. `ensure_toolchain`'s found/not-found check is
+/// unchanged, so nothing runs unverified either way.
 pub fn audit_toolchain() -> (ToolPaths, ToolchainStatus) {
     let policy = current_policy();
     let dirs = search_dirs();
@@ -194,12 +315,12 @@ pub fn audit_toolchain() -> (ToolPaths, ToolchainStatus) {
         // Lets an operator spot a swapped binary from /api/toolchain. `None`
         // when `verify_on_startup` is off -- absent, not stale.
         ffmpeg_sha256: if policy.verify_on_startup {
-            ffmpeg.as_ref().and_then(|p| file_sha256(p))
+            ffmpeg.as_ref().and_then(|p| cached_sha256(p))
         } else {
             None
         },
         ffprobe_sha256: if policy.verify_on_startup {
-            ffprobe.as_ref().and_then(|p| file_sha256(p))
+            ffprobe.as_ref().and_then(|p| cached_sha256(p))
         } else {
             None
         },
@@ -393,6 +514,63 @@ pub fn check_ffmpeg_update() -> UpdateCheckResult {
 #[cfg(test)]
 mod toolchain_tests {
     use super::*;
+
+    /// SB-07: a cached hash is reused only while the file still has the size
+    /// and modification time it had when it was hashed. Anything else is a
+    /// miss, so a swapped binary is never reported with the old hash.
+    #[test]
+    fn a_cached_hash_is_keyed_on_size_and_mtime() {
+        let dir = tmp("hashcache");
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("ffmpeg.exe");
+        fs::write(&file, b"first contents").unwrap();
+
+        let (len, mtime_ms) = file_identity(&file).expect("identity");
+        let real = file_sha256(&file).expect("hash");
+
+        let key = file.to_string_lossy().into_owned();
+        let mut cache: HashCache = HashCache::new();
+        cache.insert(
+            key.clone(),
+            HashCacheEntry {
+                len,
+                mtime_ms,
+                sha256: real.clone(),
+            },
+        );
+
+        // Matching identity -> hit.
+        let entry = cache.get(&key).unwrap();
+        assert!(entry.len == len && entry.mtime_ms == mtime_ms);
+        assert_eq!(entry.sha256, real);
+
+        // A different length is a miss even if the timestamp is forged to
+        // match, and vice versa.
+        let (new_len, _) = {
+            fs::write(&file, b"second contents, longer").unwrap();
+            file_identity(&file).expect("identity")
+        };
+        assert_ne!(new_len, len);
+        let entry = cache.get(&key).unwrap();
+        assert!(
+            entry.len != new_len || entry.mtime_ms != mtime_ms,
+            "a changed file must not match its old cache entry"
+        );
+        assert_ne!(file_sha256(&file).unwrap(), real);
+
+        // A corrupt cache file is treated as empty, not as a failure.
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unreadable_hash_cache_reads_as_empty() {
+        // read_hash_cache must never panic or propagate: a missing or
+        // malformed file simply means "nothing remembered", which makes the
+        // next audit report `null` and the background pass recompute.
+        let cache: HashCache =
+            serde_json::from_str("{ this is not json").unwrap_or_default();
+        assert!(cache.is_empty());
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("pt-tool-{}-{}", tag, std::process::id()));
