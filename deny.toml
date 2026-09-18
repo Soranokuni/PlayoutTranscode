@@ -24,8 +24,18 @@ ignore = []
 # Permissive licences only. This ships as a binary to broadcast customers, so a
 # copyleft dependency is a legal question rather than a technical one, and it
 # should surface at the moment it is added.
+#
+# Every entry below is permissive. The list was built by enumerating the actual
+# dependency tree rather than guessed at, so an addition means a new crate, not
+# a new opinion.
+#
+# Worth knowing: `LGPL-2.1-or-later` appears in this tree, and is deliberately
+# NOT allowed. It occurs only inside `MIT OR Apache-2.0 OR LGPL-2.1-or-later`,
+# where cargo-deny satisfies the expression with MIT. If a crate ever offers
+# LGPL alone the build fails here, which is the point.
 allow = [
     "MIT",
+    "MIT-0",
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
@@ -35,6 +45,15 @@ allow = [
     "Zlib",
     "MPL-2.0",
     "CDLA-Permissive-2.0",
+    # Public-domain dedications. `notify` is CC0-1.0 with no alternative, and
+    # it is a direct dependency -- the filesystem watcher the whole ingest path
+    # is built on.
+    "CC0-1.0",
+    "Unlicense",
+    "0BSD",
+    # Boost. Appears only alongside Apache-2.0/MIT today, but it is permissive
+    # and listing it avoids a failure that would look like a policy question.
+    "BSL-1.0",
 ]
 confidence-threshold = 0.9
 
