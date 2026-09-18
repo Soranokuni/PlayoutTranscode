@@ -71,12 +71,22 @@ strip = false
 debug = 1
 
 # The profile optimises for size, which suits a daemon whose hot path is inside
-# FFmpeg. The exceptions are the two crates that actually spin on this process's
-# CPU: SHA-256 over the 170 MB toolchain and over duplicate candidates, and JSON
-# on every request and SSE frame. `opt-level = "s"` turns off exactly the
-# vectorisation-heavy passes those two benefit from.
+# FFmpeg. Two packages are exceptions, both measured on this machine against an
+# all-"s" build (170 MB SHA-256; serialising a 5 000-asset listing):
+#
+#   all "s"                        163 MB/s   3.53 ms   7.49 MB exe
+#   + sha2, serde_json at 3        317 MB/s   3.52 ms   7.51 MB exe
+#   everything at 3                298 MB/s   1.72 ms  10.23 MB exe
+#   + sha2, this crate at 3        332 MB/s   1.65 ms   9.22 MB exe  <- this
+#
+# sha2 is the toolchain hash and the duplicate-confirmation hash: 2.0x.
+#
+# Overriding `serde_json` did nothing, which is the interesting part -- the work
+# of serialising an AssetResponse is in the *derive-generated* Serialize impl,
+# and that lives in this crate, not in serde_json. Building this crate at 3 is
+# what buys the 2.1x, and it costs 1 MB less than raising the whole graph.
 [profile.release.package.sha2]
 opt-level = 3
 
-[profile.release.package.serde_json]
+[profile.release.package.playout-transcode]
 opt-level = 3

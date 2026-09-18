@@ -2342,6 +2342,13 @@ pub async fn query_db_assets(
     }
     let total = count_q.fetch_one(pool).await?;
 
+    // The `COALESCE` in the ORDER BY defeats every index -- `EXPLAIN QUERY PLAN`
+    // still reports `USE TEMP B-TREE FOR ORDER BY` even with an index on
+    // (deleted_at, display_name, uuid), which only turns the table scan into a
+    // covering-index scan. So no such index is added: measured over 3 000 rows
+    // the whole call is 0.66 ms unfiltered and 1.61 ms with a search term. The
+    // cost here was never the sort, it was the 5 000 stats and 5 000 JSON
+    // parses this function used to do.
     let page_sql = format!(
         "SELECT {} FROM media_assets{} ORDER BY COALESCE(deleted_at, '9999') ASC, display_name ASC, uuid ASC LIMIT ? OFFSET ?",
         SELECT_COLS, where_sql
