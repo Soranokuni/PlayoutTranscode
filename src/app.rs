@@ -212,6 +212,30 @@ pub async fn run_service(
         }
     }
 
+    // Daily registry snapshot (T2-13). The asset registry is the playout source
+    // of truth and nothing in it can be reconstructed from the media files, so
+    // one is taken at startup and then every 24 h. Aborted on shutdown with the
+    // rest of the background work.
+    let backup_pool = pool.clone();
+    let backup_task = tokio::spawn(async move {
+        let data_dir = paths::data_dir();
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+        loop {
+            // Fires immediately on the first tick, which is what gives a fresh
+            // install a snapshot before it has run for a day.
+            ticker.tick().await;
+            match db::backup_now(&backup_pool, &data_dir).await {
+                Ok(path) => tracing::info!(
+                    "Registry backup written: {}",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                // Never fatal. A service that will not start because it could
+                // not write a backup is worse than one running without today's.
+                Err(e) => tracing::error!("Registry backup failed: {}", e),
+            }
+        }
+    });
+
     // `&mut` so the handle survives the select: on the stop paths the server is
     // still draining and has to be awaited below.
     let mut server_already_exited = false;
@@ -281,6 +305,7 @@ pub async fn run_service(
     if let Some(handle) = persister {
         handle.abort();
     }
+    backup_task.abort();
 
     pool.close().await;
     tracing::info!("Shutdown complete");

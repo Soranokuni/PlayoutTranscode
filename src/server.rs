@@ -189,7 +189,8 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/db/jobs", get(get_db_jobs_handler))
         .route("/db/jobs/{id}", get(get_db_job_detail_handler))
         .route("/db/folders", get(get_db_folders_handler))
-        .route("/db/schema", get(get_db_schema_handler));
+        .route("/db/schema", get(get_db_schema_handler))
+        .route("/db/backup", post(post_db_backup));
 
     let api_v2 = Router::new()
         .route("/health", get(health_v2))
@@ -221,7 +222,8 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/db/jobs", get(get_db_jobs_handler))
         .route("/db/jobs/{id}", get(get_db_job_detail_handler))
         .route("/db/folders", get(get_db_folders_handler))
-        .route("/db/schema", get(get_db_schema_handler));
+        .route("/db/schema", get(get_db_schema_handler))
+        .route("/db/backup", post(post_db_backup));
 
     let (allowed_origins, api_token) = {
         let cfg = state.config.lock();
@@ -2966,9 +2968,62 @@ async fn put_folder_color(
 
 // ── DB Viewer API Handlers ───────────────────────────────────────────────────
 
+/// `POST /api/db/backup` — take a registry snapshot now (T2-13).
+///
+/// Token-protected like every other `/api/**` route, but deliberately **not**
+/// behind `X-Confirm-Destructive`: it creates a file and deletes nothing except
+/// snapshots past the retention window. Making an operator jump through a
+/// confirmation to take a backup is the wrong incentive.
+async fn post_db_backup(State(state): State<ServerState>) -> impl IntoResponse {
+    let pool = state.pool.clone();
+    let data_dir = crate::paths::data_dir();
+
+    match db::backup_now(&pool, &data_dir).await {
+        Ok(path) => {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            tracing::info!("Registry backup written: {} ({} bytes)", file_name, size);
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "success": true,
+                    // The name, not the path: error bodies and success bodies
+                    // alike stay free of filesystem paths (T1-4).
+                    "file_name": file_name,
+                    "size_bytes": size,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Registry backup failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"success": false, "error": "backup_failed"})),
+            )
+                .into_response()
+        }
+    }
+}
+
 async fn get_db_overview_handler(State(state): State<ServerState>) -> impl IntoResponse {
     match db::get_db_overview(&state.pool).await {
-        Ok(overview) => (StatusCode::OK, Json(overview)).into_response(),
+        Ok(overview) => {
+            // Additive: an operator asking "when was this last backed up?" has
+            // nowhere else to look.
+            let backups = db::list_backups(&crate::paths::data_dir());
+            let mut body = serde_json::to_value(&overview).unwrap_or(serde_json::json!({}));
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert(
+                    "backups".to_string(),
+                    serde_json::to_value(&backups).unwrap_or(serde_json::json!([])),
+                );
+            }
+            (StatusCode::OK, Json(body)).into_response()
+        }
         Err(e) => {
             tracing::error!("DB error on get_db_overview: {}", e);
             (
