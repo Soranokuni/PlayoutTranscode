@@ -1,3 +1,21 @@
+> **SUPERSEDED — 2026-09-18.**
+>
+> The remediation is complete. Read
+> [`docs/PLAYOUT-CLIENT-DOCUMENTATION.md`](../PLAYOUT-CLIENT-DOCUMENTATION.md)
+> instead: it is the single current spec for the PlayOut client, written against
+> the finished service and checked against PlayOut's actual call sites.
+>
+> This file was written incrementally as each step landed and is kept only as
+> history. Two things in it are now **wrong**:
+>
+> - §6.3 says a skipped duplicate is reported as `Failed` with
+>   `error_category = "duplicate_skipped"`. T2-6 added a terminal `Skipped`
+>   phase; it is now `state: "Completed"`, `phase: "skipped"`.
+> - §3 asks what values `tp` takes. Answered: `TP` and `NONE`, from
+>   `src/stores/mediaLibrary.ts`.
+
+---
+
 # PlayOut client changes required by the PlayoutTranscode hardening
 
 Audience: the PlayOut (Tauri/Vue) client team.
