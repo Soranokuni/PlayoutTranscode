@@ -88,6 +88,10 @@ async fn a_broadcast_after_connect_arrives_on_the_stream() {
     assert_eq!(events[1].0, "progress");
     let data: serde_json::Value = serde_json::from_str(&events[1].1).unwrap();
     assert_eq!(data["id"], "j1");
+    // SB-05: the frame now carries the producer's strings verbatim instead of
+    // round-tripping them through serde_json::Value, so the body on the wire
+    // is byte-for-byte what the caller passed.
+    assert_eq!(events[1].1, r#"{"id":"j1","percent":42.0}"#);
 }
 
 #[tokio::test]

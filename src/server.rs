@@ -1568,12 +1568,6 @@ async fn get_toolchain_status(State(state): State<ServerState>) -> Json<Toolchai
     Json(state.toolchain().await)
 }
 
-#[derive(Deserialize)]
-struct EventEnvelope {
-    event: String,
-    data: serde_json::Value,
-}
-
 /// `GET /api/events` — the SSE stream (T2-10).
 ///
 /// Two guarantees a client can rely on:
@@ -1603,25 +1597,27 @@ async fn sse_events(
     );
     let head = tokio_stream::once(Ok::<Event, std::convert::Infallible>(hello));
 
-    let tail = BroadcastStream::new(rx).filter_map(|msg: Result<String, _>| match msg {
-        Ok(msg) => {
-            let envelope: EventEnvelope = serde_json::from_str(&msg).ok()?;
-            Some(Ok(Event::default()
-                .event(envelope.event)
-                .data(envelope.data.to_string())))
-        }
-        Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
-            // Not fatal: the subscription is still live and will keep
-            // delivering. The client just has to assume its view is stale.
-            tracing::warn!(
-                "SSE subscriber fell behind and dropped {} event(s); sending resync",
-                dropped
-            );
-            Some(Ok(Event::default().event("resync").data(
-                serde_json::json!({ "dropped": dropped }).to_string(),
-            )))
-        }
-    });
+    let tail = BroadcastStream::new(rx).filter_map(
+        |msg: Result<Arc<crate::jobs::SseFrame>, _>| match msg {
+            // The producer already serialised both halves; nothing here parses
+            // or re-serialises them (SB-05). The bytes on the wire are
+            // byte-identical to what the envelope round trip produced.
+            Ok(frame) => Some(Ok(Event::default()
+                .event(frame.event.as_str())
+                .data(frame.data.as_str()))),
+            Err(tokio_stream::wrappers::errors::BroadcastStreamRecvError::Lagged(dropped)) => {
+                // Not fatal: the subscription is still live and will keep
+                // delivering. The client just has to assume its view is stale.
+                tracing::warn!(
+                    "SSE subscriber fell behind and dropped {} event(s); sending resync",
+                    dropped
+                );
+                Some(Ok(Event::default().event("resync").data(
+                    serde_json::json!({ "dropped": dropped }).to_string(),
+                )))
+            }
+        },
+    );
 
     Sse::new(head.chain(tail)).keep_alive(KeepAlive::default())
 }

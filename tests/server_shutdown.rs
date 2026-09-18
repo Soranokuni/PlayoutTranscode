@@ -56,7 +56,7 @@ async fn fixture(tag: &str) -> (TempTree, ServerDeps) {
             .await
             .expect("init pool"),
     );
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<std::sync::Arc<playout_transcode::jobs::SseFrame>>(16);
 
     let deps = ServerDeps {
         jobs: JobQueue::new(event_tx, Some(pool.clone())),

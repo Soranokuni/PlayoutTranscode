@@ -358,6 +358,18 @@ struct Persistence {
     pool: Arc<SqlitePool>,
 }
 
+/// One server-sent event, kept as the two strings the wire format needs.
+///
+/// Shared behind an `Arc` because every subscriber gets the same frame and
+/// none of them mutate it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SseFrame {
+    /// The `event:` field.
+    pub event: String,
+    /// The `data:` field, already serialised by the producer.
+    pub data: String,
+}
+
 /// The counters behind `/api/stats`, produced without cloning the queue.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct JobStateCounts {
@@ -371,12 +383,12 @@ pub struct JobStateCounts {
 #[derive(Clone)]
 pub struct JobQueue {
     jobs: Arc<RwLock<Vec<JobRecord>>>,
-    event_tx: broadcast::Sender<String>,
+    event_tx: broadcast::Sender<Arc<SseFrame>>,
     persist: Option<Arc<Persistence>>,
 }
 
 impl JobQueue {
-    pub fn new(event_tx: broadcast::Sender<String>, pool: Option<Arc<SqlitePool>>) -> Self {
+    pub fn new(event_tx: broadcast::Sender<Arc<SseFrame>>, pool: Option<Arc<SqlitePool>>) -> Self {
         let persist = pool.map(|pool| {
             let (tx, rx) = tokio::sync::mpsc::channel(PERSIST_CHANNEL_CAPACITY);
             Arc::new(Persistence {
@@ -448,7 +460,7 @@ impl JobQueue {
     }
 
     #[allow(dead_code)]
-    pub fn new_in_memory(event_tx: broadcast::Sender<String>) -> Self {
+    pub fn new_in_memory(event_tx: broadcast::Sender<Arc<SseFrame>>) -> Self {
         Self::new(event_tx, None)
     }
 
@@ -461,7 +473,7 @@ impl JobQueue {
         }
     }
 
-    pub fn event_sender(&self) -> broadcast::Sender<String> {
+    pub fn event_sender(&self) -> broadcast::Sender<Arc<SseFrame>> {
         self.event_tx.clone()
     }
 
@@ -676,9 +688,31 @@ impl JobQueue {
         }
     }
 
+    /// Is anyone subscribed to the SSE stream right now?
+    ///
+    /// Lets a caller skip building a payload nobody will read -- the progress
+    /// thread produces one every 250 ms per running encode.
+    pub fn has_subscribers(&self) -> bool {
+        self.event_tx.receiver_count() > 0
+    }
+
+    /// Publish one SSE frame.
+    ///
+    /// This used to parse the already-serialised payload back into a
+    /// `serde_json::Value`, wrap it in an envelope and serialise the whole
+    /// thing again, and then every subscriber's stream parsed that envelope
+    /// and serialised `data` a third time. The event name and the data body
+    /// are both already strings, so the frame now carries them verbatim and
+    /// the subscribers share one `Arc` instead of each doing a round trip
+    /// through JSON.
     pub fn broadcast(&self, event_type: &str, payload: &str) {
-        let envelope = serde_json::json!({"event": event_type, "data": serde_json::from_str::<serde_json::Value>(payload).unwrap_or(serde_json::Value::String(payload.to_string()))}).to_string();
-        let _ = self.event_tx.send(envelope);
+        if !self.has_subscribers() {
+            return;
+        }
+        let _ = self.event_tx.send(Arc::new(SseFrame {
+            event: event_type.to_string(),
+            data: payload.to_string(),
+        }));
     }
 }
 
@@ -863,7 +897,7 @@ mod tests {
     #[tokio::test]
     async fn a_burst_of_updates_coalesces_to_one_row_with_the_final_state() {
         let (pool, dir) = pool_in_temp("coalesce").await;
-        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let (event_tx, _rx) = broadcast::channel::<std::sync::Arc<crate::jobs::SseFrame>>(16);
         let queue = JobQueue::new(event_tx, Some(pool.clone()));
         let persister = queue.spawn_persister().expect("persister started");
 
@@ -903,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn a_full_channel_still_converges_on_the_latest_state() {
         let (pool, dir) = pool_in_temp("backpressure").await;
-        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let (event_tx, _rx) = broadcast::channel::<std::sync::Arc<crate::jobs::SseFrame>>(16);
         let queue = JobQueue::new(event_tx, Some(pool.clone()));
 
         let mut job = JobRecord::new("D:/media/flood.mov", "ProfileA");
@@ -939,7 +973,7 @@ mod tests {
     #[tokio::test]
     async fn update_local_does_not_write_until_persist_now() {
         let (pool, dir) = pool_in_temp("local").await;
-        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let (event_tx, _rx) = broadcast::channel::<std::sync::Arc<crate::jobs::SseFrame>>(16);
         let queue = JobQueue::new(event_tx, Some(pool.clone()));
         let persister = queue.spawn_persister().expect("persister started");
 
@@ -970,7 +1004,7 @@ mod tests {
 
     #[test]
     fn find_pending_by_input_path_returns_the_oldest_match() {
-        let (event_tx, _rx) = broadcast::channel::<String>(16);
+        let (event_tx, _rx) = broadcast::channel::<std::sync::Arc<crate::jobs::SseFrame>>(16);
         let queue = JobQueue::new_in_memory(event_tx);
 
         let mut old = JobRecord::new("D:/media/same.mov", "ProfileA");

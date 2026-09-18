@@ -131,7 +131,7 @@ pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
     let pool = Arc::new(pool);
 
     // Matches production (T2-10).
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(1024);
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<std::sync::Arc<playout_transcode::jobs::SseFrame>>(1024);
     let jobs = JobQueue::new(event_tx, Some(pool.clone()));
     let service_handle = ServiceHandle::new();
 

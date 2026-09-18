@@ -1200,7 +1200,13 @@ fn process_file_inner(
         let qc = queue.clone();
         std::thread::spawn(move || {
             let mut last_broadcast = std::time::Instant::now();
+            let mut last_persist = std::time::Instant::now();
+            // The UI wants a smooth bar; the database only needs enough to
+            // show a sensible figure after a crash. Coupling them meant four
+            // full-record UPSERTs a second per running encode, each an fsync
+            // under WAL.
             const THROTTLE_MS: u64 = 250;
+            const PERSIST_MS: u64 = 1_000;
             while let Ok(p) = prx.recv() {
                 let pct = p.percent;
                 // In-memory only: FFmpeg emits a progress line every few
@@ -1223,11 +1229,16 @@ fn process_file_inner(
                     };
                 });
                 let now = std::time::Instant::now();
+                if now.duration_since(last_persist).as_millis() as u64 >= PERSIST_MS
+                    || pct >= 100.0
+                {
+                    last_persist = now;
+                    qc.persist_now(&jid);
+                }
                 if now.duration_since(last_broadcast).as_millis() as u64 >= THROTTLE_MS
                     || pct >= 100.0
                 {
                     last_broadcast = now;
-                    qc.persist_now(&jid);
                     let determinate = p.duration_ms > 0 || p.total_frames > 0;
                     let _ = qc.broadcast(
                         "progress",
@@ -2608,7 +2619,7 @@ mod tests {
         let pool = crate::db::init_pool(&root.join("jobs.db"))
             .await
             .expect("init pool");
-        let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(16);
+        let (event_tx, _rx) = tokio::sync::broadcast::channel::<std::sync::Arc<crate::jobs::SseFrame>>(16);
         let queue = jobs::JobQueue::new(event_tx, None);
 
         let mut cfg = config::AppConfig::default();

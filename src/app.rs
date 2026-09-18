@@ -145,7 +145,7 @@ pub async fn run_service(
     // about eight seconds of traffic -- less than a browser tab spends
     // throttled in the background. Capacity does not prevent a lag, it only
     // makes one rare; the `resync` event is what makes it survivable.
-    let (event_tx, _rx) = tokio::sync::broadcast::channel::<String>(1024);
+    let (event_tx, _rx) = tokio::sync::broadcast::channel::<std::sync::Arc<crate::jobs::SseFrame>>(1024);
     let job_queue = jobs::JobQueue::new(event_tx, Some(pool.clone()));
     // One writer for the whole service. Every job mutation is queued to it and
     // coalesced by job id, instead of each one spawning its own upsert (T2-4).
