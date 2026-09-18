@@ -166,6 +166,159 @@ pub async fn recover_failed_assets(
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Registry backups (T2-13)
+//
+// The asset registry is the playout source of truth. It holds every uuid,
+// virtual folder, rating, trim window and compliance flag an operator has ever
+// set, and none of it can be reconstructed from the media files. Losing it
+// means re-ingesting the library and re-entering every piece of metadata by
+// hand -- and SQLite files do get lost, to a full volume mid-write, to antivirus
+// quarantine, to someone copying a WAL-mode database while the service runs.
+//
+// `VACUUM INTO` is the right primitive: it is a consistent snapshot taken
+// through the same connection pool, safe while the service is writing, and the
+// result is a plain defragmented database file. Copying the file is not safe;
+// `.backup` needs the CLI.
+// ---------------------------------------------------------------------------
+
+/// Directory under the data directory that holds registry snapshots.
+pub const BACKUP_DIR_NAME: &str = "backups";
+
+/// How many daily snapshots to keep. Two weeks of retention would be nicer, but
+/// a snapshot is roughly the size of the live registry, and an operator who has
+/// not noticed a problem in a week is not going to notice it in two.
+pub const BACKUP_RETENTION: usize = 7;
+
+/// A snapshot on disk.
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupInfo {
+    pub file_name: String,
+    pub size_bytes: u64,
+    /// RFC 3339, from the filesystem.
+    pub created_at: Option<String>,
+}
+
+/// Where snapshots live for a given data directory.
+pub fn backup_dir(data_dir: &Path) -> std::path::PathBuf {
+    data_dir.join(BACKUP_DIR_NAME)
+}
+
+/// The snapshot filename for a date, e.g. `media_assets-2026-09-18.db`.
+///
+/// Date-stamped rather than timestamped on purpose: a second backup on the same
+/// day overwrites the first, so an hourly trigger cannot fill the volume.
+pub fn backup_file_name(date: &str) -> String {
+    format!("media_assets-{}.db", date)
+}
+
+/// Take a consistent snapshot of the registry into `<data_dir>/backups/`.
+///
+/// Returns the path written. Safe to call while the service is running and
+/// writing; `VACUUM INTO` takes its own read transaction.
+pub async fn backup_now(pool: &SqlitePool, data_dir: &Path) -> Result<std::path::PathBuf, String> {
+    let dir = backup_dir(data_dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+
+    let date = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let dest = dir.join(backup_file_name(&date));
+
+    // Checkpoint first, so the snapshot includes everything committed to the
+    // WAL rather than only what has been folded back into the main file.
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await;
+
+    // Vacuum into a unique temporary name, then rename it into place.
+    //
+    // `VACUUM INTO` refuses to overwrite, so the obvious implementation is
+    // "delete today's file, then vacuum onto it" -- and that has a window in
+    // which today's backup does not exist. Two concurrent calls (the daily task
+    // firing while an operator clicks Backup) can then delete the file the
+    // other is halfway through writing: the loser errors and the winner leaves
+    // a truncated snapshot. Write-then-rename has no such window -- the old
+    // snapshot stays intact until a complete new one atomically replaces it.
+    let staging = dir.join(format!(
+        ".{}.{}.tmp",
+        backup_file_name(&date),
+        uuid::Uuid::new_v4()
+    ));
+
+    // The path is interpolated because SQLite does not accept a bound parameter
+    // here. Single quotes are doubled so a path containing one cannot terminate
+    // the literal; the value is server-generated, never caller-supplied.
+    let escaped = staging.to_string_lossy().replace('\'', "''");
+    if let Err(e) = sqlx::query(&format!("VACUUM INTO '{}'", escaped))
+        .execute(pool)
+        .await
+    {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("VACUUM INTO failed: {}", e));
+    }
+
+    if let Err(e) = std::fs::rename(&staging, &dest) {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("cannot publish {}: {}", dest.display(), e));
+    }
+
+    prune_backups(&dir, BACKUP_RETENTION);
+    Ok(dest)
+}
+
+/// List snapshots, newest first.
+pub fn list_backups(data_dir: &Path) -> Vec<BackupInfo> {
+    let dir = backup_dir(data_dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut out: Vec<BackupInfo> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            name.starts_with("media_assets-") && name.ends_with(".db")
+        })
+        .map(|e| {
+            let meta = e.metadata().ok();
+            BackupInfo {
+                file_name: e.file_name().to_string_lossy().into_owned(),
+                size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+                created_at: meta
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339()),
+            }
+        })
+        .collect();
+
+    // By name, which sorts chronologically because the stamp is ISO-8601.
+    out.sort_by(|a, b| b.file_name.cmp(&a.file_name));
+    out
+}
+
+/// Delete all but the newest `keep` snapshots.
+pub fn prune_backups(dir: &Path, keep: usize) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("media_assets-") && n.ends_with(".db"))
+        .collect();
+    names.sort();
+
+    let mut removed = 0;
+    while names.len() > keep {
+        let oldest = names.remove(0);
+        if std::fs::remove_file(dir.join(&oldest)).is_ok() {
+            removed += 1;
+            tracing::info!("Pruned old registry backup {}", oldest);
+        }
+    }
+    removed
+}
+
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let _ = std::fs::create_dir_all(db_dir);
