@@ -538,6 +538,41 @@ pub fn process_file_sync_with_runner_and_measurer(
     }
 }
 
+/// Is a sampled-fingerprint match a *real* duplicate?
+///
+/// The sampled fingerprint is a prefilter, never a verdict — see
+/// [`crate::fingerprint`]. Only two full SHA-256 hashes that agree confirm a
+/// duplicate; every other combination means "cannot confirm", and the file is
+/// ingested.
+///
+/// Failing towards a redundant encode is the cheap mistake. Failing the other
+/// way silently drops a programme, and nothing downstream can tell that it
+/// happened (F-15).
+fn is_confirmed_duplicate(
+    stored_hash: Option<&str>,
+    our_hash: Option<&str>,
+    existing_uuid: &str,
+) -> bool {
+    match (stored_hash, our_hash) {
+        (Some(stored), Some(ours)) => stored == ours,
+        // The existing row predates `source_sha256` (T2-6), so there is nothing
+        // to compare against. Falling back to the sampled match would reinstate
+        // F-15 for exactly the rows most likely to have been hit by it. The
+        // cost of re-ingesting is one redundant encode per legacy asset, once.
+        (None, _) => {
+            tracing::info!(
+                "Dedup: asset {} matched on the sampled fingerprint but predates \
+                 source_sha256; cannot confirm, re-transcoding",
+                existing_uuid
+            );
+            false
+        }
+        // Our own hash could not be computed — an unreadable or vanishing
+        // source. Same reasoning.
+        (_, None) => false,
+    }
+}
+
 fn process_file_inner(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -550,18 +585,72 @@ fn process_file_inner(
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
 ) {
-    // Every early return below happens before a job record would normally be
-    // created. When we have adopted an existing record we must close it out, or
-    // it stays Pending forever -- which is the ghost F-13 is about.
-    let close_adopted = |category: &str, message: &str| {
-        if let Some(j) = existing_job.as_ref() {
-            let msg = message.to_string();
-            let cat = category.to_string();
-            let _ = queue.transition(&j.id, jobs::JobPhase::Failed, Some("Failed".into()), |job| {
-                job.error = Some(msg);
-                job.error_category = Some(cat);
-            });
-        }
+    // Every early return below happens before the main job record is created.
+    //
+    // T2-4 made them close out an *adopted* record, or it stayed Pending
+    // forever (F-13). But on a fresh ingest -- the watcher offering a file for
+    // the first time -- there was no record to close, so a file rejected at the
+    // watch-folder boundary, or skipped as a duplicate, simply vanished: no job,
+    // no event, nothing in /api/jobs, and an operator watching a folder saw
+    // their file disappear with no explanation (F-26). Now every early return
+    // leaves a visible terminal record, adopted or created.
+    let terminate_early = |phase: jobs::JobPhase,
+                           category: Option<&str>,
+                           message: &str,
+                           asset_uuid: Option<&str>| {
+        let msg = message.to_string();
+        let cat = category.map(|c| c.to_string());
+        let stage = phase.as_str().to_string();
+        let apply = move |job: &mut jobs::JobRecord| {
+            job.error = Some(msg);
+            job.error_category = cat;
+            job.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        };
+
+        let id = match existing_job.as_ref() {
+            Some(prior) => {
+                let _ = queue.transition(&prior.id, phase, Some(stage), apply);
+                prior.id.clone()
+            }
+            None => {
+                let mut job = jobs::JobRecord::new(&input_path.to_string_lossy(), "pending");
+                if let Some(u) = asset_uuid {
+                    // A skip points at the asset that already holds this
+                    // content, so the UI can link straight to it.
+                    job.uuid = Some(u.to_string());
+                }
+                let id = job.id.clone();
+                let _ = job.transition_to(phase, Some(stage));
+                apply(&mut job);
+                queue.push(job);
+                id
+            }
+        };
+
+        // `skipped` is a new event type. Clients that do not know it must treat
+        // an unknown SSE event as a no-op -- PlayOut and the web UI both do.
+        let event = if phase == jobs::JobPhase::Skipped {
+            "skipped"
+        } else {
+            "failed"
+        };
+        queue.broadcast(
+            event,
+            &serde_json::json!({
+                "id": id,
+                "error": message,
+                "error_category": category,
+                "uuid": asset_uuid,
+            })
+            .to_string(),
+        );
+    };
+
+    let close_job = |category: &str, message: &str| {
+        terminate_early(jobs::JobPhase::Failed, Some(category), message, None);
+    };
+    let skip_job = |asset_uuid: &str, message: &str| {
+        terminate_early(jobs::JobPhase::Skipped, None, message, Some(asset_uuid));
     };
 
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
@@ -582,7 +671,7 @@ fn process_file_inner(
     );
     if !canonical_input.starts_with(&canonical_watch) {
         tracing::warn!("Rejected path traversal attempt: {}", input_path.display());
-        close_adopted("path_outside_watch_folder", "Input is outside the watch folder");
+        close_job("path_outside_watch_folder", "Input is outside the watch folder");
         return;
     }
 
@@ -596,48 +685,111 @@ fn process_file_inner(
 
     let handle = tokio::runtime::Handle::current();
 
-    let fingerprint = match fingerprint::compute_fnv1a64(input_path) {
+    let fingerprint = match fingerprint::compute_sampled_fingerprint(input_path) {
         Ok(fp) => fp,
         Err(e) => {
             tracing::error!("Fingerprint failed for {}: {}", input_path.display(), e);
-            close_adopted("fingerprint_failure", "Could not read the source file");
+            close_job("fingerprint_failure", "Could not read the source file");
             return;
         }
     };
 
+    // The full hash, computed lazily: only when the cheap sampled hash has
+    // already matched something. For a library of distinct media that is
+    // approximately never, so the common path still reads 192 KiB, not 40 GB.
+    let mut source_sha256: Option<String> = None;
+    let mut full_hash_of_source = || -> Option<String> {
+        if source_sha256.is_none() {
+            match fingerprint::compute_full_sha256(input_path) {
+                Ok(h) => source_sha256 = Some(h),
+                Err(e) => {
+                    tracing::warn!(
+                        "Full hash failed for {}: {} -- treating as not-a-duplicate",
+                        input_path.display(),
+                        e
+                    );
+                }
+            }
+        }
+        source_sha256.clone()
+    };
+
     if let Ok(Some(existing)) = handle.block_on(db::find_by_fingerprint(pool, fingerprint)) {
-        if existing.status == "ready"
+        let usable = existing.status == "ready"
             && existing.mezzanine_ok
             && !existing.current_path.is_empty()
-            && std::path::Path::new(&existing.current_path).exists()
-        {
+            && std::path::Path::new(&existing.current_path).exists();
+
+        // A sampled-hash match is a *candidate*, never a verdict. Two distinct
+        // programmes cut from the same master share size, leader and tail, and
+        // the old code dropped the second one on that evidence alone (F-15).
+        let confirmed = usable
+            && is_confirmed_duplicate(
+                existing.source_sha256.as_deref(),
+                full_hash_of_source().as_deref(),
+                &existing.uuid,
+            );
+
+        if confirmed {
             tracing::info!(
-                "Dedup: asset {} already ready with valid mezzanine at {} (fingerprint={}), skipping transcode",
+                "Dedup: asset {} is byte-identical (sha256 confirmed) and already ready at {}, skipping transcode",
                 existing.uuid,
                 existing.current_path,
-                fingerprint,
             );
-            // Reported as Failed rather than Completed because the phase machine
-            // has no non-error terminal reachable from Queued. The distinct
-            // category is what the UI and PlayOut should key on: the retry did
-            // not run because the asset is already ingested. A visible terminal
-            // state beats a row that sits Pending forever.
-            close_adopted(
-                "duplicate_skipped",
+            // A confirmed duplicate is not a failure -- nothing went wrong and
+            // no work was needed. T2-6 gave the phase machine a terminal
+            // `Skipped` for it, which maps to the v1 `Completed` state so the
+            // wire contract is unchanged (T2-4 had to report this as `Failed`
+            // for want of anywhere else to put it).
+            skip_job(
+                &existing.uuid,
                 "Skipped: an identical asset is already ingested",
             );
             return;
         }
 
-        tracing::info!(
-            "Dedup: fingerprint {} matched but existing asset not usable (status={}, mezzanine_ok={}, path_exists={}), re-transcoding",
-            fingerprint,
-            existing.status,
-            existing.mezzanine_ok,
-            std::path::Path::new(&existing.current_path).exists(),
-        );
-        let _ = handle.block_on(db::purge_rows_by_fingerprint(pool, fingerprint));
+        if usable {
+            tracing::info!(
+                "Dedup: fingerprint {} matched asset {} but the full hashes differ -- \
+                 these are different files, ingesting both",
+                fingerprint,
+                existing.uuid,
+            );
+        } else {
+            tracing::info!(
+                "Dedup: fingerprint {} matched but existing asset not usable (status={}, mezzanine_ok={}, path_exists={}), re-transcoding",
+                fingerprint,
+                existing.status,
+                existing.mezzanine_ok,
+                std::path::Path::new(&existing.current_path).exists(),
+            );
+            // Only clears out the leftovers of a failed ingest. Subclips and
+            // live `ready` rows are protected -- deleting every row sharing the
+            // fingerprint destroyed operator-cut subclips (F-26).
+            match handle.block_on(db::purge_unusable_rows_by_fingerprint(
+                pool,
+                fingerprint,
+                |p| std::path::Path::new(p).exists(),
+            )) {
+                Ok(outcome) => {
+                    if outcome.demoted > 0 || outcome.protected > 0 {
+                        tracing::info!(
+                            "Re-ingest cleanup for fingerprint {}: {} deleted, {} demoted to error, {} protected (subclips / live assets)",
+                            fingerprint,
+                            outcome.deleted,
+                            outcome.demoted,
+                            outcome.protected,
+                        );
+                    }
+                }
+                Err(e) => tracing::error!("Re-ingest cleanup failed: {}", e),
+            }
+        }
     }
+
+    // Computed here if the dedup path never needed it, so every new row
+    // carries one and the next ingest has something to confirm against.
+    let source_sha256 = full_hash_of_source();
 
     let metadata_uuid = Uuid::new_v4().to_string();
     let video_dir = target_root.join("videos");
@@ -658,6 +810,7 @@ fn process_file_inner(
         pool,
         &metadata_uuid,
         fingerprint,
+        source_sha256.as_deref(),
         &input_path.to_string_lossy(),
         &raw_stem,
     )) {
@@ -2109,9 +2262,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_fresh_ingest_with_no_adopted_job_creates_nothing_on_early_return() {
-        // The other half of the contract: without an adopted record, an early
-        // return must not invent a job either.
+    async fn a_fresh_ingest_that_fails_early_still_leaves_a_visible_job() {
+        // T2-4 asserted the opposite -- that a fresh ingest creating no record
+        // was correct. T2-6 changed that deliberately: a file the watcher
+        // offered and the service then rejected used to vanish with no job, no
+        // event and nothing in /api/jobs, so an operator saw their file
+        // disappear with no explanation (F-26).
         let (queue, pool, cfg, root) = adoption_fixture("fresh").await;
         let missing = std::path::Path::new(&cfg.paths.watch_folder).join("nope.mov");
 
@@ -2129,8 +2285,54 @@ mod tests {
             None,
         );
 
-        assert!(queue.all().is_empty());
+        let all = queue.all();
+        assert_eq!(all.len(), 1, "the rejection must be visible as a job");
+        assert_eq!(all[0].phase, jobs::JobPhase::Failed);
+        assert_eq!(all[0].input_path, missing.to_string_lossy());
+        assert!(
+            all[0].error_category.is_some(),
+            "a visible failure must say why: {:?}",
+            all[0]
+        );
+        assert!(
+            all[0].finished_at.is_some(),
+            "a terminal job must carry a finish time"
+        );
+
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dedup_confirms_only_on_two_agreeing_full_hashes() {
+        // The one case that is a duplicate.
+        assert!(is_confirmed_duplicate(Some("abc"), Some("abc"), "u"));
+
+        // Same sampled fingerprint, different bytes: two different programmes
+        // cut from one master. This is F-15, and it must ingest both.
+        assert!(!is_confirmed_duplicate(Some("abc"), Some("def"), "u"));
+
+        // A row ingested before source_sha256 existed. Unconfirmable, so it
+        // re-transcodes rather than guessing from the sampled hash alone.
+        assert!(!is_confirmed_duplicate(None, Some("abc"), "u"));
+
+        // Our own hash failed -- unreadable source. Also unconfirmable.
+        assert!(!is_confirmed_duplicate(Some("abc"), None, "u"));
+        assert!(!is_confirmed_duplicate(None, None, "u"));
+    }
+
+    #[test]
+    fn a_skipped_phase_is_terminal_and_reads_as_completed_on_the_wire() {
+        // The whole point of adding the phase: a duplicate is not a failure,
+        // but v1 clients only see `state`, so it has to land on Completed.
+        assert!(jobs::JobPhase::Skipped.is_terminal());
+        assert_eq!(
+            jobs::JobPhase::Skipped.as_v1_state(),
+            jobs::JobState::Completed
+        );
+        assert_eq!(jobs::JobPhase::Skipped.as_str(), "skipped");
+        // Re-triable: the operator may purge the asset that caused the skip.
+        assert!(jobs::JobPhase::Skipped.can_transition_to(jobs::JobPhase::Queued));
+        assert!(jobs::JobPhase::Queued.can_transition_to(jobs::JobPhase::Skipped));
     }
 
     #[test]

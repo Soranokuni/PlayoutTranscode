@@ -716,6 +716,7 @@ mod tests {
         std::fs::write(&media_file, b"fake video content").unwrap();
 
         let asset = crate::db::MediaAsset {
+            source_sha256: None,
             uuid: "test-uuid-1234".to_string(),
             fingerprint: 12345,
             current_path: media_file.to_string_lossy().into_owned(),
