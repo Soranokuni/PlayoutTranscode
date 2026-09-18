@@ -1409,6 +1409,7 @@ fn process_file_inner(
                 faststart_ok,
                 measured_loudness.as_ref(),
                 &audio_policy,
+                &config.effective_validation_policy(),
             );
 
             let mezzanine_ok = qc_report.passed;
@@ -1935,6 +1936,19 @@ fn probe_with_retry(
     }
 }
 
+/// Evaluate the encoded mezzanine against the operator's validation policy
+/// (T3-3, F-29).
+///
+/// `validation_policy.*` used to be pure decoration: `GET /api/config` served
+/// the knobs, the UI rendered them, `PUT /api/config` stored them, and nothing
+/// ever read them. Every check here was unconditionally blocking. An operator
+/// who turned off `enforce_faststart` because their downstream did not care
+/// still had every such asset marked `mezzanine_ok = false`.
+///
+/// Each `enforce_*` now chooses **severity**, not whether the check runs: the
+/// finding is always recorded, so the sidecar and the DB viewer still say what
+/// was observed. Turning one off downgrades it from blocking to a warning; it
+/// never hides it.
 pub fn run_qc_evaluation(
     output_probe: &probe::ProbeData,
     source_probe: &probe::ProbeData,
@@ -1942,10 +1956,34 @@ pub fn run_qc_evaluation(
     faststart_ok: bool,
     measured_loudness: Option<&probe::MeasuredLoudness>,
     _audio_policy: &config::AudioPolicy,
+    policy: &config::ValidationPolicy,
 ) -> identity::QcReport {
     let mut findings = Vec::new();
     let mut blocking_errors = 0;
     let mut warnings_count = 0;
+
+    // Records a finding at error severity when the operator enforces this rule,
+    // and at warning severity when they do not.
+    let push = |enforced: bool,
+                    code: &str,
+                    message: &str,
+                    observed: Option<String>,
+                    expected: Option<String>,
+                    findings: &mut Vec<identity::ValidationFinding>,
+                    blocking: &mut usize,
+                    warnings: &mut usize| {
+        if enforced {
+            findings.push(identity::ValidationFinding::error(
+                code, message, observed, expected,
+            ));
+            *blocking += 1;
+        } else {
+            findings.push(identity::ValidationFinding::warning(
+                code, message, observed, expected,
+            ));
+            *warnings += 1;
+        }
+    };
 
     // 1. Duration check
     let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
@@ -1988,35 +2026,44 @@ pub fn run_qc_evaluation(
 
     // 3. Audio sample rate check
     if output_probe.audio_sample_rate != 48000 {
-        findings.push(identity::ValidationFinding::error(
+        push(
+            policy.enforce_48k_audio,
             "audio_sample_rate_not_48k",
             "Output audio sample rate must be exactly 48000 Hz",
             Some(format!("{} Hz", output_probe.audio_sample_rate)),
             Some("48000 Hz".to_string()),
-        ));
-        blocking_errors += 1;
+            &mut findings,
+            &mut blocking_errors,
+            &mut warnings_count,
+        );
     }
 
     // 4. Closed GOP check
     if !closed_gop_ok {
-        findings.push(identity::ValidationFinding::error(
+        push(
+            policy.enforce_closed_gop,
             "closed_gop_violation",
             "Keyframe structure does not satisfy closed GOP cadence requirements",
             Some("irregular GOP detected".to_string()),
             Some("strict closed GOP with 2s interval".to_string()),
-        ));
-        blocking_errors += 1;
+            &mut findings,
+            &mut blocking_errors,
+            &mut warnings_count,
+        );
     }
 
     // 5. Faststart check
     if !faststart_ok {
-        findings.push(identity::ValidationFinding::error(
+        push(
+            policy.enforce_faststart,
             "missing_faststart",
             "MP4 moov atom is not at the beginning of the file (faststart missing)",
             Some("moov atom not in first 64KB".to_string()),
             Some("+faststart enabled".to_string()),
-        ));
-        blocking_errors += 1;
+            &mut findings,
+            &mut blocking_errors,
+            &mut warnings_count,
+        );
     }
 
     // 6. Audio loudness checks
@@ -2040,7 +2087,38 @@ pub fn run_qc_evaluation(
         }
     }
 
-    let passed = blocking_errors == 0;
+    // 7. Duration drift against the source.
+    //
+    // There was no such check at all before T3-3, despite
+    // `max_duration_delta_ms` being an advertised, validated, UI-rendered knob.
+    // A mezzanine silently a second short of its source is exactly the failure
+    // an as-run log catches at transmission and nobody catches before it.
+    let source_ms = (source_probe.duration_secs * 1000.0).round() as i64;
+    if source_ms > 0 && duration_ms > 0 {
+        let delta = (duration_ms - source_ms).abs();
+        if delta > policy.max_duration_delta_ms {
+            push(
+                true,
+                "duration_delta_exceeded",
+                "Output duration differs from the source by more than the configured tolerance",
+                Some(format!("{} ms drift", delta)),
+                Some(format!("<= {} ms", policy.max_duration_delta_ms)),
+                &mut findings,
+                &mut blocking_errors,
+                &mut warnings_count,
+            );
+        }
+    }
+
+    // `strict_ready_blocking` promotes warnings to blocking. For a station that
+    // will not air anything with an open question against it, "passed with
+    // warnings" is not a state they want in the library.
+    let passed = if policy.strict_ready_blocking {
+        blocking_errors == 0 && warnings_count == 0
+    } else {
+        blocking_errors == 0
+    };
+
     identity::QcReport {
         passed,
         blocking_errors,
@@ -2604,6 +2682,170 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ---- T3-3: the validation policy knobs actually do something (F-29) ----
+
+    fn probe_at(duration_secs: f64, sample_rate: i64) -> probe::ProbeData {
+        probe::ProbeData {
+            duration_secs,
+            frame_count: (duration_secs * 25.0) as i64,
+            width: 1920,
+            height: 1080,
+            video_codec: "h264".into(),
+            audio_codec: "aac".into(),
+            audio_sample_rate: sample_rate,
+            audio_channels: 2,
+            fps_num: crate::profiles::TARGET_FPS_NUM,
+            fps_den: crate::profiles::TARGET_FPS_DEN,
+            field_order: "progressive".into(),
+            display_aspect_ratio: "16:9".into(),
+            input_path: "input.mp4".into(),
+        }
+    }
+
+    fn qc(
+        closed_gop_ok: bool,
+        faststart_ok: bool,
+        sample_rate: i64,
+        policy: &config::ValidationPolicy,
+    ) -> identity::QcReport {
+        let out = probe_at(10.0, sample_rate);
+        let src = probe_at(10.0, 48000);
+        run_qc_evaluation(
+            &out,
+            &src,
+            closed_gop_ok,
+            faststart_ok,
+            None,
+            &config::AudioPolicy::default(),
+            policy,
+        )
+    }
+
+    #[test]
+    fn with_the_default_policy_every_check_blocks() {
+        let p = config::ValidationPolicy::default();
+        assert!(!qc(false, true, 48000, &p).passed, "closed GOP");
+        assert!(!qc(true, false, 48000, &p).passed, "faststart");
+        assert!(!qc(true, true, 44100, &p).passed, "sample rate");
+        assert!(qc(true, true, 48000, &p).passed, "a clean encode passes");
+    }
+
+    #[test]
+    fn turning_off_enforcement_downgrades_the_finding_rather_than_hiding_it() {
+        // The distinction that matters: an operator whose downstream does not
+        // care about faststart should not have every asset marked unusable --
+        // but the observation must still reach the sidecar and the DB viewer,
+        // or nobody can answer "was this file actually faststart?" later.
+        let p = config::ValidationPolicy {
+            enforce_faststart: false,
+            ..Default::default()
+        };
+
+        let report = qc(true, false, 48000, &p);
+        assert!(report.passed, "must no longer block");
+        assert_eq!(report.blocking_errors, 0);
+        assert!(report.warnings_count >= 1, "but it must still be recorded");
+        assert!(
+            report.findings.iter().any(|f| f.code == "missing_faststart"),
+            "the finding must survive the downgrade: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn each_enforcement_flag_governs_only_its_own_check() {
+        let p = config::ValidationPolicy {
+            enforce_closed_gop: false,
+            ..Default::default()
+        };
+        // GOP is waived, faststart is not.
+        assert!(qc(false, true, 48000, &p).passed);
+        assert!(!qc(false, false, 48000, &p).passed);
+
+        let p = config::ValidationPolicy {
+            enforce_48k_audio: false,
+            ..Default::default()
+        };
+        assert!(qc(true, true, 44100, &p).passed);
+        assert!(!qc(false, true, 44100, &p).passed);
+    }
+
+    #[test]
+    fn duration_drift_beyond_the_tolerance_blocks() {
+        // There was no duration-delta check at all before T3-3, despite
+        // `max_duration_delta_ms` being advertised, validated and rendered in
+        // the UI. A mezzanine a second short of its source is the failure an
+        // as-run log catches at transmission and nothing catches before it.
+        let policy = config::ValidationPolicy::default(); // 80 ms
+        let src = probe_at(10.0, 48000);
+
+        let within = run_qc_evaluation(
+            &probe_at(10.05, 48000),
+            &src,
+            true,
+            true,
+            None,
+            &config::AudioPolicy::default(),
+            &policy,
+        );
+        assert!(within.passed, "50 ms of drift is inside the 80 ms tolerance");
+
+        let beyond = run_qc_evaluation(
+            &probe_at(11.0, 48000),
+            &src,
+            true,
+            true,
+            None,
+            &config::AudioPolicy::default(),
+            &policy,
+        );
+        assert!(!beyond.passed, "a full second of drift must block");
+        assert!(beyond
+            .findings
+            .iter()
+            .any(|f| f.code == "duration_delta_exceeded"));
+    }
+
+    #[test]
+    fn a_wider_tolerance_admits_drift_a_narrow_one_rejects() {
+        let src = probe_at(10.0, 48000);
+        let out = probe_at(10.5, 48000); // 500 ms
+
+        let narrow = config::ValidationPolicy {
+            max_duration_delta_ms: 80,
+            ..Default::default()
+        };
+        let wide = config::ValidationPolicy {
+            max_duration_delta_ms: 1000,
+            ..Default::default()
+        };
+
+        let audio = config::AudioPolicy::default();
+        assert!(!run_qc_evaluation(&out, &src, true, true, None, &audio, &narrow).passed);
+        assert!(run_qc_evaluation(&out, &src, true, true, None, &audio, &wide).passed);
+    }
+
+    #[test]
+    fn strict_ready_blocking_promotes_warnings_to_failures() {
+        // For a station that will not air anything with an open question
+        // against it, "passed with warnings" is not a state they want.
+        // enforce_faststart off produces a warning, not an error.
+        let lenient = config::ValidationPolicy {
+            enforce_faststart: false,
+            ..Default::default()
+        };
+        assert!(qc(true, false, 48000, &lenient).passed);
+
+        let strict_policy = config::ValidationPolicy {
+            strict_ready_blocking: true,
+            ..lenient
+        };
+        let strict = qc(true, false, 48000, &strict_policy);
+        assert!(!strict.passed, "a warning now blocks");
+        assert_eq!(strict.blocking_errors, 0, "it is still a warning, not an error");
+        assert!(strict.warnings_count >= 1);
     }
 
     // ---- T2-9: the preflight has to know how big this job is ----
@@ -3233,7 +3475,15 @@ mod tests {
         };
         let policy = config::AudioPolicy::default();
 
-        let qc = run_qc_evaluation(&dummy_probe, &dummy_probe, true, true, None, &policy);
+        let qc = run_qc_evaluation(
+            &dummy_probe,
+            &dummy_probe,
+            true,
+            true,
+            None,
+            &policy,
+            &config::ValidationPolicy::default(),
+        );
         assert!(qc.passed);
         assert_eq!(qc.blocking_errors, 0);
     }
@@ -3261,7 +3511,15 @@ mod tests {
         let policy = config::AudioPolicy::default();
 
         // 1. Zero duration + 44.1k audio + GOP violation + missing faststart -> 4 blocking errors
-        let qc = run_qc_evaluation(&dummy_output, &dummy_source, false, false, None, &policy);
+        let qc = run_qc_evaluation(
+            &dummy_output,
+            &dummy_source,
+            false,
+            false,
+            None,
+            &policy,
+            &config::ValidationPolicy::default(),
+        );
         assert!(!qc.passed);
         assert!(qc.blocking_errors >= 4);
         assert!(qc.findings.iter().any(|f| f.code == "zero_duration"));

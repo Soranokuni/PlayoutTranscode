@@ -642,6 +642,15 @@ impl Default for ValidationPolicy {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StoragePolicy {
     #[serde(default)]
+    /// Always true, and not settable (T3-3, F-29).
+    ///
+    /// Publication is a write to `.tmp_<uuid>_<name>` followed by a rename onto
+    /// the final path — there is no non-atomic code path to fall back to, and
+    /// there should not be: a half-written mezzanine appearing in the library is
+    /// the thing this design exists to prevent. The field defaulted to `false`
+    /// and `GET /api/config` reported it as `false`, so the API told operators
+    /// that publication was *not* atomic while it always was. Retained so an
+    /// existing `config.toml` still parses, and forced true on read.
     pub atomic_publication: bool,
     #[serde(default = "default_true")]
     pub preserve_subclips_on_purge: bool,
@@ -652,7 +661,7 @@ pub struct StoragePolicy {
 impl Default for StoragePolicy {
     fn default() -> Self {
         Self {
-            atomic_publication: false,
+            atomic_publication: true,
             preserve_subclips_on_purge: true,
             clean_source_after_success: false,
         }
@@ -685,6 +694,15 @@ pub struct ToolchainPolicy {
     pub ffmpeg_path: Option<String>,
     #[serde(default)]
     pub ffprobe_path: Option<String>,
+    /// Run the toolchain audit at startup (T1-2).
+    ///
+    /// The audit resolves ffmpeg/ffprobe, runs each with `-version` and
+    /// SHA-256s both binaries. On a ~170 MB pair that costs around 25 s before
+    /// the HTTP server binds, which on a broadcast host that has just rebooted
+    /// is 25 s of PlayOut showing a red light. Setting this false skips the
+    /// audit; the toolchain is still resolved and still verified lazily the
+    /// first time an encode needs it, so nothing runs unverified — the check
+    /// just stops blocking startup.
     #[serde(default = "default_true")]
     pub verify_on_startup: bool,
     /// Expected SHA-256 (64 hex chars) of the FFmpeg release archive.
@@ -824,8 +842,11 @@ impl AppConfig {
     }
 
     /// Returns effective StoragePolicy derived in-memory or from explicit V2 settings.
+    ///
+    /// `atomic_publication` is forced true regardless of what is stored: the
+    /// publisher stages to a temp name and renames, unconditionally (T3-3).
     pub fn effective_storage_policy(&self) -> StoragePolicy {
-        if let Some(ref sp) = self.storage_policy {
+        let mut policy = if let Some(ref sp) = self.storage_policy {
             if sp.clean_source_after_success != self.ingestion.clean_source_after_success {
                 tracing::warn!(
                     "Storage policy configuration conflict: explicit storage_policy.clean_source_after_success ({}) differs from legacy ingestion setting ({})",
@@ -835,11 +856,13 @@ impl AppConfig {
             sp.clone()
         } else {
             StoragePolicy {
-                atomic_publication: false,
+                atomic_publication: true,
                 preserve_subclips_on_purge: true,
                 clean_source_after_success: self.ingestion.clean_source_after_success,
             }
-        }
+        };
+        policy.atomic_publication = true;
+        policy
     }
 
     /// Returns effective RetryPolicyV2 derived in-memory or from explicit V2 settings.
@@ -860,6 +883,160 @@ impl AppConfig {
         self.toolchain_policy.clone().unwrap_or_default()
     }
 
+    /// Every `[section]` and key this schema accepts.
+    ///
+    /// Maintained by hand next to the struct because serde gives no runtime
+    /// reflection. The `config_docs` test walks the README's TOML block against
+    /// it, so a section added to the struct and forgotten here shows up as a
+    /// documentation failure rather than silently at an operator's site.
+    pub fn known_keys() -> &'static [(&'static str, &'static [&'static str])] {
+        &[
+            ("", &["version", "initialized"]),
+            ("paths", &["watch_folder", "target_folder"]),
+            (
+                "server",
+                &["web_port", "bind_address", "allowed_origins", "api_token"],
+            ),
+            (
+                "encoding",
+                &[
+                    "preset",
+                    "ffmpeg_threads",
+                    "cpu_cores",
+                    "audio_codec",
+                    "audio_bitrate",
+                    "tune",
+                    "probesize",
+                    "analyzeduration",
+                ],
+            ),
+            ("profile_a", &["enabled", "crf", "maxrate", "bufsize"]),
+            ("profile_b", &["enabled", "crf", "maxrate", "bufsize"]),
+            ("profile_c", &["enabled", "crf", "maxrate", "bufsize"]),
+            (
+                "ingestion",
+                &[
+                    "settle_secs",
+                    "poll_secs",
+                    "max_concurrency",
+                    "stable_polls_min",
+                    "retry_policy",
+                    "auto_retry_on_start",
+                    "max_attempts",
+                    "retry_delay_ms",
+                    "clean_source_after_success",
+                    "include_extensions",
+                    "exclude_extensions",
+                ],
+            ),
+            ("logging", &["level", "log_file", "retain_days"]),
+            (
+                "audio_policy",
+                &[
+                    "mode",
+                    "codec",
+                    "bitrate",
+                    "sample_rate_hz",
+                    "channels",
+                    "channel_layout",
+                    "target_lufs",
+                    "true_peak_dbtp",
+                    "lra_target",
+                    "dual_mono",
+                    "preserve_original_track",
+                ],
+            ),
+            (
+                "validation_policy",
+                &[
+                    "enforce_closed_gop",
+                    "enforce_faststart",
+                    "enforce_48k_audio",
+                    "max_duration_delta_ms",
+                    "strict_ready_blocking",
+                ],
+            ),
+            (
+                "storage_policy",
+                &[
+                    "atomic_publication",
+                    "preserve_subclips_on_purge",
+                    "clean_source_after_success",
+                ],
+            ),
+            (
+                "retry_policy_v2",
+                &["max_attempts", "retry_delay_ms", "auto_retry_on_start"],
+            ),
+            (
+                "toolchain_policy",
+                &[
+                    "ffmpeg_path",
+                    "ffprobe_path",
+                    "verify_on_startup",
+                    "download_sha256",
+                ],
+            ),
+        ]
+    }
+
+    /// Report keys in `value` that this schema does not recognise.
+    ///
+    /// serde silently ignores unknown fields, so a typo — `[transcode]` instead
+    /// of `[encoding]`, `max_concurrency` at the top level instead of under
+    /// `[ingestion]` — left the operator with a config file that looked applied
+    /// and was not. That is F-25 from the operator's side: the README described
+    /// sections that never existed, and nothing told anyone who copied them.
+    ///
+    /// Returns dotted paths, e.g. `transcode.max_concurrency`.
+    pub fn unknown_keys(value: &toml::Value) -> Vec<String> {
+        let known = Self::known_keys();
+        let mut out = Vec::new();
+
+        let Some(table) = value.as_table() else {
+            return out;
+        };
+
+        let root_scalars: &[&str] = known
+            .iter()
+            .find(|(s, _)| s.is_empty())
+            .map(|(_, k)| *k)
+            .unwrap_or(&[]);
+
+        for (key, val) in table {
+            if val.is_table() {
+                match known.iter().find(|(section, _)| section == key) {
+                    Some((_, allowed)) => {
+                        if let Some(inner) = val.as_table() {
+                            for k in inner.keys() {
+                                if !allowed.contains(&k.as_str()) {
+                                    out.push(format!("{}.{}", key, k));
+                                }
+                            }
+                        }
+                    }
+                    None => out.push(key.clone()),
+                }
+            } else if !root_scalars.contains(&key.as_str()) {
+                out.push(key.clone());
+            }
+        }
+
+        out.sort();
+        out
+    }
+
+    /// Log a warning for every unrecognised key. Called from [`Self::load`].
+    pub fn warn_unknown_keys(value: &toml::Value) {
+        for key in Self::unknown_keys(value) {
+            tracing::warn!(
+                "Unknown config key '{}' -- it is ignored. Check the spelling \
+                 against the Configuration section of the README.",
+                key
+            );
+        }
+    }
+
     pub fn load(path: Option<&str>) -> Result<(Self, PathBuf), String> {
         let config_path = path.map(PathBuf::from).unwrap_or_else(default_config_path);
 
@@ -875,6 +1052,14 @@ impl AppConfig {
 
         let config: AppConfig = toml::from_str(&content)
             .map_err(|e| format!("Failed to parse config '{}': {}", config_path.display(), e))?;
+
+        // serde ignores unknown fields silently, so a typo or a section copied
+        // from out-of-date documentation left an operator with a config file
+        // that looked applied and was not (T3-4, F-25). Warn, do not fail: an
+        // extra key is not worth refusing to start a broadcast service over.
+        if let Ok(raw) = toml::from_str::<toml::Value>(&content) {
+            Self::warn_unknown_keys(&raw);
+        }
 
         Ok((config, config_path))
     }
@@ -1325,7 +1510,10 @@ clean_source_after_success = true
 
         let effective_storage = cfg.effective_storage_policy();
         assert_eq!(effective_storage.clean_source_after_success, true);
-        assert_eq!(effective_storage.atomic_publication, false);
+        // Forced true since T3-3: the publisher stages and renames
+        // unconditionally, so reporting `false` told operators publication was
+        // not atomic when it always was (F-29).
+        assert_eq!(effective_storage.atomic_publication, true);
 
         let effective_retry = cfg.effective_retry_policy();
         assert_eq!(effective_retry.auto_retry_on_start, true);
