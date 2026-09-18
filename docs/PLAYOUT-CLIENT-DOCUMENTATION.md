@@ -311,7 +311,19 @@ Four of these are new. Map them to operator-facing wording:
 | `db_mark_ready_failed` | Encoded successfully, registry would not record it; **the mezzanine is in `<target>\quarantine\`** | "Transcode finished but could not be saved — see quarantine" |
 | `sidecar_write_failed` | Encoded successfully, sidecar could not be written; also quarantined | as above |
 | `io_disk_full` | Not enough free space | "Not enough disk space" |
+| `probe_failure` | ffprobe could not read the stream layout | "Could not probe the file" |
+| `audio_measurement_failure` | The loudness pass did not complete | "Audio measurement failed" |
+| `profile_disabled` | The profile this file maps to is turned off | "Profile disabled in configuration" |
+| `validation_failure` | The encode finished but failed output QC | "Failed quality checks" |
+| `transcode_failure` | FFmpeg exited with an error | "Encode failed" |
+| `publish_failure` | The encoded file could not be moved into the target folder | "Could not publish the encoded file" |
+| `retryable_error` | Transient; the job will be attempted again | "Retrying" |
+| `cancelled` | An operator cancelled the job; nothing was published | "Cancelled" |
 | `duplicate_skipped` | **Legacy — see 5.3.** No longer produced | — |
+
+The web UI renders this same table from `web-ui/src/lib/errorCategories.ts`.
+If a category is added on the server, update both in the same commit; an
+unknown token falls back to being shown raw in both places.
 
 The three `db_*` / `sidecar_*` categories mean an encoded file exists in
 `<target>\quarantine\` that nothing references. An operator needs to know that,

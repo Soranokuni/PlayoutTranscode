@@ -59,7 +59,11 @@
           <span class="queue-status failed">Failed</span>
           <span v-if="job.attempt && job.attempt > 0" class="retry-chip">⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span></span>
           <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
-          <span v-if="job.error_category" class="error-category">{{ job.error_category }}</span>
+          <span
+            v-if="job.error_category"
+            class="error-category"
+            :title="job.error_category"
+          >⚠ {{ describeErrorCategory(job.error_category).label }}</span>
           <span class="queue-profile">{{ job.profile }}</span>
           <div class="error-actions">
             <button class="btn btn-mini" :disabled="retryingId === job.id" @click="onRetry(job.id)">
@@ -69,18 +73,55 @@
           </div>
         </div>
         <div class="error-summary">{{ shortError(job.error) }}</div>
+        <div v-if="describeErrorCategory(job.error_category).hint" class="error-hint">
+          {{ describeErrorCategory(job.error_category).hint }}
+        </div>
+        <!-- The work was done and only the bookkeeping failed, so there is a
+             finished mezzanine on disk that nothing references. -->
+        <div v-if="describeErrorCategory(job.error_category).quarantined" class="error-quarantine">
+          The encoded file was kept in the target folder's <code>quarantine\</code>
+          directory. Nothing references it, so it is safe to inspect or delete.
+        </div>
         <details v-if="job.stderr_log && job.stderr_log.length" class="error-details">
           <summary>ffmpeg stderr tail ({{ job.stderr_log.length }} lines)</summary>
           <pre class="error-body">{{ job.stderr_log.join('\n') }}</pre>
         </details>
       </div>
     </div>
+
+    <!--
+      A job that finished used to vanish, and a duplicate that was skipped
+      (state Completed, phase skipped) never appeared anywhere but as a number
+      in the stats. An operator who dropped a file and saw nothing could not
+      tell "done" from "ignored" (UX-04).
+    -->
+    <details v-if="recent.length" class="recent">
+      <summary class="recent-summary">
+        Recent ({{ recent.length }})
+      </summary>
+      <div class="recent-list">
+        <div v-for="job in recent" :key="job.id" class="recent-row">
+          <span class="recent-badge" :class="job.phase === 'skipped' ? 'skipped' : 'done'">
+            {{ job.phase === 'skipped' ? '⊘ skipped' : '✓ completed' }}
+          </span>
+          <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
+          <span v-if="job.phase === 'skipped' && job.uuid" class="recent-note">
+            duplicate of {{ job.uuid.slice(0, 8) }}
+          </span>
+          <span v-if="job.duration_secs" class="recent-note mono">
+            {{ job.duration_secs.toFixed(1) }}s
+          </span>
+          <span v-if="job.finished_at" class="recent-note mono">{{ clockTime(job.finished_at) }}</span>
+        </div>
+      </div>
+    </details>
   </section>
 </template>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import type { JobRecord } from '../composables/useEventStream'
+import { describeErrorCategory } from '../lib/errorCategories'
 import ProgressBar from './ProgressBar.vue'
 
 const props = defineProps<{
@@ -103,12 +144,41 @@ function shortError(err?: string): string {
   return first.length > 220 ? first.slice(0, 217) + '…' : first
 }
 
-const processing = computed(() =>
-  Array.from(props.jobs.values()).filter((j) => j.state === 'Processing')
+/**
+ * One pass over the Map instead of one per list.
+ *
+ * With `jobs` mutated in place on progress (SF-03), this recomputes when a
+ * job's identity changes rather than on every 250 ms tick.
+ */
+const buckets = computed(() => {
+  const processing: JobRecord[] = []
+  const failed: JobRecord[] = []
+  const completed: JobRecord[] = []
+  for (const job of props.jobs.values()) {
+    if (job.state === 'Processing') processing.push(job)
+    else if (job.state === 'Failed') failed.push(job)
+    else if (job.state === 'Completed') completed.push(job)
+  }
+  return { processing, failed, completed }
+})
+
+const processing = computed(() => buckets.value.processing)
+const failed = computed(() => buckets.value.failed)
+
+const RECENT_LIMIT = 20
+const recent = computed(() =>
+  buckets.value.completed
+    .slice()
+    .sort((a, b) => (b.finished_at || '').localeCompare(a.finished_at || ''))
+    .slice(0, RECENT_LIMIT),
 )
-const failed = computed(() =>
-  Array.from(props.jobs.values()).filter((j) => j.state === 'Failed')
-)
+
+function clockTime(iso: string): string {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime())
+    ? ''
+    : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
 
 const retryingId = ref<string | null>(null)
 const cancellingId = ref<string | null>(null)
@@ -260,6 +330,75 @@ defineExpose({ showRetryMsg: (msg: string, ok: boolean) => { retryMsg.value = ms
   background: rgba(255,170,40,0.1);
   padding: 1px 6px;
   border-radius: 4px;
+}
+
+.error-hint {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.error-quarantine {
+  font-size: 12px;
+  line-height: 1.5;
+  margin-top: 8px;
+  padding: 7px 10px;
+  color: var(--accent-amber);
+  background: rgba(245, 166, 35, 0.08);
+  border-left: 2px solid var(--accent-amber);
+  border-radius: 3px;
+}
+
+.recent {
+  margin-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+  padding-top: 8px;
+}
+
+.recent-summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text-secondary);
+  user-select: none;
+}
+
+.recent-list {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.recent-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12px;
+  padding: 3px 2px;
+}
+
+.recent-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.recent-badge.done {
+  color: var(--accent-emerald);
+  background: rgba(63, 185, 80, 0.1);
+}
+
+.recent-badge.skipped {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.recent-note {
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 .btn-cancel {
   border-color: rgba(229,57,53,0.4);
