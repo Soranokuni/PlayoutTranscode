@@ -1626,30 +1626,10 @@ async fn sse_events(
     Sse::new(head.chain(tail)).keep_alive(KeepAlive::default())
 }
 
-#[derive(Serialize)]
-struct JobStats {
-    pending: usize,
-    active: usize,
-    completed: usize,
-    failed: usize,
-    total: usize,
-}
-
-async fn get_stats(State(state): State<ServerState>) -> Json<JobStats> {
-    let all = state.jobs.all();
-    Json(JobStats {
-        pending: all.iter().filter(|j| j.state == JobState::Pending).count(),
-        active: all
-            .iter()
-            .filter(|j| j.state == JobState::Processing)
-            .count(),
-        completed: all
-            .iter()
-            .filter(|j| j.state == JobState::Completed)
-            .count(),
-        failed: all.iter().filter(|j| j.state == JobState::Failed).count(),
-        total: all.len(),
-    })
+/// `GET /api/stats`. The field names are the wire contract; the counting is
+/// now done under the queue's read lock instead of over a full clone of it.
+async fn get_stats(State(state): State<ServerState>) -> Json<crate::jobs::JobStateCounts> {
+    Json(state.jobs.stats())
 }
 
 #[derive(Serialize)]
@@ -1821,8 +1801,24 @@ async fn get_download_status(State(state): State<ServerState>) -> Json<serde_jso
     Json(serde_json::json!({ "status": status }))
 }
 
-async fn get_logs(State(state): State<ServerState>) -> Json<Vec<String>> {
-    Json(state.service_handle.get_logs())
+#[derive(Deserialize)]
+struct LogsQuery {
+    /// Cursor from a previous response's `next`. Absent means "give me the
+    /// whole ring", which is the original, unchanged behaviour.
+    since: Option<u64>,
+}
+
+/// `GET /api/logs` -- the whole ring as a bare array of strings, as before.
+/// `GET /api/logs?since=<seq>` -- only what is new, so the viewer can append
+/// instead of repainting 500 rows every poll (UX-05).
+async fn get_logs(
+    State(state): State<ServerState>,
+    Query(q): Query<LogsQuery>,
+) -> Response {
+    match q.since {
+        None => Json(state.service_handle.get_logs()).into_response(),
+        Some(since) => Json(state.service_handle.logs_since(since)).into_response(),
+    }
 }
 
 #[derive(Deserialize)]

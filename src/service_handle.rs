@@ -106,6 +106,27 @@ impl WorkerExit {
 /// alive is what would let a second one start alongside it.
 const WORKER_JOIN_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many lines the in-memory log ring keeps for the UI.
+const LOG_RING_CAPACITY: usize = 500;
+
+/// One line of the UI log ring, with the cursor a viewer keys and polls on.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogLine {
+    pub seq: u64,
+    pub text: String,
+}
+
+/// The answer to `GET /api/logs?since=<seq>`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct LogPage {
+    pub lines: Vec<LogLine>,
+    /// The cursor to send next time.
+    pub next: u64,
+    /// The cursor had already fallen off the back of the ring, so lines were
+    /// missed and the viewer should repaint rather than append.
+    pub dropped: bool,
+}
+
 #[derive(Clone)]
 pub struct ServiceHandle {
     run_state: Arc<Mutex<RunState>>,
@@ -120,7 +141,7 @@ pub struct ServiceHandle {
     /// `None` when it has never been started.
     started_config_hash: Arc<Mutex<Option<u64>>>,
     pub download_status: Arc<Mutex<Option<String>>>,
-    pub log_lines: Arc<Mutex<Vec<String>>>,
+    pub log_lines: Arc<Mutex<std::collections::VecDeque<LogLine>>>,
     pub active_pids: ActivePids,
 }
 
@@ -134,7 +155,9 @@ impl ServiceHandle {
             retry_tx: Arc::new(StdMutex::new(None)),
             started_config_hash: Arc::new(Mutex::new(None)),
             download_status: Arc::new(Mutex::new(None)),
-            log_lines: Arc::new(Mutex::new(Vec::new())),
+            log_lines: Arc::new(Mutex::new(std::collections::VecDeque::with_capacity(
+                LOG_RING_CAPACITY,
+            ))),
             active_pids: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
@@ -168,14 +191,52 @@ impl ServiceHandle {
     pub fn add_log(&self, level: &str, msg: &str) {
         let ts = chrono::Local::now().format("%H:%M:%S").to_string();
         let mut logs = self.log_lines.lock();
-        logs.push(format!("{} [{}] {}", ts, level.to_uppercase(), msg));
-        while logs.len() > 500 {
-            logs.remove(0);
+        let seq = logs.back().map(|l| l.seq + 1).unwrap_or(0);
+        logs.push_back(LogLine {
+            seq,
+            text: format!("{} [{}] {}", ts, level.to_uppercase(), msg),
+        });
+        // `Vec::remove(0)` shifted 500 elements per line; a deque drops the
+        // oldest in O(1).
+        while logs.len() > LOG_RING_CAPACITY {
+            logs.pop_front();
         }
     }
 
+    /// The whole ring, oldest first. Unchanged shape: `GET /api/logs` with no
+    /// cursor still answers a bare array of strings.
     pub fn get_logs(&self) -> Vec<String> {
-        self.log_lines.lock().clone()
+        self.log_lines
+            .lock()
+            .iter()
+            .map(|l| l.text.clone())
+            .collect()
+    }
+
+    /// Only the lines added after `since`, with the cursor to pass next time.
+    ///
+    /// The ring shifts, so a viewer that keyed rows by index repainted all 500
+    /// nodes on every poll and could not tell "nothing new" from "everything
+    /// moved by one". `dropped` says the cursor fell off the back of the ring
+    /// and the caller should repaint from scratch.
+    pub fn logs_since(&self, since: u64) -> LogPage {
+        let logs = self.log_lines.lock();
+        let oldest = logs.front().map(|l| l.seq);
+        let dropped = match oldest {
+            Some(oldest) => since < oldest,
+            None => false,
+        };
+        let lines: Vec<LogLine> = logs
+            .iter()
+            .filter(|l| l.seq >= since)
+            .cloned()
+            .collect();
+        let next = logs.back().map(|l| l.seq + 1).unwrap_or(since);
+        LogPage {
+            lines,
+            next,
+            dropped,
+        }
     }
 
     /// True only in [`ServiceState::Running`].
@@ -833,6 +894,57 @@ mod pid_tests {
 mod lifecycle_tests {
     use super::*;
     use std::time::Duration;
+
+    /// SB-03 / UX-05: the ring is a deque with a monotonic cursor, so a viewer
+    /// can append what is new instead of repainting 500 rows, and can tell
+    /// that it fell behind.
+    #[test]
+    fn the_log_ring_drops_from_the_front_and_hands_out_a_usable_cursor() {
+        let handle = ServiceHandle::new();
+
+        for i in 0..5 {
+            handle.add_log("info", &format!("line {}", i));
+        }
+
+        // No cursor: the whole ring, as a bare array of strings, as before.
+        let all = handle.get_logs();
+        assert_eq!(all.len(), 5);
+        assert!(all[0].contains("[INFO] line 0"));
+
+        let page = handle.logs_since(0);
+        assert_eq!(page.lines.len(), 5);
+        assert_eq!(page.lines[0].seq, 0);
+        assert_eq!(page.next, 5);
+        assert!(!page.dropped);
+
+        // Nothing new since the cursor.
+        let page = handle.logs_since(page.next);
+        assert!(page.lines.is_empty());
+        assert_eq!(page.next, 5);
+        assert!(!page.dropped);
+
+        handle.add_log("warn", "line 5");
+        let page = handle.logs_since(5);
+        assert_eq!(page.lines.len(), 1);
+        assert!(page.lines[0].text.contains("[WARN] line 5"));
+        assert_eq!(page.next, 6);
+
+        // Overflow the ring: the cap holds, the oldest lines go, and a stale
+        // cursor is reported as dropped rather than silently returning a gap.
+        for i in 6..700 {
+            handle.add_log("info", &format!("line {}", i));
+        }
+        assert_eq!(handle.get_logs().len(), 500);
+        let stale = handle.logs_since(0);
+        assert!(stale.dropped, "a cursor off the back of the ring is dropped");
+        assert_eq!(stale.lines.len(), 500);
+        assert_eq!(stale.next, 700);
+
+        let fresh = handle.logs_since(699);
+        assert!(!fresh.dropped);
+        assert_eq!(fresh.lines.len(), 1);
+        assert!(fresh.lines[0].text.contains("line 699"));
+    }
 
     /// Stand-in for `start_processing_loop`'s bookkeeping, without the Tokio
     /// runtime, database pool and FFmpeg toolchain a real start needs. The

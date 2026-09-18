@@ -358,6 +358,16 @@ struct Persistence {
     pool: Arc<SqlitePool>,
 }
 
+/// The counters behind `/api/stats`, produced without cloning the queue.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct JobStateCounts {
+    pub pending: usize,
+    pub active: usize,
+    pub completed: usize,
+    pub failed: usize,
+    pub total: usize,
+}
+
 #[derive(Clone)]
 pub struct JobQueue {
     jobs: Arc<RwLock<Vec<JobRecord>>>,
@@ -570,6 +580,30 @@ impl JobQueue {
         self.jobs.read().clone()
     }
 
+    /// The five counters `/api/stats` reports, counted under the read lock.
+    ///
+    /// This used to be `all()` -- a clone of the whole vector, each record
+    /// carrying up to 200 lines of `stderr_log` for a failed job -- thrown
+    /// away after five `filter().count()` passes. The UI polled it every 2 s
+    /// per tab.
+    pub fn stats(&self) -> JobStateCounts {
+        let jobs = self.jobs.read();
+        let mut counts = JobStateCounts {
+            total: jobs.len(),
+            ..Default::default()
+        };
+        for job in jobs.iter() {
+            match job.state {
+                JobState::Pending => counts.pending += 1,
+                JobState::Processing => counts.active += 1,
+                JobState::Completed => counts.completed += 1,
+                JobState::Failed => counts.failed += 1,
+                JobState::Cancelled => {}
+            }
+        }
+        counts
+    }
+
     pub fn all_recent(&self) -> Vec<JobRecord> {
         let mut jobs = self.jobs.read().clone();
         jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -760,6 +794,57 @@ async fn flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SB-03: `stats()` counts under the read lock. It must agree exactly with
+    /// the clone-and-filter it replaced, including that `Cancelled` counts
+    /// towards `total` but towards none of the four buckets.
+    #[test]
+    fn stats_agree_with_counting_a_full_clone() {
+        let (tx, _rx) = broadcast::channel(16);
+        let queue = JobQueue::new(tx, None);
+
+        let states = [
+            JobState::Pending,
+            JobState::Pending,
+            JobState::Processing,
+            JobState::Completed,
+            JobState::Completed,
+            JobState::Completed,
+            JobState::Failed,
+            JobState::Cancelled,
+        ];
+        for (i, state) in states.iter().enumerate() {
+            let mut job = JobRecord::new(&format!("D:/media/clip{}.mov", i), "ProfileA");
+            job.state = *state;
+            queue.push(job);
+        }
+
+        let all = queue.all();
+        let counts = queue.stats();
+        assert_eq!(
+            counts.pending,
+            all.iter().filter(|j| j.state == JobState::Pending).count()
+        );
+        assert_eq!(
+            counts.active,
+            all.iter()
+                .filter(|j| j.state == JobState::Processing)
+                .count()
+        );
+        assert_eq!(
+            counts.completed,
+            all.iter()
+                .filter(|j| j.state == JobState::Completed)
+                .count()
+        );
+        assert_eq!(
+            counts.failed,
+            all.iter().filter(|j| j.state == JobState::Failed).count()
+        );
+        assert_eq!(counts.total, all.len());
+        assert_eq!(counts.total, 8);
+        assert_eq!(counts.pending + counts.active + counts.completed + counts.failed, 7);
+    }
 
     async fn pool_in_temp(tag: &str) -> (Arc<SqlitePool>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
