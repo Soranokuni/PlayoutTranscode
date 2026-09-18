@@ -161,3 +161,155 @@ max_concurrancy = 4
         unknown
     );
 }
+
+// ---------------------------------------------------------------------------
+// Partial config files must still validate.
+//
+// `AppConfig` marks most sections `#[serde(default)]`, so a `config.toml` that
+// omits one builds that struct through `Default`. Two of them derived
+// `Default`, which ignores the per-field `#[serde(default = "...")]` entirely.
+// A file with no `[server]` section therefore produced `web_port: 0` and an
+// empty `bind_address`, and `validate()` rejected it; no `[encoding]` produced
+// an empty `preset`, same outcome.
+//
+// That was not theoretical. `app::run_service` only auto-starts ingest when
+// `validate()` succeeds, and it reports the failure to the UI log ring rather
+// than to `tracing`. So the service came up, served its API, answered
+// /api/health -- and silently never ingested anything, with nothing in the log
+// to explain it. Found while verifying an unrelated change, which is the only
+// reason it was found at all.
+// ---------------------------------------------------------------------------
+
+/// `validate()` requires the media roots to exist, so the fixtures are real.
+struct Roots {
+    dir: std::path::PathBuf,
+    watch: String,
+    target: String,
+}
+
+impl Drop for Roots {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+fn roots(name: &str) -> Roots {
+    let dir = std::env::temp_dir().join(format!(
+        "pt-cfgdocs-{}-{}-{}",
+        name,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let watch = dir.join("watch");
+    let target = dir.join("target");
+    std::fs::create_dir_all(&watch).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    Roots {
+        watch: watch.to_string_lossy().replace('\\', "/"),
+        target: target.to_string_lossy().replace('\\', "/"),
+        dir,
+    }
+}
+
+fn minimal_config(r: &Roots) -> String {
+    format!(
+        "[paths]\nwatch_folder = \"{}\"\ntarget_folder = \"{}\"\n",
+        r.watch, r.target
+    )
+}
+
+#[test]
+fn a_config_with_only_paths_is_valid() {
+    let r = roots("minimal");
+    let cfg: AppConfig = toml::from_str(&minimal_config(&r)).expect("must parse");
+    if let Err(e) = cfg.validate() {
+        panic!("a config with only [paths] must validate, or the service silently never auto-starts: {}", e);
+    }
+}
+
+#[test]
+fn omitting_any_single_section_still_validates() {
+    let r = roots("sections");
+
+    // The full documented config, with its placeholder paths pointed at real
+    // directories, then one section dropped at a time.
+    let full = readme_config_block();
+    let parsed: toml::Value = toml::from_str(&full).expect("valid TOML");
+    let mut table = parsed.as_table().expect("a table").clone();
+    if let Some(paths) = table.get_mut("paths").and_then(|p| p.as_table_mut()) {
+        paths.insert("watch_folder".into(), toml::Value::String(r.watch.clone()));
+        paths.insert("target_folder".into(), toml::Value::String(r.target.clone()));
+    }
+
+    let sections: Vec<String> = table
+        .iter()
+        .filter(|(_, v)| v.is_table())
+        // `[paths]` is genuinely required: the service cannot guess where the
+        // media lives, and `validate()` says so explicitly.
+        .filter(|(k, _)| k.as_str() != "paths")
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    for section in sections {
+        let mut reduced = table.clone();
+        reduced.remove(&section);
+
+        let text = toml::to_string(&toml::Value::Table(reduced)).expect("serialisable");
+        let cfg: AppConfig = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("dropping [{}] made it unparseable: {}", section, e));
+
+        if let Err(e) = cfg.validate() {
+            panic!("dropping [{}] made the config invalid: {}", section, e);
+        }
+    }
+}
+
+#[test]
+fn section_defaults_match_their_field_defaults() {
+    // The specific trap: a struct deriving `Default` while its fields carry
+    // `#[serde(default = "...")]`. The two must agree, or which one applies
+    // depends on whether the section is present -- which is the bug.
+    let r = roots("defaults");
+
+    let present: AppConfig =
+        toml::from_str(&format!("{}\n[server]\n[encoding]\n", minimal_config(&r)))
+            .expect("parse");
+    let absent: AppConfig = toml::from_str(&minimal_config(&r)).expect("parse");
+
+    assert_eq!(
+        present.server.web_port, absent.server.web_port,
+        "an empty [server] and a missing [server] must produce the same port"
+    );
+    assert_eq!(
+        present.server.bind_address, absent.server.bind_address,
+        "...and the same bind address"
+    );
+    assert_eq!(
+        present.encoding.preset, absent.encoding.preset,
+        "an empty [encoding] and a missing [encoding] must produce the same preset"
+    );
+    assert_eq!(present.encoding.audio_bitrate, absent.encoding.audio_bitrate);
+
+    // And they are the real values, not empty strings that happen to match.
+    assert_eq!(absent.server.web_port, 4353);
+    assert_eq!(absent.server.bind_address, "127.0.0.1");
+    assert_eq!(absent.encoding.preset, "medium");
+    assert_eq!(absent.encoding.audio_bitrate, "320k");
+}
+
+#[test]
+fn the_built_in_defaults_validate() {
+    // The other direction: what `AppConfig::default()` produces is what a fresh
+    // install writes to disk, so it has to be runnable once paths are set.
+    let r = roots("builtin");
+    let mut cfg = AppConfig::default();
+    cfg.paths.watch_folder = r.watch.clone();
+    cfg.paths.target_folder = r.target.clone();
+
+    if let Err(e) = cfg.validate() {
+        panic!("the config a fresh install writes must be valid: {}", e);
+    }
+}
