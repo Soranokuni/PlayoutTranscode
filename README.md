@@ -202,6 +202,24 @@ The data directory may not be used as the watch or target folder.
 > `/api/**` call except `GET /api/health` and `GET /api/v2/health`.
 
 ```toml
+# Every section and key below is real: `tests/config_docs.rs` parses this block
+# and fails the build if it does not round-trip through the actual schema, or if
+# it names a key the service does not read. Sections the service writes on a
+# fresh install are shown with their defaults; the `*_policy` sections are
+# optional and absent unless you add them.
+
+version = 1
+# Set true by the setup wizard. While false the service will not auto-start the
+# processing loop, however complete the rest of this file looks.
+initialized = false
+
+[paths]
+# Both must be set and must not nest inside one another.
+watch_folder = "D:/Media/Ingest"
+target_folder = "D:/Media/Mezzanine"
+# NOTE: there is no database_path. The registry, the logs and the downloaded
+# toolchain all live in the data directory (see above), not here.
+
 [server]
 web_port = 4353
 bind_address = "127.0.0.1"
@@ -213,45 +231,53 @@ allowed_origins = []
 # A non-loopback bind_address requires this to be set.
 api_token = ""
 
-[paths]
-watch_folder = "D:/Media/Ingest"
-target_folder = "D:/Media/Mezzanine"
-database_path = "D:/PlayoutTranscode/logs/media_assets.db"
+[encoding]
+preset = "medium"
+# 0 = derive from cpu_cores and ingestion.max_concurrency.
+ffmpeg_threads = 0
+# 0 = all logical cores.
+cpu_cores = 0
+audio_codec = "aac"
+audio_bitrate = "320k"
+tune = "film"
+probesize = "500M"
+analyzeduration = "500M"
 
-[transcode]
-default_profile = "ProfileA"
+# One section per broadcast profile. The profile is chosen automatically from
+# the source probe; these set its rate control.
+[profile_a]
+enabled = true
+crf = 24
+maxrate = "15M"
+bufsize = "16M"
+
+[profile_b]
+enabled = true
+crf = 23
+maxrate = "15M"
+bufsize = "16M"
+
+[profile_c]
+enabled = true
+crf = 20
+maxrate = "5M"
+bufsize = "6M"
+
+[ingestion]
+# Seconds a file must sit unchanged before it is considered complete.
+settle_secs = 5
+poll_secs = 10
 max_concurrency = 2
-process_priority = "BelowNormal"
-settling_delay_seconds = 5
-
-[audio]
-mode = "ebu_r128"          # Options: "ebu_r128", "atsc_a85", "legacy_v1_encode", "passthrough_validate"
-codec = "aac"
-bitrate = "320k"
-sample_rate_hz = 48000
-channels = 2
-target_lufs = -23.0
-true_peak_dbtp = -1.0
-lra_target = 7.0
-preserve_original = false
-
-[cleanup]
-auto_purge_days = 30
-verified_source_cleanup = false
-
-[toolchain_policy]
-# Absolute paths to the toolchain. Leave unset to search <data_dir>/bin, then
-# <exe_dir>/bin, then <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately
-# NOT searched: a
-# writable directory earlier in PATH would let a local user supply the
-# ffmpeg.exe this service runs.
-# ffmpeg_path = "C:/PlayoutTranscode/bin/ffmpeg.exe"
-# ffprobe_path = "C:/PlayoutTranscode/bin/ffprobe.exe"
-verify_on_startup = true
-# Expected SHA-256 of the FFmpeg release archive. The in-app download is
-# DISABLED until this is set - an unpinned executable download is not
-# acceptable on a broadcast host. Install manually if you prefer.
-download_sha256 = ""
+stable_polls_min = 2
+retry_policy = "once"
+auto_retry_on_start = true
+max_attempts = 2
+retry_delay_ms = 2000
+# Delete the source after a verified successful ingest.
+clean_source_after_success = false
+# Empty include list = every extension not excluded.
+include_extensions = []
+exclude_extensions = []
 
 [logging]
 # Console level, and the level written to the rotated JSON files.
@@ -261,6 +287,66 @@ level = "info"
 log_file = "transcode.log"
 # Rotated files older than this are deleted at startup. 0 disables pruning.
 retain_days = 14
+
+# ---------------------------------------------------------------------------
+# Optional policy sections. Absent from a fresh config.toml; add them only to
+# override the defaults shown.
+# ---------------------------------------------------------------------------
+
+[toolchain_policy]
+# Absolute paths to the toolchain. Leave unset to search <data_dir>/bin, then
+# <exe_dir>/bin, then <exe_dir>/Requirements/ffmpeg/bin. PATH is deliberately
+# NOT searched: a writable directory earlier in PATH would let a local user
+# supply the ffmpeg.exe this service runs.
+# ffmpeg_path = "C:/PlayoutTranscode/bin/ffmpeg.exe"
+# ffprobe_path = "C:/PlayoutTranscode/bin/ffprobe.exe"
+# SHA-256 both binaries at startup. On a ~170 MB pair that costs ~25 s before
+# the HTTP server binds. False skips it; the toolchain is still verified before
+# the first encode, so nothing ever runs unverified either way.
+verify_on_startup = true
+# Expected SHA-256 of the FFmpeg release archive. The in-app download is
+# DISABLED until this is set - an unpinned executable download is not
+# acceptable on a broadcast host. Install manually if you prefer.
+download_sha256 = ""
+
+[validation_policy]
+# Each enforce_* chooses the SEVERITY of its check, not whether it runs. Turning
+# one off downgrades that finding from blocking to a warning; the finding is
+# still recorded in the sidecar and the DB viewer, so "was this file actually
+# faststart?" always has an answer.
+enforce_closed_gop = true
+enforce_faststart = true
+enforce_48k_audio = true
+# Maximum tolerated drift between the source duration and the mezzanine.
+max_duration_delta_ms = 80
+# Promote warnings to blocking, so an asset with any open question against it
+# is not marked ready.
+strict_ready_blocking = false
+
+[storage_policy]
+# Always true and not settable: publication stages to a temp name and renames.
+atomic_publication = true
+preserve_subclips_on_purge = true
+clean_source_after_success = false
+
+[retry_policy_v2]
+# Overrides the equivalent [ingestion] keys when present.
+max_attempts = 2
+retry_delay_ms = 2000
+auto_retry_on_start = true
+
+[audio_policy]
+# Options: "ebu_r128", "atsc_a85", "legacy_v1_encode", "passthrough_validate"
+mode = "ebu_r128"
+codec = "aac"
+bitrate = "320k"
+sample_rate_hz = 48000
+channels = 2
+target_lufs = -23.0
+true_peak_dbtp = -1.0
+lra_target = 7.0
+dual_mono = false
+preserve_original_track = false
 ```
 
 ### Logs
