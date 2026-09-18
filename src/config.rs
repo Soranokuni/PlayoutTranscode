@@ -27,7 +27,7 @@ fn default_target() -> String {
     String::new()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
     #[serde(default = "default_web_port")]
     pub web_port: u16,
@@ -292,7 +292,49 @@ fn default_bind_address() -> String {
     "127.0.0.1".to_string()
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+/// Hand-written so it agrees with the `#[serde(default = "...")]` on each field.
+///
+/// `#[derive(Default)]` is a trap here, and it bit for real. `AppConfig` marks
+/// this field `#[serde(default)]`, so a `config.toml` with **no `[server]`
+/// section** builds the struct through `Default` — and a derived `Default`
+/// ignores the per-field serde defaults entirely, yielding `web_port: 0` and an
+/// empty `bind_address`. `validate()` then rejects the config ("web_port must
+/// not be 0"), and because the auto-start path only runs when `validate()`
+/// succeeds, the service came up, served its API, and silently never started
+/// ingesting. The operator saw a stopped service after every restart with
+/// nothing in the log to explain it.
+///
+/// If you add a field here with a serde default, add it below too.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            web_port: default_web_port(),
+            bind_address: default_bind_address(),
+            allowed_origins: Vec::new(),
+            api_token: String::new(),
+        }
+    }
+}
+
+/// Hand-written for the same reason as [`ServerConfig::default`]: a
+/// `config.toml` with no `[encoding]` section would otherwise get an empty
+/// `preset`, which `validate()` rejects.
+impl Default for EncodingConfig {
+    fn default() -> Self {
+        Self {
+            preset: default_preset(),
+            ffmpeg_threads: default_threads(),
+            cpu_cores: default_cpu_cores(),
+            audio_codec: default_audio_codec(),
+            audio_bitrate: default_audio_bitrate(),
+            tune: default_tune(),
+            probesize: default_probesize(),
+            analyzeduration: default_analyzeduration(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncodingConfig {
     #[serde(default = "default_preset")]
     pub preset: String,
