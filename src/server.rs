@@ -990,6 +990,52 @@ fn static_not_found() -> Response {
         .into_response()
 }
 
+/// Does `Accept-Encoding` list this coding with a non-zero q-value?
+fn accepts_encoding(headers: &header::HeaderMap, coding: &str) -> bool {
+    let Some(value) = headers
+        .get(header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    value.split(',').any(|part| {
+        let mut bits = part.split(';');
+        let name = bits.next().unwrap_or("").trim();
+        if !name.eq_ignore_ascii_case(coding) && name != "*" {
+            return false;
+        }
+        // `br;q=0` is an explicit refusal, not an offer.
+        !bits.any(|p| p.trim().eq_ignore_ascii_case("q=0"))
+    })
+}
+
+/// Pick the precompressed sibling to serve, if the build produced one and the
+/// client will take it.
+///
+/// The sibling path is built by appending to the path `safe_join` already
+/// validated -- never from anything in the request -- so this cannot widen
+/// what is reachable (F-01).
+async fn precompressed_sibling(
+    file_path: &std::path::Path,
+    headers: &header::HeaderMap,
+) -> Option<(std::path::PathBuf, std::fs::Metadata, &'static str)> {
+    for (suffix, coding) in [("br", "br"), ("gz", "gzip")] {
+        if !accepts_encoding(headers, coding) {
+            continue;
+        }
+        let mut candidate = file_path.as_os_str().to_os_string();
+        candidate.push(".");
+        candidate.push(suffix);
+        let candidate = std::path::PathBuf::from(candidate);
+        if let Ok(meta) = tokio::fs::metadata(&candidate).await {
+            if meta.is_file() {
+                return Some((candidate, meta, coding));
+            }
+        }
+    }
+    None
+}
+
 async fn serve_spa(
     uri: Uri,
     headers: header::HeaderMap,
@@ -1028,34 +1074,57 @@ async fn serve_spa(
     } else {
         "no-cache"
     };
+
+    // The content type is always the *original* file's; only the bytes change.
+    let content_type = content_type_for(&file_path);
+    let (read_path, meta, encoding) = match precompressed_sibling(&file_path, &headers).await {
+        Some((path, meta, coding)) => (path, meta, Some(coding)),
+        None => (file_path, meta, None),
+    };
+
+    // The validator describes the bytes actually sent, so a client that
+    // switches encodings revalidates rather than reusing the wrong body.
     let etag = etag_for(&meta);
 
     if let Some(etag) = etag.as_deref() {
         if if_none_match_matches(&headers, etag) {
-            return (
+            let mut response = (
                 StatusCode::NOT_MODIFIED,
                 [
                     (header::CACHE_CONTROL, cache_control),
                     (header::ETAG, etag),
+                    (header::VARY, "Accept-Encoding"),
                 ],
             )
                 .into_response();
+            if let Some(encoding) = encoding {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_ENCODING, header::HeaderValue::from_static(encoding));
+            }
+            return response;
         }
     }
 
-    match tokio::fs::read(&file_path).await {
+    match tokio::fs::read(&read_path).await {
         Ok(content) => {
             let mut response = (
                 StatusCode::OK,
                 [
-                    (header::CONTENT_TYPE, content_type_for(&file_path)),
+                    (header::CONTENT_TYPE, content_type),
                     (header::CACHE_CONTROL, cache_control),
+                    (header::VARY, "Accept-Encoding"),
                 ],
                 content,
             )
                 .into_response();
             if let Some(etag) = etag.and_then(|e| header::HeaderValue::from_str(&e).ok()) {
                 response.headers_mut().insert(header::ETAG, etag);
+            }
+            if let Some(encoding) = encoding {
+                response
+                    .headers_mut()
+                    .insert(header::CONTENT_ENCODING, header::HeaderValue::from_static(encoding));
             }
             response
         }

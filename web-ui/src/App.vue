@@ -283,12 +283,15 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted, computed } from 'vue'
+import { ref, watch, nextTick, onMounted, computed, defineAsyncComponent } from 'vue'
 import { useEventStream, type ConfigPayload } from './composables/useEventStream'
 import BroadcastTopBar from './components/BroadcastTopBar.vue'
 import IngestQueuePanel from './components/IngestQueuePanel.vue'
 import AssetRegistryGrid from './components/AssetRegistryGrid.vue'
-import DbViewer from './components/DbViewer.vue'
+// The largest component in the UI by a wide margin, and the Database tab is
+// almost never the first screen an operator opens. Loading it on demand keeps
+// it out of the dashboard's bundle.
+const DbViewer = defineAsyncComponent(() => import('./components/DbViewer.vue'))
 
 const PRESETS = ['ultrafast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow']
 const AUDIO_CODECS = ['aac', 'pcm_s16le', 'libmp3lame']

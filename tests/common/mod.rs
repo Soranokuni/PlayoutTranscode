@@ -113,6 +113,19 @@ pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
             "export const y = 2;",
         )
         .expect("write hashed asset");
+        // Precompressed siblings, as the Vite build writes them. The
+        // contents are not real brotli/gzip: the handler must not decode
+        // them, only hand them over with the right Content-Encoding.
+        std::fs::write(
+            web_ui_dir.join("assets").join("index-AbCd1234.js.br"),
+            b"BROTLI-BYTES",
+        )
+        .expect("write br sibling");
+        std::fs::write(
+            web_ui_dir.join("assets").join("index-AbCd1234.js.gz"),
+            b"GZIP-BYTES",
+        )
+        .expect("write gz sibling");
         // A file the SPA must never hand out: it sits next to the dist dir,
         // reachable only by escaping it.
         std::fs::write(root.join("secret.toml"), "token = \"do-not-serve\"\n")

@@ -214,3 +214,96 @@ async fn a_missing_static_asset_is_a_real_404_without_a_path() {
     assert_eq!(r.status(), 200);
     assert!(r.text().await.unwrap().contains("<title>spa</title>"));
 }
+
+/// BO-03 + SB-04: the build writes `.br`/`.gz` siblings and the handler serves
+/// them when the client asks, with the original's Content-Type.
+#[tokio::test]
+async fn precompressed_siblings_are_served_only_when_accepted() {
+    let s = spawn_test_server().await;
+
+    // No Accept-Encoding: the original, uncompressed.
+    let plain = s.get("/assets/index-AbCd1234.js").await;
+    assert_eq!(plain.status(), 200);
+    assert!(plain.headers().get("content-encoding").is_none());
+    let plain_etag = plain
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    assert_eq!(plain.text().await.unwrap(), "export const y = 2;");
+
+    // Brotli is preferred over gzip when both are offered.
+    let br = s
+        .client()
+        .get(s.url("/assets/index-AbCd1234.js"))
+        .header("accept-encoding", "gzip, deflate, br")
+        .send()
+        .await
+        .expect("GET");
+    assert_eq!(br.status(), 200);
+    assert_eq!(
+        br.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("br")
+    );
+    // The type is the original's -- only the bytes are encoded.
+    assert_eq!(
+        br.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("application/javascript; charset=utf-8")
+    );
+    assert_eq!(
+        br.headers().get("vary").and_then(|v| v.to_str().ok()),
+        Some("Accept-Encoding")
+    );
+    let br_etag = br
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .to_string();
+    // A different representation gets a different validator, so a client that
+    // switches encodings cannot reuse the wrong body.
+    assert_ne!(br_etag, plain_etag);
+    assert_eq!(br.text().await.unwrap(), "BROTLI-BYTES");
+
+    // gzip only.
+    let gz = s
+        .client()
+        .get(s.url("/assets/index-AbCd1234.js"))
+        .header("accept-encoding", "gzip")
+        .send()
+        .await
+        .expect("GET");
+    assert_eq!(
+        gz.headers()
+            .get("content-encoding")
+            .and_then(|v| v.to_str().ok()),
+        Some("gzip")
+    );
+    assert_eq!(gz.text().await.unwrap(), "GZIP-BYTES");
+
+    // `br;q=0` is a refusal, not an offer.
+    let refused = s
+        .client()
+        .get(s.url("/assets/index-AbCd1234.js"))
+        .header("accept-encoding", "br;q=0")
+        .send()
+        .await
+        .expect("GET");
+    assert!(refused.headers().get("content-encoding").is_none());
+    assert_eq!(refused.text().await.unwrap(), "export const y = 2;");
+
+    // A file with no sibling is served plain however eager the client is.
+    let no_sibling = s
+        .client()
+        .get(s.url("/assets/app.js"))
+        .header("accept-encoding", "br, gzip")
+        .send()
+        .await
+        .expect("GET");
+    assert!(no_sibling.headers().get("content-encoding").is_none());
+}

@@ -34,7 +34,6 @@ chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
 zip = "2"
 sha2 = "0.10"
-regex = "1"
 anyhow = "1"
 parking_lot = "0.12"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "derive"] }
@@ -70,3 +69,14 @@ opt-level = "s"
 # the installer rather than into it, so the shipped payload is unchanged.
 strip = false
 debug = 1
+
+# The profile optimises for size, which suits a daemon whose hot path is inside
+# FFmpeg. The exceptions are the two crates that actually spin on this process's
+# CPU: SHA-256 over the 170 MB toolchain and over duplicate candidates, and JSON
+# on every request and SSE frame. `opt-level = "s"` turns off exactly the
+# vectorisation-heavy passes those two benefit from.
+[profile.release.package.sha2]
+opt-level = 3
+
+[profile.release.package.serde_json]
+opt-level = 3
