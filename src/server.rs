@@ -1038,6 +1038,7 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             "version": env!("CARGO_PKG_VERSION"),
             "api_version": "2.0.0",
             "running": state.service_handle.is_running(),
+            "state": state.service_handle.state().as_str(),
             "uptime_secs": uptime_secs,
             "active_pids": state.service_handle.active_pids_count(),
         },
@@ -1530,18 +1531,40 @@ async fn get_watchfolder(State(state): State<ServerState>) -> Json<WatchfolderIn
 async fn get_service_status(State(state): State<ServerState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "running": state.service_handle.is_running(),
+        // Additive (T2-5). `running` is unchanged and still means "Running";
+        // `state` distinguishes the two transitional states it collapsed.
+        "state": state.service_handle.state().as_str(),
+        "generation": state.service_handle.generation(),
     }))
 }
 
-async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json::Value> {
-    if state.service_handle.is_running() {
-        return Json(serde_json::json!({ "success": false, "error": "Service already running" }));
-    }
-
+async fn post_start_service(State(state): State<ServerState>) -> impl IntoResponse {
     let config = state.config.lock().clone();
     if config.paths.watch_folder.trim().is_empty() || config.paths.target_folder.trim().is_empty() {
-        return Json(
-            serde_json::json!({ "success": false, "error": "Watch and target folders must be configured first" }),
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "success": false,
+                "error": "Watch and target folders must be configured first",
+            })),
+        );
+    }
+
+    // Asked before the toolchain check so an already-running service answers
+    // immediately instead of hashing 170 MB of FFmpeg to then refuse (T2-5).
+    if state.service_handle.state() != crate::service_handle::ServiceState::Stopped {
+        let current = state.service_handle.state();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "error": match current {
+                    crate::service_handle::ServiceState::Stopping => "Service is stopping",
+                    crate::service_handle::ServiceState::Starting => "Service is starting",
+                    _ => "Service already running",
+                },
+                "state": current.as_str(),
+            })),
         );
     }
 
@@ -1549,13 +1572,20 @@ async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json
     let tools = match tokio::task::spawn_blocking(crate::bootstrap::ensure_toolchain).await {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => {
-            return Json(
-                serde_json::json!({ "success": false, "error": format!("FFmpeg toolchain: {}", e) }),
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("FFmpeg toolchain: {}", e),
+                })),
             )
         }
         Err(e) => {
             tracing::error!("toolchain check task failed: {}", e);
-            return Json(serde_json::json!({ "success": false, "error": "internal_error" }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": "internal_error" })),
+            );
         }
     };
 
@@ -1566,14 +1596,38 @@ async fn post_start_service(State(state): State<ServerState>) -> Json<serde_json
         &tools,
         state.pool.clone(),
     ) {
-        Ok(()) => Json(serde_json::json!({ "success": true })),
-        Err(e) => Json(serde_json::json!({ "success": false, "error": e })),
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "state": state.service_handle.state().as_str(),
+            })),
+        ),
+        // The state machine lost a race with another start, or the target
+        // folder could not be created. The former is a conflict; both are
+        // reported the same way the guard above is, so a client has one shape
+        // to handle.
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "success": false,
+                "error": e,
+                "state": state.service_handle.state().as_str(),
+            })),
+        ),
     }
 }
 
 async fn post_stop_service(State(state): State<ServerState>) -> Json<serde_json::Value> {
     crate::service_handle::stop_processing(&state.service_handle);
-    Json(serde_json::json!({ "success": true }))
+    // Returns while the state is still `Stopping`: the worker thread has to
+    // unwind before the service is really stopped, and holding this request
+    // open for it would put a 60 s teardown inside an HTTP round-trip. Poll
+    // `GET /api/service/status` for `state == "stopped"`.
+    Json(serde_json::json!({
+        "success": true,
+        "state": state.service_handle.state().as_str(),
+    }))
 }
 
 /// Starts the FFmpeg download worker.
