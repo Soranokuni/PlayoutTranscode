@@ -381,7 +381,99 @@ percentages are as current as they ever were.
 
 ---
 
-## 7. Still coming (no action yet, listed for planning)
+## 7. Service lifecycle: `POST /api/service/start` now uses status codes
+
+**Status in PlayoutTranscode:** shipped (T2-5).
+
+PlayOut does not call these endpoints today — `src-tauri/src/ingestor_api.rs`
+has no `/api/service/*` call site, and the operator starts and stops the
+service from the PlayoutTranscode web UI or the Windows Services console. This
+section is here because that may change, and because the deployment note in
+7.4 affects anyone running both.
+
+### 7.1 Why it changed
+
+`running` was a boolean, so "stopped" and "still stopping" looked the same. A
+stop followed immediately by a start spawned a second watcher over the same
+folder while the first was still killing its FFmpeg children — two dispatchers
+on one concurrency semaphore, and whichever encode lost failed on a locked
+output file. The service now has an explicit state machine.
+
+### 7.2 New fields, additive
+
+`GET /api/service/status`:
+
+```json
+{ "running": false, "state": "stopped", "generation": 3 }
+```
+
+| Field | Meaning |
+|---|---|
+| `running` | **unchanged.** `true` only in `running` |
+| `state` | `stopped` \| `starting` \| `running` \| `stopping` |
+| `generation` | incremented once per start; identifies the current run |
+
+`GET /api/diagnostics` gains the same string at `service.state`. No existing
+field changed, so a client that only reads `running` keeps working.
+
+**The one that matters is `stopping`.** `POST /api/service/stop` returns as soon
+as the stop is *requested*; the processing thread then unwinds, which takes as
+long as the in-flight FFmpeg children take to die. During that window `running`
+is already `false` but a start will be refused. If PlayOut ever drives a
+restart, poll `GET /api/service/status` until `state == "stopped"` rather than
+sleeping a fixed interval.
+
+### 7.3 `POST /api/service/start` answers with a status code
+
+It used to return `200` with `{"success": false, "error": "..."}` for every
+refusal. Now:
+
+| Status | Body `error` | Meaning |
+|---|---|---|
+| `200` | — | started; `{"success": true, "state": "running"}` |
+| `409` | `Service already running` / `Service is starting` / `Service is stopping` | retry later; the body also carries `state` |
+| `503` | `FFmpeg toolchain: …` | the toolchain is missing or unusable — operator action |
+| `400` | `Watch and target folders must be configured first` | configuration, not timing |
+
+`success` and `error` are still in every body, so a client that ignores the
+status code and reads the body behaves exactly as before. The distinction is
+worth honouring though: `409` is worth retrying, `400` and `503` are not.
+
+`POST /api/service/stop` is unchanged apart from an additive `state` in its
+body. It still requires `X-Confirm-Destructive: yes` (section 2).
+
+### 7.4 One instance per data directory — **tell your operators**
+
+The service now takes an advisory lock, `playout-transcode.lock`, in its data
+directory (section 5.2) and refuses to start if a live process already holds
+it. Startup fails with:
+
+```
+another PlayoutTranscode instance (pid 1234) is already using this data
+directory; its lock is C:\ProgramData\PlayoutTranscode\playout-transcode.lock.
+Stop that instance, or start this one with a different --data-dir.
+```
+
+This is deliberate. Two processes on one data directory meant two watchers on
+one folder and two writers on one SQLite registry, and the symptom was a stream
+of unexplained ingest failures with no obvious cause. The way operators reached
+it was starting the portable build while the Windows service was already
+running — which, since 5.1 made the service actually work, is now easier to do
+by accident, not harder.
+
+Two installs with **separate** data directories are unaffected and remain
+supported.
+
+A lock left behind by a crash is taken over by the next start, with a warning
+in the log. No one has to delete a file by hand.
+
+### 7.5 Nothing else for PlayOut here
+
+Ingest, job, asset and SSE behaviour are untouched by this step.
+
+---
+
+## 8. Still coming (no action yet, listed for planning)
 
 - **Paginated listings (T2-7).** `GET /api/assets` will default to
   `limit=1000` with `X-Total-Count`, and will omit `keyframe_offsets` unless
