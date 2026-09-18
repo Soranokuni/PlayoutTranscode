@@ -10,12 +10,14 @@
           @click="activeFilter = f.key"
         >
           {{ f.label }}
-          <span class="filter-count">{{ filteredCount(f.key) }}</span>
+          <span class="filter-count mono">{{ counts[f.key] ?? 0 }}</span>
         </button>
       </div>
       <input
-        v-model="search"
+        v-model="searchInput"
         class="search-input"
+        type="search"
+        aria-label="Search assets"
         placeholder="Search assets..."
       />
     </div>
@@ -37,7 +39,7 @@
           </tr>
         </thead>
         <tbody>
-          <tr v-for="asset in displayedAssets" :key="asset.uuid">
+          <tr v-for="asset in visibleAssets" :key="asset.uuid">
             <td class="cell-name" :title="asset.display_name || asset.uuid.slice(0,8)">
               {{ asset.display_name || asset.uuid.slice(0,8) }}
             </td>
@@ -55,12 +57,25 @@
           </tr>
         </tbody>
       </table>
+      <!--
+        The grid used to render one <tr> per asset for the whole library. At a
+        few thousand assets that is a few thousand rows built on every filter
+        change, for a table nobody scrolls past the first screen of (SF-04).
+      -->
+      <div v-if="visibleAssets.length < displayedAssets.length" class="show-more">
+        <button class="btn" @click="showMore">
+          Show more ({{ displayedAssets.length - visibleAssets.length }} remaining)
+        </button>
+        <span class="text-muted show-more-count mono">
+          Showing {{ visibleAssets.length }} of {{ displayedAssets.length }}
+        </span>
+      </div>
     </div>
   </section>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, watch, onUnmounted } from 'vue'
 import type { AssetRecord } from '../composables/useEventStream'
 
 const props = defineProps<{
@@ -69,6 +84,29 @@ const props = defineProps<{
 
 const activeFilter = ref('all')
 const search = ref('')
+const searchInput = ref('')
+
+// Same debounce the DB tab already uses, so typing does not refilter the whole
+// library on every keystroke.
+const SEARCH_DEBOUNCE_MS = 250
+let searchTimer = 0
+watch(searchInput, (value) => {
+  window.clearTimeout(searchTimer)
+  searchTimer = window.setTimeout(() => {
+    search.value = value
+  }, SEARCH_DEBOUNCE_MS)
+})
+onUnmounted(() => window.clearTimeout(searchTimer))
+
+const PAGE = 100
+const shown = ref(PAGE)
+function showMore() {
+  shown.value += PAGE
+}
+// Any change to what is being listed starts again from the first page.
+watch([activeFilter, search], () => {
+  shown.value = PAGE
+})
 
 const filters = [
   { key: 'all', label: 'All' },
@@ -90,10 +128,16 @@ function formatDuration(ms: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-function filteredCount(key: string): number {
-  if (key === 'all') return props.assets.length
-  return props.assets.filter((a) => a.status === key).length
-}
+/** All four chip counts in one pass, instead of one `filter` per chip on
+ *  every render. */
+const counts = computed<Record<string, number>>(() => {
+  const out: Record<string, number> = { all: 0, ready: 0, error: 0, processing: 0 }
+  for (const asset of props.assets) {
+    out.all!++
+    if (asset.status in out) out[asset.status]!++
+  }
+  return out
+})
 
 const displayedAssets = computed(() => {
   let list = props.assets
@@ -110,9 +154,22 @@ const displayedAssets = computed(() => {
   }
   return list
 })
+
+const visibleAssets = computed(() => displayedAssets.value.slice(0, shown.value))
 </script>
 
 <style scoped>
+.show-more {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 2px 2px;
+}
+
+.show-more-count {
+  font-size: 12px;
+}
+
 .panel {
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);
