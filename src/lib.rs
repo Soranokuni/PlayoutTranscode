@@ -13,6 +13,7 @@ pub mod db;
 pub mod encoder;
 pub mod fingerprint;
 pub mod identity;
+pub mod instance_lock;
 pub mod jobs;
 pub mod logging;
 pub mod paths;

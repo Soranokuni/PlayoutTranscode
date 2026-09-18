@@ -230,6 +230,23 @@ level = "info"
         Fail "/api/health never answered within 30 s"
     }
 
+    Step "Checking the single-instance lock (T2-5)"
+    $lockPath = Join-Path $dataDir "playout-transcode.lock"
+    if (Test-Path -LiteralPath $lockPath) {
+        Pass "the running service holds $lockPath"
+    } else {
+        Fail "no instance lock at $lockPath while the service is running"
+    }
+
+    # A second process on the same data directory would give two watchers on one
+    # folder and two writers on one registry. It must refuse and say why.
+    $secondOut = & $testExe run --data-dir $dataDir 2>&1 | Out-String
+    if ($LASTEXITCODE -ne 0 -and $secondOut -match "already using this data directory") {
+        Pass "a second instance on the same data directory was refused"
+    } else {
+        Fail "a second instance was not refused (exit $LASTEXITCODE): $secondOut"
+    }
+
     Step "Stopping the service"
     & sc.exe stop $ServiceName | Out-Null
     if (Wait-ServiceState $ServiceName "STOPPED" 30) {
@@ -247,6 +264,13 @@ level = "info"
         $orphans | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     } else {
         Pass "no PlayoutTranscode or ffmpeg process survived the stop"
+    }
+
+    Step "Checking the instance lock was released"
+    if (Test-Path -LiteralPath $lockPath) {
+        Fail "the instance lock survived a clean stop; the next start will report a stale takeover"
+    } else {
+        Pass "the instance lock was released on stop"
     }
 
     Step "Checking the service wrote into its data directory"

@@ -205,7 +205,10 @@ export function useEventStream() {
     try {
       const send = destructive ? apiFetchDestructive : apiFetch
       const r = await send('/api' + path, { method: 'POST' })
-      if (!r.ok) return null
+      // A refused POST still carries `{ success: false, error }`. Since T2-5
+      // `/api/service/start` answers 409/503/400 instead of a 200 with that
+      // body, so discarding non-2xx here would have turned every refusal into a
+      // silent no-op button.
       const text = await r.text()
       if (!text || text.trim() === '') {
         return null

@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
@@ -22,9 +22,97 @@ pub struct RetryRequest {
     pub job_id: Option<String>,
 }
 
+/// Where the processing loop is in its lifecycle (T2-5).
+///
+/// This replaced a bare `running: bool`. The boolean could not distinguish
+/// "stopped" from "stopping", so a stop immediately followed by a start
+/// happily spawned a second watcher thread while the first was still tearing
+/// down its FFmpeg children — two watchers on one folder, two dispatchers on
+/// one semaphore (F-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+}
+
+impl ServiceState {
+    /// The value reported over the API. Stable; clients may key on it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceState::Stopped => "stopped",
+            ServiceState::Starting => "starting",
+            ServiceState::Running => "running",
+            ServiceState::Stopping => "stopping",
+        }
+    }
+}
+
+/// The lifecycle state together with the run it belongs to.
+///
+/// `generation` is bumped on every start. Work dispatched under generation N
+/// checks it before acquiring a semaphore permit, so a task that was queued
+/// before a stop cannot wake up inside the *next* run and process a file the
+/// new configuration never offered it.
+#[derive(Debug, Clone, Copy)]
+pub struct RunState {
+    pub state: ServiceState,
+    pub generation: u64,
+}
+
+impl Default for RunState {
+    fn default() -> Self {
+        Self {
+            state: ServiceState::Stopped,
+            generation: 0,
+        }
+    }
+}
+
+/// Signals a worker thread's exit to whoever is reaping it.
+///
+/// A `std::thread::JoinHandle` cannot be joined with a timeout, and a stop must
+/// not block the HTTP handler that asked for it. The worker flips this on the
+/// way out; the reaper waits on it, bounded, and only then reports `Stopped`.
+#[derive(Default)]
+struct WorkerExit {
+    done: StdMutex<bool>,
+    cv: Condvar,
+}
+
+impl WorkerExit {
+    fn finish(&self) {
+        if let Ok(mut done) = self.done.lock() {
+            *done = true;
+        }
+        self.cv.notify_all();
+    }
+
+    /// Returns true if the worker finished within `timeout`.
+    fn wait(&self, timeout: std::time::Duration) -> bool {
+        let Ok(done) = self.done.lock() else {
+            return false;
+        };
+        match self.cv.wait_timeout_while(done, timeout, |d| !*d) {
+            Ok((guard, _)) => *guard,
+            Err(_) => false,
+        }
+    }
+}
+
+/// How long a stop waits for the processing thread before it says so out loud.
+/// It keeps waiting afterwards — reporting `Stopped` while a watcher is still
+/// alive is what would let a second one start alongside it.
+const WORKER_JOIN_WARN_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct ServiceHandle {
-    pub running: Arc<Mutex<bool>>,
+    run_state: Arc<Mutex<RunState>>,
+    /// The processing thread of the current generation, taken by whoever reaps it.
+    worker: Arc<StdMutex<Option<std::thread::JoinHandle<()>>>>,
+    /// Flipped by the worker on its way out; awaited by the reaper.
+    worker_exit: Arc<Mutex<Arc<WorkerExit>>>,
     pub cmd_tx: Arc<Mutex<Option<mpsc::Sender<ServiceCmd>>>>,
     /// Optional channel for the API to inject manual retries into the processing loop.
     pub retry_tx: Arc<StdMutex<Option<mpsc::Sender<RetryRequest>>>>,
@@ -36,7 +124,9 @@ pub struct ServiceHandle {
 impl ServiceHandle {
     pub fn new() -> Self {
         Self {
-            running: Arc::new(Mutex::new(false)),
+            run_state: Arc::new(Mutex::new(RunState::default())),
+            worker: Arc::new(StdMutex::new(None)),
+            worker_exit: Arc::new(Mutex::new(Arc::new(WorkerExit::default()))),
             cmd_tx: Arc::new(Mutex::new(None)),
             retry_tx: Arc::new(StdMutex::new(None)),
             download_status: Arc::new(Mutex::new(None)),
@@ -84,8 +174,100 @@ impl ServiceHandle {
         self.log_lines.lock().clone()
     }
 
+    /// True only in [`ServiceState::Running`].
+    ///
+    /// Deliberately false while `Starting` and `Stopping`: every caller of this
+    /// is asking "may I hand work to the processing loop?", and in both of
+    /// those states the answer is no.
     pub fn is_running(&self) -> bool {
-        *self.running.lock()
+        self.run_state.lock().state == ServiceState::Running
+    }
+
+    /// The full lifecycle state, for `/api/service/status` and diagnostics.
+    pub fn state(&self) -> ServiceState {
+        self.run_state.lock().state
+    }
+
+    /// The current run's generation. Bumped once per successful start.
+    pub fn generation(&self) -> u64 {
+        self.run_state.lock().generation
+    }
+
+    /// True when the service is still serving the run `generation` belongs to.
+    /// Used by [`dispatch_one`] to drop work queued under a previous run.
+    fn is_current_run(&self, generation: u64) -> bool {
+        let rs = self.run_state.lock();
+        rs.generation == generation && rs.state == ServiceState::Running
+    }
+
+    /// Claim the right to start. On success the state is `Starting` and the
+    /// returned generation identifies this run.
+    fn begin_start(&self) -> Result<u64, String> {
+        let mut rs = self.run_state.lock();
+        match rs.state {
+            ServiceState::Running => Err("Service already running".into()),
+            ServiceState::Starting => Err("Service is starting".into()),
+            ServiceState::Stopping => Err("Service is stopping".into()),
+            ServiceState::Stopped => {
+                rs.generation += 1;
+                rs.state = ServiceState::Starting;
+                Ok(rs.generation)
+            }
+        }
+    }
+
+    /// Roll a failed `Starting` back, without disturbing a later run.
+    fn abandon_start(&self, generation: u64) {
+        let mut rs = self.run_state.lock();
+        if rs.generation == generation && rs.state == ServiceState::Starting {
+            rs.state = ServiceState::Stopped;
+        }
+    }
+
+    /// Publish the worker thread and move `Starting` to `Running`.
+    ///
+    /// Both under the same `run_state` lock, because a stop arriving between
+    /// the two would otherwise find no worker to reap and report `Stopped`
+    /// while the thread was still alive — the exact race this step exists to
+    /// remove. When the stop wins, the handle comes back here instead and the
+    /// caller reaps it.
+    fn install_worker(
+        &self,
+        generation: u64,
+        worker: std::thread::JoinHandle<()>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let mut rs = self.run_state.lock();
+        if rs.generation != generation || rs.state != ServiceState::Starting {
+            return Some(worker);
+        }
+        if let Ok(mut slot) = self.worker.lock() {
+            *slot = Some(worker);
+        }
+        rs.state = ServiceState::Running;
+        None
+    }
+
+    /// Move to `Stopping` and take the worker to reap, in one step.
+    /// `None` means there was nothing to stop.
+    #[allow(clippy::type_complexity)]
+    fn begin_stop(&self) -> Option<(u64, Option<std::thread::JoinHandle<()>>, Arc<WorkerExit>)> {
+        let mut rs = self.run_state.lock();
+        match rs.state {
+            ServiceState::Stopped | ServiceState::Stopping => None,
+            ServiceState::Starting | ServiceState::Running => {
+                rs.state = ServiceState::Stopping;
+                let worker = self.worker.lock().ok().and_then(|mut slot| slot.take());
+                let exit = self.worker_exit.lock().clone();
+                Some((rs.generation, worker, exit))
+            }
+        }
+    }
+
+    fn mark_stopped(&self, generation: u64) {
+        let mut rs = self.run_state.lock();
+        if rs.generation == generation {
+            rs.state = ServiceState::Stopped;
+        }
     }
 
     pub fn active_pids_count(&self) -> usize {
@@ -168,15 +350,16 @@ pub fn start_processing_loop(
     tools: &ToolPaths,
     pool: Arc<SqlitePool>,
 ) -> Result<(), String> {
-    if *handle.running.lock() {
-        return Err("Service already running".into());
-    }
+    // Claims the state machine before anything else, so two concurrent
+    // `POST /api/service/start` calls cannot both get past this point.
+    let generation = handle.begin_start()?;
 
     // Creating the target folder used to be a side effect of
     // `AppConfig::validate()`, which meant an unauthenticated `PUT /api/config`
     // could create arbitrary directories (F-03). It belongs here, where the
     // operator has actually asked the service to run.
     if let Err(e) = std::fs::create_dir_all(&config.paths.target_folder) {
+        handle.abandon_start(generation);
         return Err(format!(
             "Cannot create target folder '{}': {}",
             config.paths.target_folder, e
@@ -185,9 +368,13 @@ pub fn start_processing_loop(
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ServiceCmd>(1);
     *handle.cmd_tx.lock() = Some(cmd_tx);
-    *handle.running.lock() = true;
 
-    let running = handle.running.clone();
+    // A fresh exit signal per run; the previous one has already been consumed
+    // by the reaper that let this start happen.
+    let exit = Arc::new(WorkerExit::default());
+    *handle.worker_exit.lock() = exit.clone();
+    let exit_for_reaper = exit.clone();
+
     let watch = PathBuf::from(&config.paths.watch_folder);
     let target = PathBuf::from(&config.paths.target_folder);
     let tools = tools.clone();
@@ -223,8 +410,31 @@ pub fn start_processing_loop(
         ),
     );
 
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
+    let worker = std::thread::spawn(move || {
+        // `Runtime::new().unwrap()` here was a panic on a worker thread with no
+        // one to catch it: the service reported Running and then silently did
+        // nothing forever (F-30). A runtime that will not build is a start
+        // failure, reported as one.
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                tracing::error!("Failed to build the processing runtime: {}", e);
+                handle_for_thread.add_log(
+                    "error",
+                    &format!("Could not start the processing runtime: {}", e),
+                );
+                if let Ok(mut slot) = cleanup_retry_tx.lock() {
+                    *slot = None;
+                }
+                handle_for_thread.mark_stopped(generation);
+                exit.finish();
+                return;
+            }
+        };
+
         rt.block_on(async move {
             let _ = std::fs::create_dir_all(&target);
 
@@ -278,7 +488,7 @@ pub fn start_processing_loop(
                 .await;
             });
 
-            let running_flag = handle_for_thread.running.clone();
+            let gate = handle_for_thread.clone();
 
             let mut cmd_rx = cmd_rx;
             loop {
@@ -290,14 +500,14 @@ pub fn start_processing_loop(
                         let existing = jobs
                             .find_pending_by_input_path(&path.to_string_lossy())
                             .map(|j| j.id);
-                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path, existing, &running_flag);
+                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path, existing, &gate, generation);
                     }
                     Some(retry) = retry_rx.recv() => {
                         handle_for_thread.add_log(
                             "info",
                             &format!("Manual retry submitted for {}", retry.path.display()),
                         );
-                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry.path, retry.job_id, &running_flag);
+                        dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, retry.path, retry.job_id, &gate, generation);
                     }
                     cmd = cmd_rx.recv() => {
                         if let Some(ServiceCmd::Stop) = cmd {
@@ -312,10 +522,45 @@ pub fn start_processing_loop(
         if let Ok(mut slot) = cleanup_retry_tx.lock() {
             *slot = None;
         }
-        *running.lock() = false;
+        // The reaper, not the worker, publishes `Stopped` — see
+        // `stop_processing`. Announcing it here would let a start race a
+        // thread that has not yet unwound.
+        exit.finish();
     });
 
+    if let Some(orphan) = handle.install_worker(generation, worker) {
+        // A stop landed between the spawn and here. The thread has already been
+        // told to stop (`cmd_tx` was installed before the spawn), so all that is
+        // left is to wait for it before anyone reports `Stopped`.
+        spawn_reaper(handle.clone(), generation, orphan, exit_for_reaper);
+    }
+
     Ok(())
+}
+
+/// Wait for a processing thread to unwind, then publish `Stopped`.
+///
+/// Runs on its own thread: a stop must not block the HTTP handler that asked
+/// for it, and `JoinHandle` cannot be joined with a timeout.
+fn spawn_reaper(
+    handle: ServiceHandle,
+    generation: u64,
+    worker: std::thread::JoinHandle<()>,
+    exit: Arc<WorkerExit>,
+) {
+    std::thread::spawn(move || {
+        if !exit.wait(WORKER_JOIN_WARN_AFTER) {
+            tracing::warn!(
+                "Processing thread has not exited {}s after the stop request; still waiting",
+                WORKER_JOIN_WARN_AFTER.as_secs()
+            );
+        }
+        if worker.join().is_err() {
+            tracing::error!("Processing thread panicked during shutdown");
+        }
+        handle.mark_stopped(generation);
+        handle.add_log("info", "Service stopped");
+    });
 }
 
 /// Dispatches one input file through the concurrency semaphore into the processor.
@@ -332,7 +577,11 @@ fn dispatch_one(
     path: std::path::PathBuf,
     // The existing job record to reuse, if this file already has one.
     existing_job_id: Option<String>,
-    running: &Arc<parking_lot::Mutex<bool>>,
+    // The handle and the generation this dispatch belongs to. A task that was
+    // queued behind a full semaphore before a stop must not wake up inside the
+    // next run (T2-5).
+    gate: &ServiceHandle,
+    generation: u64,
 ) {
     let t = tools.clone();
     let c = cfg.clone();
@@ -341,7 +590,7 @@ fn dispatch_one(
     let s = sem.clone();
     let p = pool.clone();
     let apids = active_pids.clone();
-    let r = running.clone();
+    let gate = gate.clone();
     let existing = existing_job_id.and_then(|id| jobs.get(&id));
 
     tokio::spawn(async move {
@@ -350,8 +599,9 @@ fn dispatch_one(
             return;
         };
 
-        // If the service has stopped while waiting for a permit, exit cleanly
-        if !*r.lock() {
+        // If the service stopped -- or stopped and started again -- while this
+        // task waited for a permit, exit cleanly.
+        if !gate.is_current_run(generation) {
             return;
         }
 
@@ -364,8 +614,17 @@ fn dispatch_one(
     });
 }
 
+/// Ask the processing loop to stop, and reap it.
+///
+/// Returns immediately. The state goes to `Stopping` here and only reaches
+/// `Stopped` once the worker thread has actually unwound, which is what stops a
+/// restart from racing a teardown (F-17). Calling it while already stopped or
+/// stopping is a no-op.
 pub fn stop_processing(handle: &ServiceHandle) {
-    *handle.running.lock() = false;
+    let Some((generation, worker, exit)) = handle.begin_stop() else {
+        return;
+    };
+
     if let Some(ref tx) = *handle.cmd_tx.lock() {
         let _ = tx.try_send(ServiceCmd::Stop);
     }
@@ -374,6 +633,31 @@ pub fn stop_processing(handle: &ServiceHandle) {
     }
     handle.kill_active_ffmpeg();
     handle.add_log("info", "Service stop requested");
+
+    match worker {
+        Some(worker) => spawn_reaper(handle.clone(), generation, worker, exit),
+        // No thread was ever spawned for this generation -- a start that failed
+        // before the spawn, or a stop racing a start that will find its handle
+        // rejected by `install_worker` and reap it itself. Nothing to wait for.
+        None => handle.mark_stopped(generation),
+    }
+}
+
+/// Block until the service reaches `Stopped`, up to `timeout`.
+///
+/// Used by the shutdown path and by tests; a plain `stop_processing` is
+/// asynchronous by design so an HTTP handler is not held open by a teardown.
+pub fn wait_until_stopped(handle: &ServiceHandle, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if handle.state() == ServiceState::Stopped {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 pub fn trigger_download(handle: &ServiceHandle) -> bool {
@@ -491,5 +775,168 @@ mod pid_tests {
         assert_eq!(handle.active_pids_count(), 2);
         handle.kill_active_ffmpeg();
         assert_eq!(handle.active_pids_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Stand-in for `start_processing_loop`'s bookkeeping, without the Tokio
+    /// runtime, database pool and FFmpeg toolchain a real start needs. The
+    /// worker is a thread that parks until told to finish, which is exactly the
+    /// shape of the real one: a loop that exits on `ServiceCmd::Stop`.
+    fn fake_start(handle: &ServiceHandle) -> (u64, Arc<WorkerExit>, Arc<StdMutex<bool>>) {
+        let generation = handle.begin_start().expect("start must be allowed");
+        let exit = Arc::new(WorkerExit::default());
+        *handle.worker_exit.lock() = exit.clone();
+
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<ServiceCmd>(1);
+        *handle.cmd_tx.lock() = Some(cmd_tx);
+
+        let release = Arc::new(StdMutex::new(false));
+        let release_for_thread = release.clone();
+        let exit_for_thread = exit.clone();
+        let worker = std::thread::spawn(move || {
+            // Drain the stop command so the channel behaves like the real loop.
+            while cmd_rx.try_recv().is_err() && !*release_for_thread.lock().unwrap() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            while !*release_for_thread.lock().unwrap() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            exit_for_thread.finish();
+        });
+
+        assert!(
+            handle.install_worker(generation, worker).is_none(),
+            "nothing has asked for a stop, so the handle must be accepted"
+        );
+        (generation, exit, release)
+    }
+
+    #[test]
+    fn a_start_while_running_is_refused() {
+        let handle = ServiceHandle::new();
+        let (_gen, _exit, release) = fake_start(&handle);
+        assert_eq!(handle.state(), ServiceState::Running);
+
+        assert_eq!(
+            handle.begin_start().unwrap_err(),
+            "Service already running".to_string()
+        );
+
+        *release.lock().unwrap() = true;
+        stop_processing(&handle);
+        assert!(wait_until_stopped(&handle, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_start_immediately_after_a_stop_is_refused_until_the_worker_exits() {
+        let handle = ServiceHandle::new();
+        let (_gen, _exit, release) = fake_start(&handle);
+
+        // The worker is still parked, so the stop cannot complete yet.
+        stop_processing(&handle);
+        assert_eq!(handle.state(), ServiceState::Stopping);
+        assert_eq!(
+            handle.begin_start().unwrap_err(),
+            "Service is stopping".to_string()
+        );
+
+        // Let the worker unwind; the reaper then publishes Stopped.
+        *release.lock().unwrap() = true;
+        assert!(
+            wait_until_stopped(&handle, Duration::from_secs(5)),
+            "the reaper must report Stopped once the worker thread has exited"
+        );
+
+        // And only now may the service start again.
+        let next = handle.begin_start().expect("start must succeed once stopped");
+        assert_eq!(next, 2, "each start gets its own generation");
+        handle.abandon_start(next);
+    }
+
+    #[test]
+    fn a_repeated_stop_is_a_no_op() {
+        let handle = ServiceHandle::new();
+        let (_gen, _exit, release) = fake_start(&handle);
+
+        stop_processing(&handle);
+        // A second stop must not spawn a second reaper for a worker handle that
+        // has already been taken, nor reset the generation.
+        stop_processing(&handle);
+        assert_eq!(handle.state(), ServiceState::Stopping);
+
+        *release.lock().unwrap() = true;
+        assert!(wait_until_stopped(&handle, Duration::from_secs(5)));
+        assert_eq!(handle.generation(), 1);
+    }
+
+    #[test]
+    fn a_stop_from_stopped_does_nothing() {
+        let handle = ServiceHandle::new();
+        assert_eq!(handle.state(), ServiceState::Stopped);
+        stop_processing(&handle);
+        assert_eq!(handle.state(), ServiceState::Stopped);
+    }
+
+    #[test]
+    fn work_queued_under_an_old_generation_is_dropped() {
+        let handle = ServiceHandle::new();
+        let (first, _exit, release) = fake_start(&handle);
+        assert!(handle.is_current_run(first));
+
+        *release.lock().unwrap() = true;
+        stop_processing(&handle);
+        assert!(wait_until_stopped(&handle, Duration::from_secs(5)));
+
+        // A second run. A task that was waiting for a semaphore permit under
+        // the first one must not process a file inside this one.
+        let (second, _exit2, release2) = fake_start(&handle);
+        assert!(handle.is_current_run(second));
+        assert!(
+            !handle.is_current_run(first),
+            "a dispatch from the previous run must not survive a restart"
+        );
+
+        *release2.lock().unwrap() = true;
+        stop_processing(&handle);
+        assert!(wait_until_stopped(&handle, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_retry_is_refused_unless_the_service_is_running() {
+        let handle = ServiceHandle::new();
+        assert_eq!(
+            handle
+                .submit_retry(PathBuf::from("x.mxf"), None)
+                .unwrap_err(),
+            "Service is not running".to_string()
+        );
+
+        let (_gen, _exit, release) = fake_start(&handle);
+        // Running, but `start_processing_loop` is what installs the retry
+        // channel, so the fake start has none: the failure moves on from
+        // "not running" to "no channel", which is the distinction that matters.
+        assert_eq!(
+            handle
+                .submit_retry(PathBuf::from("x.mxf"), None)
+                .unwrap_err(),
+            "retry channel not established".to_string()
+        );
+
+        *release.lock().unwrap() = true;
+        stop_processing(&handle);
+        assert!(wait_until_stopped(&handle, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn the_reported_state_string_is_stable() {
+        assert_eq!(ServiceState::Stopped.as_str(), "stopped");
+        assert_eq!(ServiceState::Starting.as_str(), "starting");
+        assert_eq!(ServiceState::Running.as_str(), "running");
+        assert_eq!(ServiceState::Stopping.as_str(), "stopping");
     }
 }

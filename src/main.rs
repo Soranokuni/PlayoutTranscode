@@ -167,7 +167,18 @@ fn run_as_windows_service(_config_path_override: Option<String>) -> Result<()> {
 }
 
 fn run_headless(config_path_override: Option<String>) {
-    let rt = tokio::runtime::Runtime::new().unwrap();
+    // `Runtime::new().unwrap()` panicked with a backtrace and no explanation
+    // when the process could not get a thread pool (F-30). Say what failed.
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Failed to create the Tokio runtime: {}", e);
+            std::process::exit(1);
+        }
+    };
     rt.block_on(async move {
         if let Err(e) = app::run_service(config_path_override, ShutdownToken::new()).await {
             eprintln!("Service error: {}", e);

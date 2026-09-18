@@ -7,7 +7,10 @@
 //! stop, because the Service Control Manager delivers `Stop` through a callback
 //! and not as Ctrl-C.
 
-use crate::{bootstrap, config, db, jobs, logging, paths, profiles, server, service_handle};
+use crate::{
+    bootstrap, config, db, instance_lock, jobs, logging, paths, profiles, server,
+    service_handle,
+};
 
 use anyhow::Result;
 use service_handle::ServiceHandle;
@@ -69,6 +72,10 @@ impl ShutdownToken {
 /// 30 s wait hint, so a wedged connection cannot make the stop look hung.
 const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long shutdown waits for the processing thread to unwind, after the HTTP
+/// drain. The two together stay under the SCM's 30 s wait hint.
+const WORKER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Boot the whole service and run until `shutdown` fires or Ctrl-C arrives.
 ///
 /// Returns once the HTTP server has drained and the processing loop has been
@@ -95,6 +102,14 @@ pub async fn run_service(
         },
         service_handle.clone(),
     );
+
+    // Before the database is opened and before the watcher can exist: a second
+    // instance on the same data directory means two watchers on one folder and
+    // two writers on one registry (T2-5). Held for the whole run; released on
+    // the way out, including on the error paths below, because the binding
+    // lives until `run_service` returns.
+    let _instance_lock = instance_lock::acquire(&paths::data_dir())
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     profiles::validate_color_constants()
         .map_err(|e| anyhow::anyhow!("Color constant misconfiguration: {}", e))?;
@@ -232,6 +247,26 @@ pub async fn run_service(
                 "HTTP server did not drain within {}s; closing the database anyway",
                 SHUTDOWN_DRAIN_TIMEOUT.as_secs()
             ),
+        }
+    }
+
+    // The processing thread unwinds asynchronously (T2-5), and it holds the
+    // pool. Wait for it before the pool closes, or a late encode completion
+    // lands on a closed database. Bounded: this and the HTTP drain together
+    // have to stay inside the SCM's 30 s wait hint, and the FFmpeg children
+    // were already killed above, so anything still running here is wedged.
+    {
+        let sh = service_handle.clone();
+        let stopped = tokio::task::spawn_blocking(move || {
+            service_handle::wait_until_stopped(&sh, WORKER_STOP_TIMEOUT)
+        })
+        .await
+        .unwrap_or(false);
+        if !stopped {
+            tracing::warn!(
+                "Processing loop did not reach Stopped within {}s; continuing shutdown",
+                WORKER_STOP_TIMEOUT.as_secs()
+            );
         }
     }
 
