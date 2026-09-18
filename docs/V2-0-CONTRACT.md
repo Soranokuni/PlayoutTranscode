@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS media_assets (
     duration_ms  INTEGER NOT NULL DEFAULT 0,
     trim_in_ms   INTEGER NOT NULL DEFAULT 0,
     trim_out_ms  INTEGER NOT NULL DEFAULT 0,
-    rating       TEXT NOT NULL DEFAULT 'K',
+    rating       TEXT NOT NULL DEFAULT 'NONE',
     tp           TEXT NOT NULL DEFAULT 'None',
     status       TEXT NOT NULL DEFAULT 'processing',
     display_name TEXT NOT NULL DEFAULT '',
@@ -214,6 +214,10 @@ CREATE INDEX IF NOT EXISTS idx_media_assets_fingerprint ON media_assets(fingerpr
 Validation rules at the API layer:
 - `trim`: `trim_in_ms ≥ 0`; `trim_out_ms` ≤ 0 means "full duration"; `trim_out > trim_in`; `trim_out ≤ duration_ms` (`src/server.rs:716-776`).
 - `rating`: `K, 8, 12, 16, 18` with optional `+`; also `NONE`/empty accepted (`src/db.rs:522-527`).
+  A newly ingested asset is written as `NONE` (unrated): ingest cannot know a
+  programme's suitability mark, so it does not assert one. PlayOut is where an
+  operator sets it, via `PUT /api/assets/{uuid}/rating`. Subclips inherit the
+  parent's rating unchanged.
 - `virtual_folder`: starts with `/`, no `..`, no trailing `/` except root (`src/db.rs:557-571`).
 - `display_name`: 1–255 chars (`src/server.rs:978-996`).
 - subclip: same trim rules vs parent + non-empty name; if parent is `mezzanine_ok` and has keyframes, `trim_in_ms` must align to a keyframe within half a frame, else `mezzanine_ok=false` + warning `trim_in_not_keyframe_aligned` (`src/server.rs:917-930`).

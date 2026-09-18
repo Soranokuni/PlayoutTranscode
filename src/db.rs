@@ -340,7 +340,7 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
             duration_ms  INTEGER NOT NULL DEFAULT 0,
             trim_in_ms   INTEGER NOT NULL DEFAULT 0,
             trim_out_ms  INTEGER NOT NULL DEFAULT 0,
-            rating       TEXT NOT NULL DEFAULT 'K',
+            rating       TEXT NOT NULL DEFAULT 'NONE',
             tp           TEXT NOT NULL DEFAULT 'None',
             status       TEXT NOT NULL DEFAULT 'processing',
             display_name TEXT NOT NULL DEFAULT '',
@@ -543,13 +543,14 @@ pub async fn insert_processing(
     display_name: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
-        "INSERT INTO media_assets (uuid, fingerprint, source_sha256, current_path, display_name, status) VALUES (?1, ?2, ?3, ?4, ?5, 'processing')",
+        "INSERT INTO media_assets (uuid, fingerprint, source_sha256, current_path, display_name, status, rating) VALUES (?1, ?2, ?3, ?4, ?5, 'processing', ?6)",
     )
     .bind(uuid)
     .bind(fingerprint)
     .bind(source_sha256)
     .bind(path)
     .bind(display_name)
+    .bind(DEFAULT_RATING)
     .execute(pool)
     .await?;
     Ok(())
@@ -1379,6 +1380,15 @@ pub async fn purge_asset_in_target(
 }
 
 pub const VALID_RATINGS: &[&str] = &["K", "8", "12", "16", "18"];
+
+/// Age rating written for a freshly ingested asset.
+///
+/// Ingest has no way to know a programme's suitability mark, so it must not
+/// assert one. `NONE` is the "unrated" token PlayOut already maps to its
+/// `none` compliance rating; the operator sets the real mark in PlayOut,
+/// which persists it through `PUT /api/assets/{uuid}/rating`. Subclips still
+/// inherit their parent's rating, and nothing here rewrites existing rows.
+pub const DEFAULT_RATING: &str = "NONE";
 
 /// Upper bound on a rating payload, including the broadcast-metadata tail.
 pub const MAX_RATING_LEN: usize = 4096;
@@ -2660,6 +2670,25 @@ mod tests {
         let db_path = temp_dir.join("test.db");
         let pool = init_pool(&db_path).await.expect("init_pool failed");
         (pool, temp_dir)
+    }
+
+    /// A freshly ingested asset must not claim a suitability mark. PlayOut is
+    /// where an operator sets it; ingest only records "unrated".
+    #[tokio::test]
+    async fn a_new_ingest_has_no_age_rating() {
+        let (pool, _temp_dir) = setup_test_pool().await;
+        insert_processing(&pool, "fresh-1", 1, None, "C:/x/a.mp4", "a")
+            .await
+            .unwrap();
+        let asset = find_by_uuid(&pool, "fresh-1").await.unwrap().unwrap();
+        assert_eq!(asset.rating, DEFAULT_RATING);
+        assert_ne!(asset.rating, "K");
+        assert!(is_valid_rating(&asset.rating));
+
+        // An operator-set rating still sticks, and a subclip still inherits it.
+        assert!(set_rating(&pool, "fresh-1", "12").await.unwrap());
+        let asset = find_by_uuid(&pool, "fresh-1").await.unwrap().unwrap();
+        assert_eq!(asset.rating, "12");
     }
 
     #[tokio::test]

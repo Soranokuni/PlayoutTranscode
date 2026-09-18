@@ -94,7 +94,7 @@
                 </div>
               </td>
               <td>
-                <span class="badge badge-rating">{{ a.rating || 'K' }}</span>
+                <span class="badge badge-rating">{{ a.rating || 'NONE' }}</span>
                 <span v-if="a.tp && a.tp !== 'None'" class="badge badge-tp">TP</span>
               </td>
               <td>

@@ -133,6 +133,7 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 - `GET /api/assets/{uuid}`: Retrieve detailed metadata for a specific asset.
 - `PUT /api/assets/{uuid}/trim`: Update non-destructive in/out trim points (`trim_in_ms`, `trim_out_ms`).
 - `PUT /api/assets/{uuid}/rating`: Update Greek NCRTV age rating (`K`, `8`, `12`, `16`, `18`) and timed advisory banner.
+  Ingest never guesses one: a newly transcoded asset is stored as `NONE` (unrated) and stays that way until PlayOut sets it.
 - `PUT /api/assets/{uuid}/tp`: Update Product Placement (`TP`) status.
 - `POST /api/assets/{uuid}/subclip`: Create a virtual subclip without duplicating physical media.
 - `POST /api/assets/{uuid}/trash`: Soft-delete an asset to the Recycle Bin.
