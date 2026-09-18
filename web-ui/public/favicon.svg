@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="PlayoutTranscode">
+  <rect width="32" height="32" rx="7" fill="#0C0D0F"/>
+  <!-- Ingest: three source frames stepping into one mezzanine. -->
+  <rect x="6" y="9" width="7" height="14" rx="1.5" fill="#2DD4BF" opacity="0.35"/>
+  <rect x="10" y="9" width="7" height="14" rx="1.5" fill="#2DD4BF" opacity="0.6"/>
+  <path d="M15.5 9.8 L26 16 L15.5 22.2 Z" fill="#2DD4BF"/>
+</svg>

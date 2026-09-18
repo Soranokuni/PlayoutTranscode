@@ -106,6 +106,13 @@ pub async fn spawn_test_server_with(opts: TestServerOptions) -> TestServer {
         std::fs::create_dir_all(web_ui_dir.join("assets")).expect("assets dir");
         std::fs::write(web_ui_dir.join("assets").join("app.js"), "export const x = 1;\n")
             .expect("write app.js");
+        // A Vite-style content-hashed bundle: the only kind of file the
+        // handler may mark immutable.
+        std::fs::write(
+            web_ui_dir.join("assets").join("index-AbCd1234.js"),
+            "export const y = 2;",
+        )
+        .expect("write hashed asset");
         // A file the SPA must never hand out: it sits next to the dist dir,
         // reachable only by escaping it.
         std::fs::write(root.join("secret.toml"), "token = \"do-not-serve\"\n")

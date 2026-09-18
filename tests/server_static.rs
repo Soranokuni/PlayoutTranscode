@@ -120,3 +120,97 @@ async fn missing_spa_build_does_not_leak_the_directory_path() {
         body
     );
 }
+
+/// SB-04: a content-hashed bundle may be cached forever; nothing else may.
+#[tokio::test]
+async fn hashed_assets_are_immutable_and_everything_else_revalidates() {
+    let s = spawn_test_server().await;
+
+    let r = s.get("/assets/index-AbCd1234.js").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        r.headers()
+            .get("cache-control")
+            .and_then(|v| v.to_str().ok()),
+        Some("public, max-age=31536000, immutable")
+    );
+
+    // app.js carries no content hash, so a rebuild could change it under the
+    // same name: it must be revalidated, exactly like index.html.
+    for path in ["/", "/assets/app.js", "/some/spa/route"] {
+        let r = s.get(path).await;
+        assert_eq!(
+            r.headers()
+                .get("cache-control")
+                .and_then(|v| v.to_str().ok()),
+            Some("no-cache"),
+            "{} must be revalidated",
+            path
+        );
+    }
+}
+
+/// A matching `If-None-Match` saves the body, and the validator itself carries
+/// no filesystem path (F-09).
+#[tokio::test]
+async fn a_matching_etag_is_answered_with_304() {
+    let s = spawn_test_server().await;
+
+    let first = s.get("/assets/app.js").await;
+    assert_eq!(first.status(), 200);
+    let etag = first
+        .headers()
+        .get("etag")
+        .and_then(|v| v.to_str().ok())
+        .expect("etag on a static asset")
+        .to_string();
+    // Only the `W/` weak marker, hex digits and a dash: no path, ever.
+    let opaque = etag
+        .strip_prefix("W/")
+        .expect("weak validator")
+        .trim_matches('"');
+    assert!(
+        opaque.chars().all(|c| c.is_ascii_hexdigit() || c == '-'),
+        "etag leaked something other than size-mtime: {}",
+        etag
+    );
+
+    let second = s
+        .client()
+        .get(s.url("/assets/app.js"))
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .expect("conditional GET");
+    assert_eq!(second.status(), 304);
+    assert_eq!(second.text().await.unwrap(), "");
+
+    let stale = s
+        .client()
+        .get(s.url("/assets/app.js"))
+        .header("if-none-match", "W/\"0-0\"")
+        .send()
+        .await
+        .expect("conditional GET");
+    assert_eq!(stale.status(), 200);
+}
+
+/// A missing bundle or favicon is a real 404, not a 200 of index.html served
+/// as `text/html`. The body stays the fixed string.
+#[tokio::test]
+async fn a_missing_static_asset_is_a_real_404_without_a_path() {
+    let s = spawn_test_server().await;
+
+    for path in ["/assets/index-ZZZZ9999.js", "/favicon.svg", "/favicon.ico"] {
+        let r = s.get(path).await;
+        assert_eq!(r.status(), 404, "{}", path);
+        let body = r.text().await.unwrap();
+        assert_eq!(body, "not found", "{}", path);
+        assert!(!body.contains(':') && !body.contains('/') && !body.contains('\\'));
+    }
+
+    // An extensionless path is still an SPA route and still gets index.html.
+    let r = s.get("/library/deep").await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("<title>spa</title>"));
+}

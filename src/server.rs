@@ -909,11 +909,53 @@ fn content_type_for(path: &std::path::Path) -> &'static str {
     }
 }
 
+/// A Vite build emits `assets/<name>-<8-char content hash>.<ext>`. The hash
+/// changes whenever the bytes change, so such a file may be cached forever;
+/// everything else (index.html above all) must be revalidated or a deploy is
+/// invisible until the operator hard-reloads.
+fn is_content_hashed_asset(path: &std::path::Path, request_path: &str) -> bool {
+    if !request_path.starts_with("/assets/") {
+        return false;
+    }
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Some((_, hash)) = stem.rsplit_once('-') else {
+        return false;
+    };
+    hash.len() == 8
+        && hash
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// A weak validator built from the two things a static file handler can learn
+/// without reading the file. It never contains a filesystem path (F-09).
+fn etag_for(meta: &std::fs::Metadata) -> Option<String> {
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some(format!("W/\"{:x}-{:x}\"", meta.len(), mtime))
+}
+
+fn if_none_match_matches(headers: &header::HeaderMap, etag: &str) -> bool {
+    headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "*" || v.split(',').any(|c| c.trim() == etag))
+}
+
 async fn serve_index(web_ui_dir: &std::path::Path) -> Response {
     match tokio::fs::read(web_ui_dir.join("index.html")).await {
         Ok(content) => (
             StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
             content,
         )
             .into_response(),
@@ -932,9 +974,30 @@ async fn serve_index(web_ui_dir: &std::path::Path) -> Response {
     }
 }
 
-async fn serve_spa(uri: Uri, State(state): State<ServerState>) -> Response {
-    let Some(file_path) = safe_join(state.web_ui_dir.as_path(), uri.path()) else {
-        tracing::warn!("rejected SPA path traversal attempt: {}", uri.path());
+/// A missing file under `/assets/` is a build or deploy fault, not an SPA
+/// route: answering it with index.html produced a 200 of HTML where the
+/// browser expected a script, which is both a wasted request and a misleading
+/// success. The body stays the fixed string -- no path ever reaches it (F-09).
+fn static_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CACHE_CONTROL, "no-cache"),
+        ],
+        b"not found".to_vec(),
+    )
+        .into_response()
+}
+
+async fn serve_spa(
+    uri: Uri,
+    headers: header::HeaderMap,
+    State(state): State<ServerState>,
+) -> Response {
+    let request_path = uri.path();
+    let Some(file_path) = safe_join(state.web_ui_dir.as_path(), request_path) else {
+        tracing::warn!("rejected SPA path traversal attempt: {}", request_path);
         return serve_index(state.web_ui_dir.as_path()).await;
     };
 
@@ -942,14 +1005,61 @@ async fn serve_spa(uri: Uri, State(state): State<ServerState>) -> Response {
         return serve_index(state.web_ui_dir.as_path()).await;
     }
 
+    // One metadata call decides 404 vs 304 vs read, so the common revalidation
+    // case never reads the file at all.
+    let meta = match tokio::fs::metadata(&file_path).await {
+        Ok(m) if m.is_file() => m,
+        _ => {
+            // Anything that is clearly a static asset gets an honest 404;
+            // everything else is an SPA route and still falls back to index.
+            if request_path.starts_with("/assets/")
+                || request_path == "/favicon.svg"
+                || request_path == "/favicon.ico"
+            {
+                return static_not_found();
+            }
+            return serve_index(state.web_ui_dir.as_path()).await;
+        }
+    };
+
+    let immutable = is_content_hashed_asset(&file_path, request_path);
+    let cache_control = if immutable {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    let etag = etag_for(&meta);
+
+    if let Some(etag) = etag.as_deref() {
+        if if_none_match_matches(&headers, etag) {
+            return (
+                StatusCode::NOT_MODIFIED,
+                [
+                    (header::CACHE_CONTROL, cache_control),
+                    (header::ETAG, etag),
+                ],
+            )
+                .into_response();
+        }
+    }
+
     match tokio::fs::read(&file_path).await {
-        Ok(content) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, content_type_for(&file_path))],
-            content,
-        )
-            .into_response(),
-        // Unknown path: hand the SPA router its index, as before.
+        Ok(content) => {
+            let mut response = (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type_for(&file_path)),
+                    (header::CACHE_CONTROL, cache_control),
+                ],
+                content,
+            )
+                .into_response();
+            if let Some(etag) = etag.and_then(|e| header::HeaderValue::from_str(&e).ok()) {
+                response.headers_mut().insert(header::ETAG, etag);
+            }
+            response
+        }
+        // Raced with a rebuild between metadata and read: fall back as before.
         Err(_) => serve_index(state.web_ui_dir.as_path()).await,
     }
 }
