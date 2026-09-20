@@ -1,13 +1,13 @@
 # PlayoutTranscode
 
-[![Author](https://img.shields.io/badge/author-Soranokuni-blue.svg)](https://github.com/Soranokuni)
+[![Author](https://img.shields.io/badge/author-Alex%20Fountas-blue.svg)](https://github.com/Soranokuni)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.77%2B-DEA584?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![Axum](https://img.shields.io/badge/Axum-0.8-9333ea.svg)](https://github.com/tokio-rs/axum)
 [![FFmpeg](https://img.shields.io/badge/FFmpeg-Ready-green.svg)](https://ffmpeg.org/)
 [![SQLite](https://img.shields.io/badge/SQLite-WAL-003B57?logo=sqlite&logoColor=white)](https://www.sqlite.org/)
 
-**PlayoutTranscode** is an automated, broadcast-grade media ingestion, analysis, and mezzanine transcoding engine developed by **[Soranokuni](https://github.com/Soranokuni)**. Engineered in **Rust** as a resilient Windows service daemon, it monitors watch folders, performs rational FPS snapping, normalizes audio to **EBU R128 / ATSC A/85** loudness standards, transcodes incoming media into standardized frame-accurate mezzanine streams (Profiles A/B/C), writes JSON identity sidecars, and exposes a high-performance REST and Server-Sent Events (SSE) API to downstream clients like **[PlayOutVue](https://github.com/Soranokuni/PlayOutVue)**.
+**PlayoutTranscode** is an automated, broadcast-grade media ingestion, analysis, and mezzanine transcoding engine developed by **Alex Fountas** ([Soranokuni](https://github.com/Soranokuni)). Engineered in **Rust** as a resilient Windows service daemon, it monitors watch folders, performs rational FPS snapping, normalizes audio to **EBU R128 / ATSC A/85** loudness standards, transcodes incoming media into standardized frame-accurate mezzanine streams (Profiles A/B/C), writes JSON identity sidecars, and exposes a high-performance REST and Server-Sent Events (SSE) API to downstream clients like **[PlayOutVue](https://github.com/Soranokuni/PlayOutVue)**.
 
 ---
 
@@ -431,12 +431,13 @@ cargo test --test contract_boundary
 
 ## Author & Project Information
 
-- **Author**: **[Soranokuni](https://github.com/Soranokuni)** (Alex Fountas)
-- **Email**: [shadowsora13@hotmail.gr](mailto:shadowsora13@hotmail.gr)
+- **Author**: **Alex Fountas** ([Soranokuni](https://github.com/Soranokuni))
+- **Email**: [fountasalexandros@gmail.com](mailto:fountasalexandros@gmail.com) · [afountas@cretetv.gr](mailto:afountas@cretetv.gr)
 - **Repository**: [https://github.com/Soranokuni/PlayoutTranscode](https://github.com/Soranokuni/PlayoutTranscode)
 
 ---
 
 ## License
 
-This project is licensed under the **MIT License**.
+This project is licensed under the **MIT License** — see [LICENSE](LICENSE).
+Copyright © 2026 Alex Fountas.

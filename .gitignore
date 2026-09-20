@@ -38,6 +38,15 @@ docs/*-PLAN.md
 docs/*-DESIGN.md
 docs/*-FIXTURES.md
 
+# Research corpora, audit write-ups and optimization briefs: internal working
+# material, not needed to build or run the service.
+NOTEBOOKLM_*.md
+optimization.md
+*-INTERFACE-CHANGES.md
+docs/audit-*/
+AUDIT-FINDINGS.md
+REMEDIATION-PLAN.md
+
 # ==============================================================================
 # Local Reference Copies & Scratch Files
 # ==============================================================================
