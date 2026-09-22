@@ -8,8 +8,8 @@
 //! and not as Ctrl-C.
 
 use crate::{
-    bootstrap, config, db, identity, instance_lock, jobs, logging, paths, profiles, server,
-    service_handle,
+    bootstrap, config, db, identity, instance_lock, jobs, logging, media_root, paths, processor,
+    profiles, server, service_handle,
 };
 
 use anyhow::Result;
@@ -75,6 +75,14 @@ const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// How long shutdown waits for the processing thread to unwind, after the HTTP
 /// drain. The two together stay under the SCM's 30 s wait hint.
 const WORKER_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How often to re-stat every published mezzanine (T-4).
+///
+/// PlayOut polls the asset list every 30 s, so anything faster than that buys
+/// nothing, and the sweep is a `stat` per asset against a share. Two minutes
+/// keeps a vanished file's window under one commercial break without making the
+/// service a source of SMB traffic in its own right.
+const MISSING_RECONCILE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Boot the whole service and run until `shutdown` fires or Ctrl-C arrives.
 ///
@@ -168,6 +176,40 @@ pub async fn run_service(
     let target_root = PathBuf::from(&app_config.paths.target_folder);
     let _ = std::fs::create_dir_all(&target_root);
 
+    // T-3. Before anything can publish into the media folder, establish that it
+    // is ours. Two registries sharing one media root is the accident behind
+    // yesterday's on-air failure, and it is only survivable by luck; this is
+    // the guard that makes it impossible instead.
+    //
+    // Refusing to start is the right severity. A service running against
+    // somebody else's media folder writes files that the other registry will
+    // never know about and PlayOut will resolve through whichever of the two it
+    // happens to be polling.
+    if !target_root.to_string_lossy().is_empty() {
+        let registry_id = db::registry_id(&pool)
+            .await
+            .map_err(|e| anyhow::anyhow!("Could not read this registry's identity: {}", e))?;
+        match media_root::claim(&target_root, &registry_id) {
+            Ok(marker) => tracing::info!(
+                "Media folder {} owned by registry {} since {}",
+                target_root.display(),
+                marker.registry_id,
+                marker.claimed_at
+            ),
+            Err(e) => {
+                tracing::error!("{}", e);
+                return Err(anyhow::anyhow!("{}", e));
+            }
+        }
+    }
+
+    // Only now, with ownership of the media folder established, is it right to
+    // rewrite the operator's rows. A start that gets refused above leaves the
+    // registry exactly as it found it.
+    db::run_data_migrations(&pool, &paths::database_path())
+        .await
+        .map_err(|e| anyhow::anyhow!("Registry data migration failed: {}", e))?;
+
     let config_initialized = app_config.initialized;
 
     let server_cfg = app_config.clone();
@@ -222,6 +264,63 @@ pub async fn run_service(
                 report.already_current,
                 report.failed
             );
+        }
+    });
+
+    // T-1c. Correct the keyframes on every asset ingested before the parser
+    // was fixed. Every one of them is wrong: the keyframe at pts 0 was dropped,
+    // so `keyframe_safe_start_ms` is one GOP too late, and PlayOut used it as a
+    // floor on the IN point and cut the head off every clip.
+    //
+    // Detached OS thread with the rest of the startup work: each file is an
+    // ffprobe, and on the packet scan that is ~0.1 s apiece, so 35 assets is a
+    // few seconds -- but it is blocking work with no business on the runtime,
+    // and a large library must not hold up the listener.
+    {
+        let backfill_pool = pool.clone();
+        let backfill_handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || match bootstrap::ensure_toolchain() {
+            Ok(tools) => {
+                processor::backfill_keyframe_offsets(
+                    &backfill_pool,
+                    &backfill_handle,
+                    &tools.ffprobe,
+                );
+            }
+            Err(e) => tracing::warn!(
+                "Keyframe backfill deferred to the next start: no ffprobe yet ({})",
+                e
+            ),
+        });
+    }
+
+    // T-4. Keep `status` honest about whether the mezzanine is still on disk.
+    // The registry could say `ready` about a file that was not there, and the
+    // first thing that noticed was PlayOut's pre-flight check at TAKE.
+    //
+    // Once at startup and then on a slow tick. The `stat`s go to
+    // `spawn_blocking` because the target folder is usually an SMB share, where
+    // each one is a round trip and a few thousand of them on the runtime would
+    // stall every request in flight.
+    let reconcile_pool = pool.clone();
+    let reconcile_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(MISSING_RECONCILE_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let result = db::reconcile_missing_paths(&reconcile_pool, |p| {
+                std::path::Path::new(p).exists()
+            })
+            .await;
+            match result {
+                Ok(r) if r.went_missing > 0 || r.came_back > 0 => tracing::info!(
+                    "Path reconcile: {} asset(s) went missing, {} came back, {} missing in total",
+                    r.went_missing,
+                    r.came_back,
+                    r.missing_total,
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::error!("Path reconcile failed: {}", e),
+            }
         }
     });
 
@@ -347,6 +446,7 @@ pub async fn run_service(
         handle.abort();
     }
     backup_task.abort();
+    reconcile_task.abort();
 
     pool.close().await;
     tracing::info!("Shutdown complete");

@@ -40,6 +40,23 @@ pub struct MediaAsset {
     pub keyframe_offsets_json: String,
     pub deleted_at: Option<String>,
     pub original_virtual_folder: Option<String>,
+    /// Identifies the QC verdict on this row: which bytes were judged, and
+    /// under which encoding and validation settings. `None` on a row published
+    /// before the column existed, and on any row that has not been through QC.
+    ///
+    /// This is what makes a failure re-checkable rather than merely repeated.
+    /// See [`find_reproducible_qc_failure`].
+    pub qc_verdict_key: Option<String>,
+    /// The full-length asset this row was cut from, for a sub-clip; `None` for
+    /// a full-length row (T-2b).
+    ///
+    /// Before this column, a sub-clip was identified by its *trim window*, and
+    /// nothing at all distinguished it in the dedupe lookup: it carries its
+    /// parent's `fingerprint` and its parent's `current_path`, with a NULL
+    /// `source_sha256`, so `find_by_fingerprint` could hand back a sub-clip as
+    /// the candidate duplicate of its own parent's source and the whole
+    /// programme was re-ingested.
+    pub parent_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,6 +81,10 @@ pub struct AssetResponse {
     pub keyframe_safe_start_ms: i64,
     pub warnings: Vec<String>,
     pub keyframe_offsets: Vec<i64>,
+    /// The service has recorded that this exact media, under these exact
+    /// settings, already failed, and will skip it rather than encode it again.
+    /// Additive; older clients ignore it.
+    pub retry_suppressed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,13 +117,14 @@ impl From<MediaAsset> for AssetResponse {
             keyframe_safe_start_ms: a.keyframe_safe_start_ms,
             warnings,
             keyframe_offsets,
+            retry_suppressed: is_retry_suppressed(a.qc_verdict_key.as_deref()),
             deleted_at: a.deleted_at,
             original_virtual_folder: a.original_virtual_folder,
         }
     }
 }
 
-const SELECT_COLS: &str = "uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder";
+const SELECT_COLS: &str = "uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder, parent_uuid, qc_verdict_key";
 
 /// Find all assets with a given status. Used for startup recovery scans.
 pub async fn find_all_with_status(
@@ -125,6 +147,9 @@ pub struct RecoveryOutcome {
     pub purged_for_retry: usize,
     pub purged_dead: usize,
     pub kept_dead: usize,
+    /// Rows left alone because the same media failed permanently under the same
+    /// settings. Retrying them would burn an encode to reach a known answer.
+    pub kept_permanent: usize,
 }
 
 /// Reclaim `error`/`processing` rows whose `current_path` (= source path on those states)
@@ -134,6 +159,7 @@ pub async fn recover_failed_assets(
     pool: &SqlitePool,
     watch_folder: &Path,
     auto_retry: bool,
+    verdict_key_for: impl Fn(&str) -> String,
 ) -> Result<RecoveryOutcome, sqlx::Error> {
     let mut out = RecoveryOutcome::default();
     if !auto_retry {
@@ -152,6 +178,49 @@ pub async fn recover_failed_assets(
                 .map(|c| c.starts_with(&canonical_watch))
                 .unwrap_or(false);
             let exists = src_path.exists();
+
+            // T-5 put a new kind of row into `error`: a mezzanine that encoded
+            // cleanly and then failed QC. Its `current_path` is the *published*
+            // file, not a source in the watch folder, and it carries the
+            // duration, geometry, keyframes and warnings that say why it is not
+            // airable. This sweep is for the debris of a failed ingest, which
+            // never reached `mark_ready` and so has `duration_ms = 0`.
+            //
+            // Without this, deleting the mezzanine of a QC-failed asset would
+            // silently delete the row too -- the same loss that
+            // `purge_unusable_rows_by_fingerprint` demotes rather than deletes
+            // to avoid.
+            if a.duration_ms > 0 {
+                out.kept_dead += 1;
+                continue;
+            }
+
+            // This media has already been through the encoder, under these
+            // exact settings, and the retry classifier called the failure
+            // permanent. Purging the row would hand the file straight back to
+            // the watcher and spend the whole encode reaching the same
+            // conclusion — which is what happened on every single restart.
+            //
+            // Keyed on the bytes *and* the settings, so it is a conclusion that
+            // can be revisited rather than a blacklist: replace the file, or
+            // change the encoding or validation settings, and the key no longer
+            // matches and it is tried again. Deleting the row does the same,
+            // deliberately.
+            let judged_permanent = a
+                .qc_verdict_key
+                .as_deref()
+                .zip(a.source_sha256.as_deref())
+                .is_some_and(|(stored, sha)| stored == verdict_key_for(sha));
+            if judged_permanent {
+                out.kept_permanent += 1;
+                tracing::debug!(
+                    "Startup recovery: {} failed permanently on unchanged media and unchanged \
+                     settings; not retrying",
+                    a.uuid
+                );
+                continue;
+            }
+
             if still_in_watch {
                 purge_row_by_uuid(pool, &a.uuid).await?;
                 out.purged_for_retry += 1;
@@ -216,6 +285,56 @@ pub fn backup_file_name(date: &str) -> String {
 ///
 /// Returns the path written. Safe to call while the service is running and
 /// writing; `VACUUM INTO` takes its own read transaction.
+/// The data directory a registry file lives in, for locating its backup folder.
+fn data_dir_for_backup(db_path: &Path) -> std::path::PathBuf {
+    db_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// A one-off snapshot taken immediately before a migration rewrites rows.
+///
+/// Distinct from the daily snapshot and never rotated out by it: the whole
+/// point is that it survives long enough to be useful if the migration turns
+/// out to have been wrong. Named for the version that took it and the moment it
+/// was taken, so several upgrades leave several files rather than overwriting
+/// each other.
+async fn snapshot_before_migration(
+    pool: &SqlitePool,
+    dir: &Path,
+) -> Result<std::path::PathBuf, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+
+    let dest = dir.join(format!(
+        "pre-migration-v{}-{}.db",
+        env!("CARGO_PKG_VERSION"),
+        chrono::Local::now().format("%Y-%m-%d-%H%M%S")
+    ));
+    if dest.exists() {
+        return Ok(dest);
+    }
+
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(pool)
+        .await;
+
+    let staging = dir.join(format!(".pre-migration-{}.tmp", uuid::Uuid::new_v4()));
+    let escaped = staging.to_string_lossy().replace('\'', "''");
+    if let Err(e) = sqlx::query(&format!("VACUUM INTO '{}'", escaped))
+        .execute(pool)
+        .await
+    {
+        let _ = std::fs::remove_file(&staging);
+        return Err(format!("VACUUM INTO failed: {}", e));
+    }
+    std::fs::rename(&staging, &dest).map_err(|e| {
+        let _ = std::fs::remove_file(&staging);
+        format!("cannot publish the snapshot: {}", e)
+    })?;
+    Ok(dest)
+}
+
 pub async fn backup_now(pool: &SqlitePool, data_dir: &Path) -> Result<std::path::PathBuf, String> {
     let dir = backup_dir(data_dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
@@ -319,6 +438,133 @@ pub fn prune_backups(dir: &Path, keep: usize) -> usize {
     removed
 }
 
+/// Rewrite rows that a new version needs to correct, once.
+///
+/// Split out of [`init_pool`] deliberately. Opening the registry is additive --
+/// `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN`, `CREATE INDEX`, `CREATE TRIGGER`
+/// -- and safe for any process that merely wants to read it: a backup, a test,
+/// or a service that is about to discover it may not run at all.
+///
+/// This is the part that changes an operator's data, so it runs only after the
+/// service has established that it owns the media folder it is about to publish
+/// into. A start that gets refused must leave the registry exactly as it found
+/// it; the first time the ownership guard actually fired, it fired *after* this
+/// work had already been done, which was harmless only by luck.
+pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<(), sqlx::Error> {
+    // Everything above this line is additive: `CREATE TABLE IF NOT EXISTS`,
+    // `ADD COLUMN`, `CREATE INDEX`. Everything below rewrites rows the operator
+    // already has -- it demotes statuses and adopts sub-clips onto parents --
+    // and the registry holds every uuid, rating, virtual folder, trim window and
+    // compliance flag anyone has ever set, none of which can be reconstructed
+    // from the media files.
+    //
+    // The daily snapshot is taken by a background task that does not start until
+    // the service is up, which is well after this runs. So the first
+    // service start on a new version would rewrite the registry with no snapshot
+    // of what it looked like beforehand. Take one here, once, only when there is
+    // actually something to rewrite -- so it costs a `VACUUM INTO` on the
+    // upgrade start and nothing on any start after it.
+    {
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT
+               (SELECT COUNT(*) FROM media_assets
+                 WHERE status = 'ready' AND mezzanine_ok = 0)
+             + (SELECT COUNT(*) FROM media_assets
+                 WHERE parent_uuid IS NULL
+                   AND source_sha256 IS NULL
+                   AND (trim_in_ms > 0
+                        OR (trim_out_ms <> 0 AND trim_out_ms <> duration_ms)))",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+
+        if pending > 0 {
+            let dir = backup_dir(&data_dir_for_backup(db_path));
+            match snapshot_before_migration(pool, &dir).await {
+                Ok(path) => tracing::warn!(
+                    "{} row(s) need a one-off migration; snapshot of the registry as it was \
+                     written to {}",
+                    pending,
+                    path.display()
+                ),
+                // Not fatal. A service that will not start because it could not
+                // write a snapshot is worse than one that starts without it --
+                // but it must be loud, because this is the one start where the
+                // snapshot mattered.
+                Err(e) => tracing::error!(
+                    "Could not snapshot the registry before migrating {} row(s): {}. \
+                     Continuing; stop the service and copy media_assets.db by hand if you \
+                     want a pre-migration copy.",
+                    pending,
+                    e
+                ),
+            }
+        }
+    }
+
+    // T-2b. Adopt the sub-clips that predate `parent_uuid`.
+    //
+    // A sub-clip is recognisable by its trim window and by sharing a
+    // `current_path` with exactly one full-length row -- it plays the same
+    // physical file as its parent, which is the whole point of a sub-clip. Rows
+    // whose parent cannot be identified that way are left NULL and stay
+    // invisible to this column; they are still excluded from the dedupe lookup
+    // by the `source_sha256 IS NOT NULL` half of the predicate.
+    {
+        let adopted = sqlx::query(
+            "UPDATE media_assets AS child SET parent_uuid = (
+                 SELECT p.uuid FROM media_assets AS p
+                 WHERE p.current_path = child.current_path
+                   AND p.uuid <> child.uuid
+                   AND p.source_sha256 IS NOT NULL
+                   AND p.trim_in_ms = 0
+                   AND (p.trim_out_ms = 0 OR p.trim_out_ms = p.duration_ms)
+                 LIMIT 1
+             )
+             WHERE child.parent_uuid IS NULL
+               AND child.source_sha256 IS NULL
+               AND (child.trim_in_ms > 0
+                    OR (child.trim_out_ms <> 0 AND child.trim_out_ms <> child.duration_ms))",
+        )
+        .execute(pool)
+        .await?;
+        if adopted.rows_affected() > 0 {
+            tracing::info!(
+                "Adopted {} pre-existing sub-clip row(s) onto parent_uuid",
+                adopted.rows_affected()
+            );
+        }
+    }
+
+    // T-5. `status = 'ready'` with `mezzanine_ok = 0` is a contradiction the
+    // contract never defined, and its three readers each resolved it
+    // differently: PlayOut's v2 library mapping said `error`, its v1 and batch
+    // paths said `ready`, and this service's own dedupe said "not usable" and
+    // re-transcoded forever. The same asset was red on one half of the
+    // operator's screen and green on the other.
+    //
+    // A QC-failed mezzanine is `error`. That is what PlayOut's v2 mapping
+    // already assumes, so nothing downstream has to change, and it gives the
+    // dedupe a signal it reads correctly.
+    {
+        let demoted = sqlx::query(
+            "UPDATE media_assets SET status = 'error' WHERE status = 'ready' AND mezzanine_ok = 0",
+        )
+        .execute(pool)
+        .await?;
+        if demoted.rows_affected() > 0 {
+            tracing::warn!(
+                "Demoted {} asset(s) that were 'ready' with a failed mezzanine to 'error' \
+                 (T-5); they were never safe to air",
+                demoted.rows_affected()
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     let db_dir = db_path.parent().unwrap_or_else(|| Path::new("."));
     let _ = std::fs::create_dir_all(db_dir);
@@ -373,11 +619,32 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
             warnings TEXT NOT NULL DEFAULT '[]',
             keyframe_offsets_json TEXT NOT NULL DEFAULT '[]',
             deleted_at TEXT DEFAULT NULL,
-            original_virtual_folder TEXT DEFAULT NULL
+            original_virtual_folder TEXT DEFAULT NULL,
+            parent_uuid TEXT DEFAULT NULL,
+            qc_verdict_key TEXT DEFAULT NULL
         )",
     )
     .execute(&pool)
     .await?;
+
+    // T-3. A stable identity for *this registry*, so the media folder it
+    // publishes into can be stamped with it and a second registry pointed at
+    // the same folder can be refused. Generated once, on the database that owns
+    // it, and never changed: it survives a data-directory move, which is the
+    // case a path comparison would get wrong.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS registry_meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
+    sqlx::query("INSERT OR IGNORE INTO registry_meta (key, value) VALUES ('registry_id', ?1)")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .execute(&pool)
+        .await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS virtual_folder_colors (
@@ -467,6 +734,14 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         // have no full hash, and backfilling would mean re-reading the whole
         // library from disk at startup.
         ("source_sha256", "TEXT", "NULL"),
+        // T-2b. Nullable: NULL means "this is a full-length asset", which is
+        // what every row written before this column existed was, bar the
+        // sub-clips the backfill below identifies.
+        ("parent_uuid", "TEXT", "NULL"),
+        // T-2. What was judged, and under what settings. Nullable: rows
+        // published before it existed fall back to the narrower legacy test in
+        // `find_reproducible_qc_failure`.
+        ("qc_verdict_key", "TEXT", "NULL"),
     ] {
         let sql = if default == "NULL" {
             format!(
@@ -510,6 +785,25 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         }
     }
 
+    // ...and now make it unrepresentable. SQLite cannot add a `CHECK` to an
+    // existing table without rebuilding it, and rebuilding the one table the
+    // whole station's playout depends on to add an assertion is the wrong
+    // trade. A pair of `BEFORE` triggers is the same guarantee at the same
+    // place -- every writer, including a hand-run `UPDATE` in the DB viewer --
+    // and it installs idempotently on a live registry.
+    for trigger in [
+        "CREATE TRIGGER IF NOT EXISTS trg_media_assets_ready_requires_mezzanine_insert
+         BEFORE INSERT ON media_assets
+         FOR EACH ROW WHEN NEW.status = 'ready' AND NEW.mezzanine_ok = 0
+         BEGIN SELECT RAISE(ABORT, 'status ready requires mezzanine_ok'); END",
+        "CREATE TRIGGER IF NOT EXISTS trg_media_assets_ready_requires_mezzanine_update
+         BEFORE UPDATE ON media_assets
+         FOR EACH ROW WHEN NEW.status = 'ready' AND NEW.mezzanine_ok = 0
+         BEGIN SELECT RAISE(ABORT, 'status ready requires mezzanine_ok'); END",
+    ] {
+        sqlx::query(trigger).execute(&pool).await?;
+    }
+
     let result =
         sqlx::query("UPDATE media_assets SET status = 'error' WHERE status = 'processing'")
             .execute(&pool)
@@ -543,6 +837,9 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         // `WHERE current_path = ?`, which was a full scan.
         "CREATE INDEX IF NOT EXISTS idx_media_assets_current_path ON media_assets(current_path)",
         "CREATE INDEX IF NOT EXISTS idx_transcode_jobs_created_at ON transcode_jobs(created_at)",
+        // Every ingest that matches a fingerprint asks this question once.
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_qc_verdict_key ON media_assets(qc_verdict_key)",
+        "CREATE INDEX IF NOT EXISTS idx_media_assets_source_sha256 ON media_assets(source_sha256)",
     ] {
         let _ = sqlx::query(idx).execute(&pool).await;
     }
@@ -577,6 +874,13 @@ pub async fn insert_processing(
     Ok(())
 }
 
+/// Publish the outcome of a completed encode.
+///
+/// Despite the name this is also how a *failed* QC lands: the row gets its real
+/// duration, geometry, keyframes and warnings either way, and `mezzanine_ok`
+/// decides whether the status is `ready` or `error` (T-5). The metadata is
+/// worth keeping in both cases -- it is what tells an operator, and the dedupe,
+/// why the asset is not airable.
 pub async fn mark_ready(
     pool: &SqlitePool,
     uuid: &str,
@@ -591,6 +895,7 @@ pub async fn mark_ready(
     keyframe_safe_start_ms: i64,
     warnings: &[String],
     keyframe_offsets_json: &str,
+    qc_verdict_key: Option<&str>,
 ) -> Result<(), sqlx::Error> {
     let warnings_json = serde_json::to_string(warnings).unwrap_or_else(|_| "[]".to_string());
     sqlx::query(
@@ -599,7 +904,12 @@ pub async fn mark_ready(
             duration_ms = ?2,
             trim_in_ms = 0,
             trim_out_ms = ?2,
-            status = 'ready',
+            -- T-5. `ready` is a promise that the asset can go to air now. A
+            -- mezzanine that failed QC cannot, so it is `error` and the
+            -- contradiction the three consumers each read differently is never
+            -- written in the first place. The triggers in `init_pool` refuse it
+            -- even if some other writer tries.
+            status = CASE WHEN ?3 THEN 'ready' ELSE 'error' END,
             mezzanine_ok = ?3,
             fps = ?4,
             fps_num = ?5,
@@ -608,8 +918,12 @@ pub async fn mark_ready(
             gop_frames = ?8,
             keyframe_safe_start_ms = ?9,
             warnings = ?10,
-            keyframe_offsets_json = ?11
-         WHERE uuid = ?12",
+            keyframe_offsets_json = ?11,
+            -- What was judged and under what settings, so a failure can be
+            -- re-examined when the settings change instead of being re-run
+            -- verbatim on every restart (T-2).
+            qc_verdict_key = ?12
+         WHERE uuid = ?13",
     )
     .bind(output_path)
     .bind(duration_ms)
@@ -622,6 +936,7 @@ pub async fn mark_ready(
     .bind(keyframe_safe_start_ms)
     .bind(warnings_json)
     .bind(keyframe_offsets_json)
+    .bind(qc_verdict_key)
     .bind(uuid)
     .execute(pool)
     .await?;
@@ -633,6 +948,29 @@ pub async fn mark_error(pool: &SqlitePool, uuid: &str) -> Result<(), sqlx::Error
         .bind(uuid)
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+/// Record an ingest failure that the retry classifier judged **permanent**,
+/// together with the verdict key identifying what was judged and under what
+/// settings.
+///
+/// The key is what stops [`recover_failed_assets`] purging the row for retry on
+/// the next start. Without it the sweep deletes the row, the watcher re-offers
+/// the file, and the whole encode is spent reaching the same conclusion —
+/// on every restart, for ever, on media that cannot be ingested.
+pub async fn mark_error_permanent(
+    pool: &SqlitePool,
+    uuid: &str,
+    qc_verdict_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE media_assets SET status = 'error', qc_verdict_key = ?1 WHERE uuid = ?2",
+    )
+    .bind(qc_verdict_key)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -679,19 +1017,287 @@ pub async fn find_trashed_by_uuid(
         .await
 }
 
-/// Find active asset by fingerprint.
+/// This registry's stable identity (T-3). See `media_root`.
+pub async fn registry_id(pool: &SqlitePool) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM registry_meta WHERE key = 'registry_id'")
+        .fetch_one(pool)
+        .await
+}
+
+/// QC findings that can fail for reasons outside the media.
+///
+/// The inverse list, and deliberately so. Almost every QC finding is
+/// *reproducible*: the pipeline probes a finished encode against its source
+/// under a fixed policy, so the same bytes judged under the same settings reach
+/// the same verdict, every time, for ever. Trying again is pure waste.
+///
+/// These are the exceptions -- a finding that says more about the machine than
+/// about the media. A row whose findings are *all* on this list stays
+/// retryable, because the next attempt genuinely might differ.
+pub const ENVIRONMENTAL_QC_CODES: &[&str] = &[
+    // ffprobe could not be run, or exited non-zero. A missing or busy toolchain
+    // is not a property of the programme, and blacklisting a good master
+    // because ffprobe was mid-upgrade would be a poor trade.
+    "keyframe_scan_failed",
+];
+
+/// QC findings that are unmistakably properties of the **source**.
+///
+/// Only used for rows published before `qc_verdict_key` existed, where there is
+/// no record of the settings the verdict was reached under. Narrow on purpose:
+/// without the settings, "reproducible" cannot be established, so the legacy
+/// path asserts it only for a finding that no configuration could plausibly
+/// have caused.
+pub const SOURCE_ATTRIBUTABLE_QC_CODES: &[&str] = &["duration_delta_exceeded"];
+
+/// Has this exact media, judged under these exact settings, already failed QC?
+///
+/// This is what stops the service re-encoding known-bad media on every start.
+/// Three sources whose container duration disagrees with their real one
+/// accumulated eleven registry rows between them, three more on every restart,
+/// because a QC-failed row was never recognised as a duplicate and the
+/// re-ingest cleanup refused to delete it.
+///
+/// The verdict is keyed on **the bytes and the settings together**, which is
+/// what makes the skip safe to make permanent:
+///
+/// * change the media and the source hash changes, so it is judged afresh. A
+///   part-copied file that later completes is a different key, not a blacklist
+///   entry.
+/// * change the encoding profile or the validation policy -- widen
+///   `max_duration_delta_ms`, turn off `enforce_closed_gop` -- and every stored
+///   verdict stops matching, so all of it gets another chance. An operator who
+///   loosens the tolerance *specifically to accept these files* must not find
+///   them still being skipped.
+/// * change neither, and there is nothing to learn from encoding it again.
+///
+/// A row whose findings are all [`ENVIRONMENTAL_QC_CODES`] is never permanent.
+///
+/// `legacy_source_sha256` covers rows published before the key existed, which
+/// have no record of the settings that judged them; for those the much narrower
+/// [`SOURCE_ATTRIBUTABLE_QC_CODES`] test applies.
+pub async fn find_reproducible_qc_failure(
+    pool: &SqlitePool,
+    verdict_key: &str,
+    legacy_source_sha256: &str,
+) -> Result<Option<MediaAsset>, sqlx::Error> {
+    let sql = format!(
+        "SELECT {} FROM media_assets
+         WHERE deleted_at IS NULL
+           AND parent_uuid IS NULL
+           AND status = 'error'
+           AND mezzanine_ok = 0
+           AND (qc_verdict_key = ?1 OR (qc_verdict_key IS NULL AND source_sha256 = ?2))
+         ORDER BY (qc_verdict_key IS NOT NULL) DESC, rowid DESC",
+        SELECT_COLS
+    );
+    let rows = sqlx::query_as::<_, MediaAsset>(&sql)
+        .bind(verdict_key)
+        .bind(legacy_source_sha256)
+        .fetch_all(pool)
+        .await?;
+
+    Ok(rows.into_iter().find(|a| {
+        let findings: Vec<String> = serde_json::from_str(&a.warnings).unwrap_or_default();
+        if findings.is_empty() {
+            // A row with no recorded findings says nothing about why it failed.
+            // It is not evidence of bad media.
+            return false;
+        }
+        if a.qc_verdict_key.is_some() {
+            // The precise test: the same bytes under the same settings reached
+            // this verdict. Reproducible unless every finding is environmental.
+            findings
+                .iter()
+                .any(|c| !ENVIRONMENTAL_QC_CODES.contains(&c.as_str()))
+        } else {
+            // The legacy test: no record of the settings, so only a finding
+            // that no setting could have caused counts.
+            findings
+                .iter()
+                .any(|c| SOURCE_ATTRIBUTABLE_QC_CODES.contains(&c.as_str()))
+        }
+    }))
+}
+
+/// Marks a verdict an operator has explicitly overruled.
+///
+/// **Not** `NULL`. Clearing the column to NULL would drop the row into the
+/// *legacy* branch of [`find_reproducible_qc_failure`] — "no record of the
+/// settings, fall back to the source hash" — which catches exactly the
+/// `duration_delta_exceeded` rows an operator is most likely to be overruling.
+/// The override would appear to work and change nothing.
+///
+/// A real key is 64 hex characters, so this prefix can never collide with one:
+/// the row keeps a non-NULL key, stays out of the legacy branch, and matches no
+/// computed verdict. The next failure overwrites it with a real one.
+pub const QC_VERDICT_CLEARED: &str = "cleared-by-operator";
+
+/// Will the service refuse to re-ingest this media?
+///
+/// True exactly when a live verdict is recorded against it: an operator's
+/// override writes [`QC_VERDICT_CLEARED`], which is not a live verdict, and a
+/// row that never failed has none at all.
+///
+/// Derived rather than stored so there is one definition of "held back", shared
+/// by the API payloads and the UI badge. Inferring it client-side from the
+/// status and the warnings got it wrong the moment an operator cleared a
+/// verdict: neither of those changes, so the badge went on claiming the media
+/// would not be retried after it had been released.
+pub fn is_retry_suppressed(qc_verdict_key: Option<&str>) -> bool {
+    matches!(qc_verdict_key, Some(k) if k != QC_VERDICT_CLEARED)
+}
+
+/// Let the service reconsider media it has given up on.
+///
+/// The operator's override for the skip. The service's rule is "same bytes,
+/// same settings, same answer"; this is how a human says "humour me".
+///
+/// Returns false when there was no verdict to overrule, so the caller can say
+/// "nothing to do" rather than implying it changed something.
+pub async fn clear_qc_verdict(pool: &SqlitePool, uuid: &str) -> Result<bool, sqlx::Error> {
+    let r = sqlx::query(
+        "UPDATE media_assets SET qc_verdict_key = ?1
+         WHERE uuid = ?2 AND qc_verdict_key IS NOT NULL AND qc_verdict_key <> ?1",
+    )
+    .bind(QC_VERDICT_CLEARED)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected() > 0)
+}
+
+/// Stamp a verdict key onto a row that predates the column, once the current
+/// settings have been confirmed to reproduce its failure.
+///
+/// Lets the legacy set converge on the precise test instead of relying on
+/// [`SOURCE_ATTRIBUTABLE_QC_CODES`] for ever -- and, more usefully, means a
+/// later settings change releases these rows too.
+pub async fn adopt_qc_verdict_key(
+    pool: &SqlitePool,
+    uuid: &str,
+    verdict_key: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE media_assets SET qc_verdict_key = ?1 WHERE uuid = ?2 AND qc_verdict_key IS NULL")
+        .bind(verdict_key)
+        .bind(uuid)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Find the active asset to test a new ingest against, by sampled fingerprint.
+///
+/// Two things this must not do, both learned the hard way:
+///
+/// * **Return a sub-clip** (T-2b). A sub-clip carries its parent's fingerprint
+///   and its parent's path with a NULL `source_sha256`, so the dedupe read it
+///   as a legacy row it could not confirm and re-ingested the parent's source.
+///   Making a sub-clip started a re-encode loop of its own, distinct from the
+///   QC one.
+/// * **Return an arbitrary row.** There was no `ORDER BY` and no `LIMIT`, so
+///   with eleven rows sharing a fingerprint the answer was whatever SQLite
+///   yielded first. Stable in practice, which is precisely why the loop never
+///   accidentally corrected itself. Prefer the row that is actually usable.
 pub async fn find_by_fingerprint(
     pool: &SqlitePool,
     fingerprint: i64,
 ) -> Result<Option<MediaAsset>, sqlx::Error> {
     let sql = format!(
-        "SELECT {} FROM media_assets WHERE fingerprint = ?1 AND deleted_at IS NULL",
+        "SELECT {} FROM media_assets
+         WHERE fingerprint = ?1
+           AND deleted_at IS NULL
+           AND parent_uuid IS NULL
+           AND source_sha256 IS NOT NULL
+         ORDER BY mezzanine_ok DESC, (status = 'ready') DESC, rowid DESC
+         LIMIT 1",
         SELECT_COLS
     );
     sqlx::query_as::<_, MediaAsset>(&sql)
         .bind(fingerprint)
         .fetch_optional(pool)
         .await
+}
+
+/// A distinct mezzanine on disk, and every registry row that plays it.
+#[derive(Debug, Clone)]
+pub struct KeyframeRescanTarget {
+    pub current_path: String,
+    /// The rows sharing this file: the full-length asset and any sub-clips cut
+    /// from it, all of which copied the parent's (wrong) offsets.
+    pub uuids: Vec<String>,
+    pub keyframe_safe_start_ms: i64,
+    /// The stored offsets, verbatim, so the backfill can tell "already
+    /// corrected" from "coincidentally has the right safe start".
+    pub keyframe_offsets_json: String,
+}
+
+/// Every mezzanine whose recorded keyframes came from the broken parser (T-1c).
+///
+/// Two shapes qualify and both are wrong:
+///
+/// * `keyframe_safe_start_ms > 0` -- the keyframe at pts 0 was dropped, so the
+///   first *surviving* offset became the safe start. Every real mezzanine this
+///   service has produced is in this group.
+/// * an empty offsets list -- either the scan failed, or it succeeded and every
+///   line was discarded. Selecting only on `> 0` would skip these, and they are
+///   exactly the rows T-7 is about.
+///
+/// Grouped by file, because a sub-clip carries a copy of its parent's offsets
+/// and has to be corrected with it, and because re-scanning one physical file
+/// once is the whole point.
+///
+/// `duration_ms > 0` restricts this to rows that actually reached `mark_ready`.
+/// A failed ingest's leftovers also carry an empty offsets list, but their
+/// `current_path` is still the *source* file, and re-scanning a source to write
+/// mezzanine keyframes onto a dead row is meaningless.
+pub async fn keyframe_rescan_targets(
+    pool: &SqlitePool,
+) -> Result<Vec<KeyframeRescanTarget>, sqlx::Error> {
+    let rows: Vec<(String, String, i64, String)> = sqlx::query_as(
+        "SELECT current_path, uuid, keyframe_safe_start_ms, keyframe_offsets_json FROM media_assets
+         WHERE deleted_at IS NULL
+           AND current_path <> ''
+           AND duration_ms > 0
+           AND (keyframe_safe_start_ms > 0
+                OR keyframe_offsets_json IN ('[]', ''))
+         ORDER BY current_path, rowid",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut targets: Vec<KeyframeRescanTarget> = Vec::new();
+    for (path, uuid, safe_start, offsets_json) in rows {
+        match targets.last_mut() {
+            Some(t) if t.current_path == path => t.uuids.push(uuid),
+            _ => targets.push(KeyframeRescanTarget {
+                current_path: path,
+                uuids: vec![uuid],
+                keyframe_safe_start_ms: safe_start,
+                keyframe_offsets_json: offsets_json,
+            }),
+        }
+    }
+    Ok(targets)
+}
+
+/// Write corrected keyframes onto every row that plays one file.
+pub async fn apply_keyframe_rescan(
+    pool: &SqlitePool,
+    current_path: &str,
+    keyframe_safe_start_ms: i64,
+    keyframe_offsets_json: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE media_assets SET keyframe_safe_start_ms = ?1, keyframe_offsets_json = ?2
+         WHERE current_path = ?3 AND deleted_at IS NULL",
+    )
+    .bind(keyframe_safe_start_ms)
+    .bind(keyframe_offsets_json)
+    .bind(current_path)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 /// Count total rows matching path (active + trashed) to protect physical media from premature deletion.
@@ -751,8 +1357,8 @@ pub async fn create_subclip(
     let parent = find_by_uuid(pool, parent_uuid).await?;
     if let Some(p) = parent {
         sqlx::query(
-            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)"
+            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, parent_uuid)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
         )
         .bind(new_uuid)
         .bind(p.fingerprint)
@@ -774,6 +1380,11 @@ pub async fn create_subclip(
         .bind(p.keyframe_safe_start_ms)
         .bind(warnings)
         .bind(&p.keyframe_offsets_json)
+        // T-2b. Without this the sub-clip is indistinguishable from a legacy
+        // row in the dedupe lookup: same fingerprint as its parent, same file,
+        // and a NULL `source_sha256` that reads as "cannot confirm, re-ingest".
+        // Making a sub-clip re-encoded the programme it was cut from.
+        .bind(parent_uuid)
         .execute(pool)
         .await?;
 
@@ -781,6 +1392,102 @@ pub async fn create_subclip(
     } else {
         Ok(None)
     }
+}
+
+/// What a pass of [`reconcile_missing_paths`] changed.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MissingReconcile {
+    /// `ready` rows whose mezzanine is no longer on disk.
+    pub went_missing: u64,
+    /// `missing` rows whose mezzanine is back -- a remounted share, usually.
+    pub came_back: u64,
+    /// Rows sitting at `missing` after this pass.
+    pub missing_total: i64,
+}
+
+/// Stat every published mezzanine and keep `status` honest about it (T-4).
+///
+/// The registry could say `ready` about a file that is not there, and the first
+/// thing that noticed was PlayOut's pre-flight check at TAKE -- on air, one clip
+/// too late. Twelve rundown rows pointed at a retired registry's paths and
+/// nothing upstream of transmission knew.
+///
+/// PlayOut now stats its own rundown rather than waiting for this, but the
+/// server is the side that actually knows, and `missing` is a status its
+/// `IngestorStatus` union already has a branch for.
+///
+/// `ready` and `missing` are the only two states this moves between, in both
+/// directions. An `error` row is already not airable and the operator's reason
+/// for it is worth more than this one; a `processing` row's `current_path` is
+/// still its *source*, so stat'ing it would mean something else entirely.
+///
+/// `file_exists` is injected so the sweep is testable without a filesystem, and
+/// so the caller can run the real `stat`s off the async runtime -- on an SMB
+/// target each one is a round trip.
+pub async fn reconcile_missing_paths(
+    pool: &SqlitePool,
+    file_exists: impl Fn(&str) -> bool,
+) -> Result<MissingReconcile, sqlx::Error> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT uuid, status, current_path FROM media_assets
+         WHERE deleted_at IS NULL AND status IN ('ready', 'missing')",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = MissingReconcile::default();
+
+    for (uuid, status, path) in rows {
+        let present = !path.is_empty() && file_exists(&path);
+        match (status.as_str(), present) {
+            ("ready", false) => {
+                sqlx::query("UPDATE media_assets SET status = 'missing' WHERE uuid = ?1")
+                    .bind(&uuid)
+                    .execute(pool)
+                    .await?;
+                out.went_missing += 1;
+                tracing::warn!(
+                    "Asset {} is 'ready' but its mezzanine is gone from {}; marked 'missing'",
+                    uuid,
+                    path
+                );
+            }
+            ("missing", true) => {
+                // Back to `ready` only if the mezzanine still passed QC. The
+                // trigger in `init_pool` refuses the other case outright, and
+                // it is the right refusal: a QC-failed row belongs at `error`.
+                let restored = sqlx::query(
+                    "UPDATE media_assets SET status = 'ready'
+                     WHERE uuid = ?1 AND mezzanine_ok = 1",
+                )
+                .bind(&uuid)
+                .execute(pool)
+                .await?;
+                if restored.rows_affected() > 0 {
+                    out.came_back += 1;
+                    tracing::info!("Asset {} is back on disk at {}; restored to 'ready'", uuid, path);
+                } else {
+                    sqlx::query("UPDATE media_assets SET status = 'error' WHERE uuid = ?1")
+                        .bind(&uuid)
+                        .execute(pool)
+                        .await?;
+                    tracing::warn!(
+                        "Asset {} is back on disk but never passed QC; moved to 'error'",
+                        uuid
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.missing_total = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM media_assets WHERE status = 'missing' AND deleted_at IS NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(out)
 }
 
 pub async fn purge_row_by_uuid(pool: &SqlitePool, uuid: &str) -> Result<u64, sqlx::Error> {
@@ -831,8 +1538,8 @@ pub async fn purge_unusable_rows_by_fingerprint(
     fingerprint: i64,
     file_exists: impl Fn(&str) -> bool,
 ) -> Result<FingerprintPurge, sqlx::Error> {
-    let rows: Vec<(String, String, i64, i64, i64, String)> = sqlx::query_as(
-        "SELECT uuid, status, trim_in_ms, trim_out_ms, duration_ms, current_path
+    let rows: Vec<(String, String, i64, i64, i64, String, Option<String>)> = sqlx::query_as(
+        "SELECT uuid, status, trim_in_ms, trim_out_ms, duration_ms, current_path, parent_uuid
          FROM media_assets WHERE fingerprint = ?1",
     )
     .bind(fingerprint)
@@ -841,8 +1548,19 @@ pub async fn purge_unusable_rows_by_fingerprint(
 
     let mut out = FingerprintPurge::default();
 
-    for (uuid, status, trim_in, trim_out, duration, path) in rows {
-        if is_subclip_row(trim_in, trim_out, duration) {
+    for (uuid, status, trim_in, trim_out, duration, path, parent_uuid) in rows {
+        if parent_uuid.is_some() || is_subclip_row(trim_in, trim_out, duration) {
+            out.protected += 1;
+            continue;
+        }
+        // T-5 made a QC-failed mezzanine `error` rather than `ready`, which
+        // walked it straight into the `error` arm below -- and that arm deletes
+        // the row while its published mezzanine stays on disk, orphaned in the
+        // Caspar media folder with nothing referencing it. A row that reached
+        // `mark_ready` has a real duration; a failed ingest's leftovers have 0.
+        // That is the line between "someone's asset, which happens not to be
+        // airable" and "debris".
+        if status == "error" && duration > 0 && !path.is_empty() && file_exists(&path) {
             out.protected += 1;
             continue;
         }
@@ -889,11 +1607,31 @@ pub fn is_subclip_row(trim_in_ms: i64, trim_out_ms: i64, duration_ms: i64) -> bo
     trim_in_ms > 0 || (trim_out_ms != 0 && trim_out_ms != duration_ms)
 }
 
+/// What a purge should do with the media file, as opposed to the registry row.
+///
+/// The two things an operator means by "delete" are genuinely different and
+/// only one of them is reversible-ish: a row can be re-ingested from the source,
+/// a deleted mezzanine cannot.
+///
+/// The previous pair of variants, `PreserveReferencedMezzanine` and
+/// `DeleteUnreferencedMezzanine`, evaluated to the identical rule
+/// (`remaining_refs == 0`) -- they are two names for the same sentence -- so the
+/// `preserve_subclips_on_purge` setting that chose between them had no effect
+/// whatsoever. Sub-clips were protected regardless, by the reference count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PurgeMode {
+    /// Delete the registry row and leave the media where it is.
+    ///
+    /// For taking a row out of the library without touching the broadcast
+    /// folder -- a duplicate entry, a mistaken ingest of a file somebody else
+    /// owns.
+    KeepMedia,
+    /// Delete the row, and the media file too, when nothing else references it.
+    ///
+    /// Never deletes a file a sub-clip still plays: that is the reference
+    /// count's job and it is not negotiable by the caller.
     #[default]
-    PreserveReferencedMezzanine,
-    DeleteUnreferencedMezzanine,
+    DeleteMediaIfUnreferenced,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -1131,8 +1869,8 @@ pub async fn purge_single_asset_with_context(
     let mut warnings = Vec::new();
 
     let should_remove_file = match mode {
-        PurgeMode::PreserveReferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
-        PurgeMode::DeleteUnreferencedMezzanine => remaining_refs == 0 && !path.is_empty(),
+        PurgeMode::KeepMedia => false,
+        PurgeMode::DeleteMediaIfUnreferenced => remaining_refs == 0 && !path.is_empty(),
     };
     // Only a `ready` row's `current_path` points at a published mezzanine.
     // For `processing` and `error` rows it is still the *source* file, so the
@@ -1915,6 +2653,41 @@ pub struct JobRecoveryReport {
     pub failed_exhausted: usize,
 }
 
+/// Forget a finished job row.
+///
+/// The durable half of dismissing a job. The in-memory queue is the live view;
+/// this stops the record coming back the next time the service starts and
+/// repopulates from `transcode_jobs`.
+pub async fn delete_durable_job(pool: &SqlitePool, id: &str) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM transcode_jobs WHERE id = ?1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// Forget several finished job rows, in one statement.
+pub async fn delete_durable_jobs(pool: &SqlitePool, ids: &[String]) -> Result<u64, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    // Chunked because SQLite's default parameter limit is 999 and a busy day
+    // can leave more failed jobs than that.
+    let mut total = 0;
+    for chunk in ids.chunks(500) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("DELETE FROM transcode_jobs WHERE id IN ({})", placeholders);
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        total += q.execute(pool).await?.rows_affected();
+    }
+    Ok(total)
+}
+
 pub async fn recover_stale_jobs(pool: &SqlitePool) -> Result<JobRecoveryReport, sqlx::Error> {
     let mut report = JobRecoveryReport::default();
     let now = chrono::Utc::now().to_rfc3339();
@@ -2178,6 +2951,8 @@ pub struct DbAssetSummary {
     pub keyframe_safe_start_ms: i64,
     pub keyframe_count: usize,
     pub warnings: Vec<String>,
+    /// See [`is_retry_suppressed`].
+    pub retry_suppressed: bool,
     pub is_subclip: bool,
     pub parent_uuid: Option<String>,
     pub deleted_at: Option<String>,
@@ -2200,7 +2975,13 @@ impl DbAssetSummary {
     /// `false` for the caller to fill in, off the runtime, for the page it is
     /// actually going to return.
     fn from_asset_row(a: MediaAsset) -> Self {
-        let is_subclip = a.trim_in_ms > 0
+        // `parent_uuid` is the fact; the rest is the inference that had to
+        // stand in for it before the column existed (T-2b). The name test in
+        // particular is a guess -- an asset an operator called "Subclip reel"
+        // is not one -- but it is kept for rows the startup adoption could not
+        // match to a parent.
+        let is_subclip = a.parent_uuid.is_some()
+            || a.trim_in_ms > 0
             || (a.trim_out_ms > 0 && a.trim_out_ms < a.duration_ms)
             || a.display_name.to_ascii_lowercase().contains("subclip")
             || a.display_name.to_ascii_lowercase().contains("sub-clip");
@@ -2244,8 +3025,9 @@ impl DbAssetSummary {
             keyframe_safe_start_ms: a.keyframe_safe_start_ms,
             keyframe_count,
             warnings,
+            retry_suppressed: is_retry_suppressed(a.qc_verdict_key.as_deref()),
             is_subclip,
-            parent_uuid: None,
+            parent_uuid: a.parent_uuid,
             deleted_at: a.deleted_at,
             sidecar_exists: false,
         }
@@ -2887,6 +3669,7 @@ mod tests {
             0,
             &[],
             "[]",
+            None,
         )
         .await
         .unwrap();
@@ -2894,7 +3677,7 @@ mod tests {
         assert!(video_path.exists());
         assert!(sidecar_path.exists());
 
-        let outcome = purge_asset_in_target(&pool, uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
+        let outcome = purge_asset_in_target(&pool, uuid, PurgeMode::DeleteMediaIfUnreferenced, &temp_dir)
             .await
             .unwrap();
         assert_eq!(outcome.rows_deleted, 1);
@@ -2945,6 +3728,7 @@ mod tests {
             0,
             &[],
             "[]",
+            None,
         )
         .await
         .unwrap();
@@ -2971,7 +3755,7 @@ mod tests {
 
         // Purge parent only
         let outcome =
-            purge_asset_in_target(&pool, parent_uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
+            purge_asset_in_target(&pool, parent_uuid, PurgeMode::DeleteMediaIfUnreferenced, &temp_dir)
                 .await
                 .unwrap();
         assert_eq!(outcome.rows_deleted, 1);
@@ -2996,7 +3780,7 @@ mod tests {
 
         // Now purge subclip (final reference)
         let outcome2 =
-            purge_asset_in_target(&pool, subclip_uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
+            purge_asset_in_target(&pool, subclip_uuid, PurgeMode::DeleteMediaIfUnreferenced, &temp_dir)
                 .await
                 .unwrap();
         assert_eq!(outcome2.rows_deleted, 1);
@@ -3049,6 +3833,7 @@ mod tests {
             0,
             &[],
             "[]",
+            None,
         )
         .await
         .unwrap();
@@ -3067,7 +3852,7 @@ mod tests {
             3
         );
 
-        let out = purge_asset_in_target(&pool, sub1, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
+        let out = purge_asset_in_target(&pool, sub1, PurgeMode::DeleteMediaIfUnreferenced, &temp_dir)
             .await
             .unwrap();
         assert_eq!(out.rows_deleted, 1);
@@ -3095,7 +3880,7 @@ mod tests {
             .await
             .unwrap();
 
-        let out = purge_asset_in_target(&pool, uuid, PurgeMode::PreserveReferencedMezzanine, &temp_dir)
+        let out = purge_asset_in_target(&pool, uuid, PurgeMode::DeleteMediaIfUnreferenced, &temp_dir)
             .await
             .unwrap();
         assert_eq!(out.rows_deleted, 1);
@@ -3346,7 +4131,7 @@ mod tests {
         insert_processing(&pool, uuid, 12345, None, "D:/target/clip1.mp4", "Clip 1")
             .await
             .unwrap();
-        mark_ready(&pool, uuid, "D:/target/clip1.mp4", 5000, true, 25.0, 25, 1, 125, 50, 0, &[], "[]")
+        mark_ready(&pool, uuid, "D:/target/clip1.mp4", 5000, true, 25.0, 25, 1, 125, 50, 0, &[], "[]", None)
             .await
             .unwrap();
         set_virtual_folder(&pool, uuid, "/Shows/Drama").await.unwrap();
@@ -3603,7 +4388,7 @@ mod tests {
         let result = purge_single_asset_with_context(
             &pool,
             uuid,
-            PurgeMode::PreserveReferencedMezzanine,
+            PurgeMode::DeleteMediaIfUnreferenced,
             Some(&temp_dir),
             None,
         )
@@ -3658,6 +4443,7 @@ mod tests {
             0,
             &[],
             "[]",
+            None,
         )
         .await
         .unwrap();
@@ -3666,7 +4452,7 @@ mod tests {
         let result = purge_single_asset_with_context(
             &pool,
             uuid,
-            PurgeMode::PreserveReferencedMezzanine,
+            PurgeMode::DeleteMediaIfUnreferenced,
             Some(&temp_dir),
             None,
         )
@@ -3708,7 +4494,7 @@ mod tests {
         let result = auto_purge_expired_with_context(
             &pool,
             14,
-            PurgeMode::PreserveReferencedMezzanine,
+            PurgeMode::DeleteMediaIfUnreferenced,
             None,
             None,
         )
@@ -3756,6 +4542,7 @@ mod tests {
         // A mix of statuses and one trashed row.
         mark_ready(
             &pool, "a-plain", "D:/target/news.mp4", 10_000, true, 25.0, 25, 1, 250, 50, 0, &[], "[]",
+            None,
         )
         .await
         .unwrap();
@@ -3773,6 +4560,7 @@ mod tests {
             0,
             &[],
             "[]",
+            None,
         )
         .await
         .unwrap();
@@ -3897,7 +4685,7 @@ mod tests {
 
         // 1. Insert master clip
         insert_processing(&pool, "asset-master", 1001, None, "D:/target/master.mp4", "Master 1").await.unwrap();
-        mark_ready(&pool, "asset-master", "D:/target/master.mp4", 10000, true, 25.0, 25, 1, 250, 50, 0, &["warning1".into()], "[]").await.unwrap();
+        mark_ready(&pool, "asset-master", "D:/target/master.mp4", 10000, true, 25.0, 25, 1, 250, 50, 0, &["warning1".into()], "[]", None).await.unwrap();
 
         // 2. Insert subclip
         create_subclip(&pool, "asset-sub", "asset-master", "Subclip 1", 1000, 5000, true, "[]").await.unwrap();
@@ -4100,6 +4888,852 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The second re-encode loop, and the one that survived every other fix.
+    ///
+    /// Media that cannot be ingested at all -- a codec ffmpeg will not take, a
+    /// file ffprobe rejects -- fails with no QC findings, so the QC rule does
+    /// not cover it. And the startup sweep *deletes* its row so the watcher
+    /// re-offers the file, which means a full encode attempt is spent on it
+    /// every single restart. Three such files sit in this station's watch
+    /// folder today.
+    #[tokio::test]
+    async fn media_that_cannot_be_ingested_is_not_retried_on_every_restart() {
+        let (pool, dir) = setup_test_pool().await;
+        let watch = dir.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+        let source = watch.join("unsupported.mxf");
+        std::fs::File::create(&source).unwrap();
+        let path = source.to_string_lossy().to_string();
+
+        // The shape those three rows have: error, never published, source still
+        // sitting in the watch folder.
+        insert_processing(&pool, "bad", 910_010, Some("sha-bad"), &path, "Bad")
+            .await
+            .unwrap();
+        mark_error_permanent(&pool, "bad", "key-now").await.unwrap();
+
+        let key_for = |sha: &str| {
+            if sha == "sha-bad" {
+                "key-now".to_string()
+            } else {
+                format!("key-{}", sha)
+            }
+        };
+
+        // Restart: the sweep leaves it alone instead of handing it back.
+        let out = recover_failed_assets(&pool, &watch, true, key_for)
+            .await
+            .unwrap();
+        assert_eq!(out.kept_permanent, 1);
+        assert_eq!(out.purged_for_retry, 0, "it must not be queued again");
+        assert!(find_by_uuid(&pool, "bad").await.unwrap().is_some());
+
+        // ...and again, and again.
+        let again = recover_failed_assets(&pool, &watch, true, key_for)
+            .await
+            .unwrap();
+        assert_eq!(again.kept_permanent, 1);
+        assert_eq!(again.purged_for_retry, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same sweep must still retry everything it used to. A permanent
+    /// verdict is scoped to the bytes and the settings that produced it.
+    #[tokio::test]
+    async fn a_changed_file_or_changed_settings_is_still_retried() {
+        let (pool, dir) = setup_test_pool().await;
+        let watch = dir.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+
+        for (uuid, sha, name) in [
+            ("settings-moved", "sha-a", "a.mxf"),
+            ("transient", "sha-b", "b.mxf"),
+        ] {
+            let source = watch.join(name);
+            std::fs::File::create(&source).unwrap();
+            insert_processing(
+                &pool,
+                uuid,
+                910_011,
+                Some(sha),
+                &source.to_string_lossy(),
+                uuid,
+            )
+            .await
+            .unwrap();
+        }
+        // One was judged permanent under settings that have since changed...
+        mark_error_permanent(&pool, "settings-moved", "key-old")
+            .await
+            .unwrap();
+        // ...the other failed transiently and carries no verdict at all.
+        mark_error(&pool, "transient").await.unwrap();
+
+        let out = recover_failed_assets(&pool, &watch, true, |_| "key-new".to_string())
+            .await
+            .unwrap();
+        assert_eq!(out.kept_permanent, 0);
+        assert_eq!(
+            out.purged_for_retry, 2,
+            "a settings change, and an unjudged failure, both get another go"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-5 again. The demoted rows land in `error`, which the startup recovery
+    /// sweep also walks -- and that sweep deletes. A published mezzanine is not
+    /// the debris of a failed ingest, whatever its status says.
+    #[tokio::test]
+    async fn the_recovery_sweep_does_not_delete_a_published_qc_failure() {
+        let (pool, dir) = setup_test_pool().await;
+        let watch = dir.join("watch");
+        std::fs::create_dir_all(&watch).unwrap();
+
+        // A QC-failed mezzanine whose file has since been deleted by hand.
+        insert_processing(&pool, "qc", 910_001, Some("aa"), "D:/w/a.ts", "A")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            "qc",
+            "D:/media/gone.mp4",
+            40_000,
+            false,
+            25.0,
+            25,
+            1,
+            1000,
+            50,
+            0,
+            &["duration_delta_exceeded".to_string()],
+            "[0,2000]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Genuine debris: never published, source gone.
+        insert_processing(&pool, "debris", 910_002, Some("bb"), "D:/w/vanished.ts", "B")
+            .await
+            .unwrap();
+        mark_error(&pool, "debris").await.unwrap();
+
+        let out = recover_failed_assets(&pool, &watch, true, |_| "unused".to_string())
+            .await
+            .unwrap();
+        assert_eq!(out.purged_dead, 1, "the debris goes");
+        assert_eq!(out.kept_dead, 1, "the published failure stays");
+        assert!(find_by_uuid(&pool, "qc").await.unwrap().is_some());
+        assert!(find_by_uuid(&pool, "debris").await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Opening the registry must not change it. The ownership guard runs after
+    /// the pool is open -- it needs this registry's identity, which lives in the
+    /// registry -- so a start that is about to be refused opens the database
+    /// first. It must find it exactly as it left it.
+    #[tokio::test]
+    async fn opening_the_registry_does_not_rewrite_any_rows() {
+        let (pool, dir) = setup_test_pool().await;
+        let db_path = dir.join("test.db");
+
+        // A row in the state the migration exists to correct, written past the
+        // trigger the way a previous version would have left it on disk.
+        insert_processing(&pool, "legacy", 920_001, Some("aa"), "D:/w/a.ts", "A")
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE media_assets SET mezzanine_ok = 0, duration_ms = 40000 WHERE uuid = 'legacy'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DROP TRIGGER trg_media_assets_ready_requires_mezzanine_update")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE media_assets SET status = 'ready' WHERE uuid = 'legacy'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(pool);
+
+        // Re-open: additive only. The bad row is still exactly as it was.
+        let pool = init_pool(&db_path).await.unwrap();
+        assert_eq!(
+            find_by_uuid(&pool, "legacy").await.unwrap().unwrap().status,
+            "ready",
+            "opening the registry must not rewrite rows -- the start may yet be refused"
+        );
+
+        // And the data migration, run once ownership is established, corrects it.
+        run_data_migrations(&pool, &db_path).await.unwrap();
+        assert_eq!(
+            find_by_uuid(&pool, "legacy").await.unwrap().unwrap().status,
+            "error"
+        );
+
+        // Idempotent.
+        run_data_migrations(&pool, &db_path).await.unwrap();
+        assert_eq!(
+            find_by_uuid(&pool, "legacy").await.unwrap().unwrap().status,
+            "error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-5. The contradiction that had the same asset red in the library and
+    /// green in the rundown can no longer be written, by anyone.
+    #[tokio::test]
+    async fn ready_with_a_failed_mezzanine_cannot_be_written() {
+        let (pool, dir) = setup_test_pool().await;
+
+        insert_processing(&pool, "qc-fail", 900_001, Some("aa"), "D:/w/a.mxf", "A")
+            .await
+            .unwrap();
+
+        // The publish path: a failed QC lands as `error`, keeping every scrap
+        // of metadata that says why.
+        mark_ready(
+            &pool,
+            "qc-fail",
+            "D:/media/a.mp4",
+            84_520,
+            false,
+            25.0,
+            25,
+            1,
+            2113,
+            50,
+            0,
+            &["duration_delta_exceeded".to_string()],
+            "[0,2000,4000]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let a = find_by_uuid(&pool, "qc-fail").await.unwrap().unwrap();
+        assert_eq!(a.status, "error", "a QC-failed mezzanine is not `ready`");
+        assert!(!a.mezzanine_ok);
+        assert_eq!(a.duration_ms, 84_520, "but it keeps its real metadata");
+        assert_eq!(a.keyframe_offsets_json, "[0,2000,4000]");
+
+        // And the back door is shut too: no hand-run UPDATE, no future writer,
+        // no restore path can put the row back into the impossible state.
+        let forced = sqlx::query("UPDATE media_assets SET status = 'ready' WHERE uuid = ?1")
+            .bind("qc-fail")
+            .execute(&pool)
+            .await;
+        assert!(
+            forced.is_err(),
+            "the schema must refuse `ready` on a failed mezzanine, not just the publish path"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-5 again, from the other side: a passing encode is still `ready`.
+    #[tokio::test]
+    async fn a_passing_mezzanine_is_still_published_as_ready() {
+        let (pool, dir) = setup_test_pool().await;
+        insert_processing(&pool, "good", 900_002, Some("bb"), "D:/w/b.mxf", "B")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool, "good", "D:/media/b.mp4", 1_000, true, 25.0, 25, 1, 25, 50, 0, &[], "[0]",
+            None,
+        )
+        .await
+        .unwrap();
+        let a = find_by_uuid(&pool, "good").await.unwrap().unwrap();
+        assert_eq!(a.status, "ready");
+        assert_eq!(a.trim_in_ms, 0);
+        assert_eq!(a.trim_out_ms, 1_000);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-2b. The loop an operator started by cutting a sub-clip: the sub-clip
+    /// carries its parent's fingerprint and path with a NULL `source_sha256`,
+    /// so the dedupe read it as an unconfirmable legacy row and re-ingested the
+    /// programme it was cut from.
+    #[tokio::test]
+    async fn a_subclip_is_never_the_dedupe_candidate_for_its_parents_source() {
+        let (pool, dir) = setup_test_pool().await;
+        let fp = 900_003;
+
+        insert_processing(&pool, "parent", fp, Some("cafe"), "D:/w/p.mxf", "Parent")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            "parent",
+            "D:/media/p.mp4",
+            84_520,
+            true,
+            25.0,
+            25,
+            1,
+            2113,
+            50,
+            0,
+            &[],
+            "[0,2000,4000]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        create_subclip(
+            &pool,
+            "child",
+            "parent",
+            "Parent (Sub-clip)",
+            4_000,
+            8_000,
+            true,
+            "[]",
+        )
+        .await
+        .unwrap()
+        .expect("the sub-clip must be created");
+
+        let child = find_by_uuid(&pool, "child").await.unwrap().unwrap();
+        assert_eq!(child.parent_uuid.as_deref(), Some("parent"));
+        assert_eq!(
+            child.fingerprint, fp,
+            "it does share the parent's fingerprint"
+        );
+        assert!(
+            child.source_sha256.is_none(),
+            "and has no source hash of its own"
+        );
+
+        // Which is exactly why the lookup has to exclude it. `rowid DESC` alone
+        // would have *preferred* it -- sub-clips are created after parents.
+        let candidate = find_by_fingerprint(&pool, fp).await.unwrap().unwrap();
+        assert_eq!(
+            candidate.uuid, "parent",
+            "the dedupe candidate must be the full-length asset, never a sub-clip"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Publish a QC failure: `mark_ready` with `mezzanine_ok = false`, which
+    /// lands the row at `error` (T-5) carrying the findings that say why.
+    async fn failed_row(
+        pool: &SqlitePool,
+        uuid: &str,
+        fingerprint: i64,
+        sha: &str,
+        findings: &[&str],
+        verdict_key: Option<&str>,
+    ) {
+        insert_processing(pool, uuid, fingerprint, Some(sha), "D:/w/x.ts", uuid)
+            .await
+            .unwrap();
+        let findings: Vec<String> = findings.iter().map(|s| s.to_string()).collect();
+        mark_ready(
+            pool,
+            uuid,
+            &format!("D:/media/{}.mp4", uuid),
+            40_000,
+            false,
+            25.0,
+            25,
+            1,
+            1000,
+            50,
+            0,
+            &findings,
+            "[0,2000]",
+            verdict_key,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// T-2. Eleven rows for three sources, three more on every restart: the
+    /// dedupe refused to recognise a QC-failed row as a duplicate, re-encoded
+    /// it, reached the identical verdict, and wrote another row.
+    ///
+    /// The verdict is keyed on the bytes **and** the settings, so it is a
+    /// re-checkable fact rather than a blacklist.
+    #[tokio::test]
+    async fn known_bad_media_is_not_re_encoded_under_the_same_settings() {
+        let (pool, dir) = setup_test_pool().await;
+
+        failed_row(
+            &pool,
+            "bad",
+            900_004,
+            "beef",
+            &["duration_delta_exceeded"],
+            Some("key-A"),
+        )
+        .await;
+
+        // Same media, same settings -> the same verdict. Do not encode it again.
+        let hit = find_reproducible_qc_failure(&pool, "key-A", "beef")
+            .await
+            .unwrap()
+            .expect("known-bad media under unchanged settings must be recognised");
+        assert_eq!(hit.uuid, "bad");
+
+        // Different media entirely: neither the verdict key nor the bytes
+        // match, so there is nothing known about it and it gets encoded.
+        assert!(
+            find_reproducible_qc_failure(&pool, "key-of-other-media", "f00d")
+                .await
+                .unwrap()
+                .is_none(),
+            "an unrelated source must not be caught by someone else's verdict"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The point of keying on the settings. An operator who widens
+    /// `max_duration_delta_ms` is doing it *precisely* to accept the files that
+    /// keep failing on it; finding them still skipped would be the worse bug.
+    #[tokio::test]
+    async fn changing_the_settings_gives_failed_media_another_hearing() {
+        let (pool, dir) = setup_test_pool().await;
+
+        failed_row(
+            &pool,
+            "bad",
+            900_020,
+            "beef",
+            &["duration_delta_exceeded"],
+            Some("settings-before"),
+        )
+        .await;
+
+        assert!(
+            find_reproducible_qc_failure(&pool, "settings-before", "beef")
+                .await
+                .unwrap()
+                .is_some(),
+            "unchanged settings: skip"
+        );
+        assert!(
+            find_reproducible_qc_failure(&pool, "settings-after", "beef")
+                .await
+                .unwrap()
+                .is_none(),
+            "the settings that reached this verdict have changed, so it must be re-examined"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failure that says more about the machine than the media stays
+    /// retryable. Blacklisting a good master because ffprobe was mid-upgrade is
+    /// not a trade worth making.
+    #[tokio::test]
+    async fn an_environmental_failure_is_never_permanent() {
+        let (pool, dir) = setup_test_pool().await;
+
+        failed_row(
+            &pool,
+            "toolchain",
+            900_021,
+            "aaaa",
+            &["keyframe_scan_failed"],
+            Some("key-E"),
+        )
+        .await;
+        assert!(
+            find_reproducible_qc_failure(&pool, "key-E", "aaaa")
+                .await
+                .unwrap()
+                .is_none(),
+            "ffprobe failing to run is not evidence about the programme"
+        );
+
+        // But the same row alongside a real finding is still bad media.
+        failed_row(
+            &pool,
+            "both",
+            900_022,
+            "bbbb",
+            &["keyframe_scan_failed", "duration_delta_exceeded"],
+            Some("key-B"),
+        )
+        .await;
+        assert!(
+            find_reproducible_qc_failure(&pool, "key-B", "bbbb")
+                .await
+                .unwrap()
+                .is_some(),
+            "one reproducible finding is enough"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Rows published before `qc_verdict_key` existed -- the eleven already in
+    /// the registry -- have no record of the settings that judged them, so the
+    /// much narrower source-attributable test applies to them instead.
+    #[tokio::test]
+    async fn legacy_rows_fall_back_to_the_narrow_test_and_then_converge() {
+        let (pool, dir) = setup_test_pool().await;
+
+        failed_row(&pool, "legacy", 900_023, "cccc", &["duration_delta_exceeded"], None).await;
+        failed_row(&pool, "unclear", 900_024, "dddd", &["missing_faststart"], None).await;
+
+        let hit = find_reproducible_qc_failure(&pool, "any-key", "cccc")
+            .await
+            .unwrap()
+            .expect("a legacy duration-delta failure is still known-bad media");
+        assert_eq!(hit.uuid, "legacy");
+        assert!(hit.qc_verdict_key.is_none());
+
+        assert!(
+            find_reproducible_qc_failure(&pool, "any-key", "dddd")
+                .await
+                .unwrap()
+                .is_none(),
+            "without a record of the settings, only an unmistakable finding counts"
+        );
+
+        // Stamping the key converges the legacy row onto the precise test, so a
+        // later settings change releases it too.
+        adopt_qc_verdict_key(&pool, "legacy", "key-now").await.unwrap();
+        assert!(find_reproducible_qc_failure(&pool, "key-now", "cccc")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            find_reproducible_qc_failure(&pool, "key-later", "cccc")
+                .await
+                .unwrap()
+                .is_none(),
+            "once stamped, a settings change releases a legacy row as well"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The operator's override must actually release the media.
+    ///
+    /// Clearing the key to NULL looked right and did nothing: a NULL key drops
+    /// the row into the *legacy* branch, which matches on the source hash alone
+    /// and catches exactly the `duration_delta_exceeded` rows an operator is
+    /// most likely to be overruling. The sentinel keeps it out of both branches.
+    #[tokio::test]
+    async fn overruling_a_verdict_really_does_release_the_media() {
+        let (pool, dir) = setup_test_pool().await;
+        failed_row(&pool, "held", 900_030, "beef", &["duration_delta_exceeded"], Some("key-A")).await;
+
+        assert!(find_reproducible_qc_failure(&pool, "key-A", "beef")
+            .await
+            .unwrap()
+            .is_some());
+
+        assert!(clear_qc_verdict(&pool, "held").await.unwrap());
+        assert!(
+            find_reproducible_qc_failure(&pool, "key-A", "beef")
+                .await
+                .unwrap()
+                .is_none(),
+            "the row must not be caught by the verdict branch..."
+        );
+        assert!(
+            find_reproducible_qc_failure(&pool, "any-other-key", "beef")
+                .await
+                .unwrap()
+                .is_none(),
+            "...nor fall through into the legacy source-hash branch"
+        );
+
+        // Idempotent, and honest about it.
+        assert!(!clear_qc_verdict(&pool, "held").await.unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `retry_suppressed` on the wire must mean what it says: that the service
+    /// will actually skip this media. It is what the UI badge renders, and a
+    /// badge that says "won't retry" about media the service happily retries is
+    /// worse than no badge.
+    #[test]
+    fn retry_suppressed_matches_what_the_service_actually_does() {
+        // No verdict at all: nothing is being skipped.
+        assert!(!is_retry_suppressed(None));
+        // A live verdict: skipped.
+        assert!(is_retry_suppressed(Some("a4f9...")));
+        // An operator's override: released, and the badge must go with it.
+        assert!(!is_retry_suppressed(Some(QC_VERDICT_CLEARED)));
+    }
+
+    /// A row with no recorded findings is not evidence of anything. Those are
+    /// the failed *jobs* -- an encode that never reached QC -- and the retry
+    /// classifier owns them.
+    #[tokio::test]
+    async fn a_failure_with_no_findings_is_not_treated_as_bad_media() {
+        let (pool, dir) = setup_test_pool().await;
+        failed_row(&pool, "nofindings", 900_025, "eeee", &[], Some("key-N")).await;
+        assert!(find_reproducible_qc_failure(&pool, "key-N", "eeee")
+            .await
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A passing asset is never a reason to skip anything.
+    #[tokio::test]
+    async fn a_healthy_asset_is_not_a_reproducible_failure() {
+        let (pool, dir) = setup_test_pool().await;
+        insert_processing(&pool, "good", 900_026, Some("ffff"), "D:/w/g.mxf", "G")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool, "good", "D:/media/g.mp4", 1_000, true, 25.0, 25, 1, 25, 50, 0, &[], "[0]", None,
+        )
+        .await
+        .unwrap();
+        assert!(find_reproducible_qc_failure(&pool, "whatever", "ffff")
+            .await
+            .unwrap()
+            .is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-5 + T-2 together. Making a QC-failed row `error` walked it into the
+    /// purge's `error` arm, which deletes -- and its mezzanine is a real file
+    /// in the Caspar media folder that nothing would then reference.
+    #[tokio::test]
+    async fn a_published_but_qc_failed_mezzanine_survives_a_re_ingest_sweep() {
+        let (pool, dir) = setup_test_pool().await;
+        let file = dir.join("qc_failed.mp4");
+        std::fs::File::create(&file).unwrap();
+        let fp = 900_006;
+
+        insert_processing(&pool, "published", fp, Some("ee"), "D:/w/e.ts", "E")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            "published",
+            &file.to_string_lossy(),
+            40_000,
+            false,
+            25.0,
+            25,
+            1,
+            1000,
+            50,
+            0,
+            &["duration_delta_exceeded".to_string()],
+            "[0,2000]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The debris of a genuinely failed ingest, by contrast: never
+        // published, so no duration, and its `current_path` is still the source.
+        insert_processing(&pool, "debris", fp, Some("ee"), "D:/w/e.ts", "E")
+            .await
+            .unwrap();
+        mark_error(&pool, "debris").await.unwrap();
+
+        let outcome =
+            purge_unusable_rows_by_fingerprint(&pool, fp, |p| std::path::Path::new(p).exists())
+                .await
+                .unwrap();
+        assert_eq!(
+            outcome,
+            FingerprintPurge {
+                deleted: 1,
+                demoted: 0,
+                protected: 1
+            }
+        );
+        assert!(
+            find_by_uuid(&pool, "published").await.unwrap().is_some(),
+            "a published mezzanine is someone's asset even when it is not airable"
+        );
+        assert!(find_by_uuid(&pool, "debris").await.unwrap().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-4. `ready` must mean the file is there, in both directions.
+    #[tokio::test]
+    async fn the_reconcile_moves_assets_between_ready_and_missing() {
+        let (pool, dir) = setup_test_pool().await;
+
+        insert_processing(&pool, "here", 900_007, Some("11"), "D:/w/f.mxf", "F")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool, "here", "D:/media/f.mp4", 1_000, true, 25.0, 25, 1, 25, 50, 0, &[], "[0]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The share is down.
+        let gone = reconcile_missing_paths(&pool, |_| false).await.unwrap();
+        assert_eq!(gone.went_missing, 1);
+        assert_eq!(gone.missing_total, 1);
+        assert_eq!(
+            find_by_uuid(&pool, "here").await.unwrap().unwrap().status,
+            "missing"
+        );
+
+        // A second pass while it is still down must not double-count.
+        let still = reconcile_missing_paths(&pool, |_| false).await.unwrap();
+        assert_eq!(still.went_missing, 0);
+        assert_eq!(still.missing_total, 1);
+
+        // The share is back.
+        let back = reconcile_missing_paths(&pool, |_| true).await.unwrap();
+        assert_eq!(back.came_back, 1);
+        assert_eq!(back.missing_total, 0);
+        assert_eq!(
+            find_by_uuid(&pool, "here").await.unwrap().unwrap().status,
+            "ready"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reconcile must leave the states it does not own alone: an `error`
+    /// row's reason is worth more than "the file is not there", and a
+    /// `processing` row's `current_path` is still its *source*.
+    #[tokio::test]
+    async fn the_reconcile_leaves_error_and_processing_rows_alone() {
+        let (pool, dir) = setup_test_pool().await;
+
+        insert_processing(&pool, "working", 900_008, Some("22"), "D:/w/g.mxf", "G")
+            .await
+            .unwrap();
+        insert_processing(&pool, "broken", 900_009, Some("33"), "D:/w/h.mxf", "H")
+            .await
+            .unwrap();
+        mark_error(&pool, "broken").await.unwrap();
+
+        let r = reconcile_missing_paths(&pool, |_| false).await.unwrap();
+        assert_eq!(r.went_missing, 0);
+        assert_eq!(
+            find_by_uuid(&pool, "working").await.unwrap().unwrap().status,
+            "processing"
+        );
+        assert_eq!(
+            find_by_uuid(&pool, "broken").await.unwrap().unwrap().status,
+            "error"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// T-1c. The backfill has to find both shapes of wrong row: the ordinary
+    /// one whose safe start is a GOP late, and the T-7 one whose offsets list
+    /// is empty and whose safe start is already 0.
+    #[tokio::test]
+    async fn the_rescan_selects_both_shapes_of_bad_keyframe_row() {
+        let (pool, dir) = setup_test_pool().await;
+
+        // Wrong: the keyframe at 0 was dropped.
+        insert_processing(&pool, "late", 900_010, Some("44"), "D:/w/i.mxf", "I")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            "late",
+            "D:/media/i.mp4",
+            84_520,
+            true,
+            25.0,
+            25,
+            1,
+            2113,
+            50,
+            2000,
+            &[],
+            "[2000,4000,6000]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Wrong differently: the scan produced nothing and QC passed anyway.
+        insert_processing(&pool, "empty", 900_011, Some("55"), "D:/w/j.mxf", "J")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool, "empty", "D:/media/j.mp4", 1_000, true, 25.0, 25, 1, 25, 50, 0, &[], "[]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Correct, and must be left out of the sweep entirely.
+        insert_processing(&pool, "fine", 900_012, Some("66"), "D:/w/k.mxf", "K")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            "fine",
+            "D:/media/k.mp4",
+            4_000,
+            true,
+            25.0,
+            25,
+            1,
+            100,
+            50,
+            0,
+            &[],
+            "[0,2000]",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let targets = keyframe_rescan_targets(&pool).await.unwrap();
+        let paths: Vec<&str> = targets.iter().map(|t| t.current_path.as_str()).collect();
+        assert!(paths.contains(&"D:/media/i.mp4"));
+        assert!(paths.contains(&"D:/media/j.mp4"));
+        assert!(!paths.contains(&"D:/media/k.mp4"));
+
+        // And a correction reaches every row that plays the file, which is how
+        // a sub-clip's copy of its parent's offsets gets fixed with it.
+        create_subclip(
+            &pool,
+            "late-cut",
+            "late",
+            "I (Sub-clip)",
+            4_000,
+            8_000,
+            true,
+            "[]",
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let n = apply_keyframe_rescan(&pool, "D:/media/i.mp4", 0, "[0,2000,4000,6000]")
+            .await
+            .unwrap();
+        assert_eq!(n, 2, "the parent and its sub-clip");
+        for uuid in ["late", "late-cut"] {
+            let a = find_by_uuid(&pool, uuid).await.unwrap().unwrap();
+            assert_eq!(a.keyframe_safe_start_ms, 0);
+            assert_eq!(a.keyframe_offsets_json, "[0,2000,4000,6000]");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn the_source_hash_round_trips_and_is_null_for_legacy_rows() {
         let (pool, dir) = setup_test_pool().await;
@@ -4111,13 +5745,22 @@ mod tests {
             .await
             .unwrap();
 
-        let a = find_by_fingerprint(&pool, 1).await.unwrap().unwrap();
-        let b = find_by_fingerprint(&pool, 2).await.unwrap().unwrap();
+        let a = find_by_uuid(&pool, "hashed").await.unwrap().unwrap();
+        let b = find_by_uuid(&pool, "legacy").await.unwrap().unwrap();
         assert_eq!(a.source_sha256.as_deref(), Some("deadbeef"));
-        assert_eq!(
-            b.source_sha256, None,
-            "a row with no stored hash must read back as None, which is what \
-             makes dedup refuse to confirm rather than guess"
+        assert!(
+            b.source_sha256.is_none(),
+            "a row with no stored hash must read back as None, which is what makes dedup              refuse to confirm rather than guess"
+        );
+
+        // And the dedupe lookup itself now skips the hashless row (T-2b). It
+        // could never be confirmed as a duplicate anyway -- there is nothing to
+        // compare against -- so returning it only ever cost a re-ingest, and it
+        // is the same shape a sub-clip has, which cost a great deal more.
+        assert!(find_by_fingerprint(&pool, 1).await.unwrap().is_some());
+        assert!(
+            find_by_fingerprint(&pool, 2).await.unwrap().is_none(),
+            "a row with no source_sha256 is not a dedupe candidate"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

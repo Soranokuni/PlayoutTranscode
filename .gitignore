@@ -22,6 +22,7 @@ target/
 # AI Agent Instructions, Handoffs, and Planning Documents
 # ==============================================================================
 AGENTS.md
+CLAUDE.md
 .agents/
 .kilo/
 .gemini/
@@ -64,6 +65,8 @@ test_stdout.txt
 *.db-shm
 *.db-wal
 *.db-journal
+# Hand-made copies taken before an upgrade: `*.db` does not match these.
+*.db.*
 
 # Local test media directories
 /in/

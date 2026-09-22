@@ -12,6 +12,16 @@
         <span v-if="retryingAll">Retrying…</span>
         <span v-else>Retry all failed ({{ failed.length }})</span>
       </button>
+      <button
+        v-if="failed.length"
+        class="btn btn-clear-all"
+        :disabled="clearingAll"
+        :title="`Remove ${failed.length} failed job record${failed.length === 1 ? '' : 's'} from this list. Assets and media files are not touched.`"
+        @click="onClearAll"
+      >
+        <span v-if="clearingAll">Clearing…</span>
+        <span v-else>Clear all ({{ failed.length }})</span>
+      </button>
       <span
         v-if="retryMsg"
         class="retry-msg"
@@ -76,6 +86,16 @@
               <span v-if="retryingId === job.id">…</span>
               <span v-else>Retry</span>
             </button>
+            <button
+              class="btn btn-mini btn-dismiss"
+              :disabled="dismissingId === job.id"
+              :aria-label="`Dismiss the failed job for ${shortFileName(job.input_path)}`"
+              title="Remove this job record from the list. The asset and its media file are not touched."
+              @click="onDismiss(job.id)"
+            >
+              <span v-if="dismissingId === job.id">…</span>
+              <span v-else aria-hidden="true">✕</span>
+            </button>
           </div>
         </div>
         <div class="error-summary">{{ shortError(job.error) }}</div>
@@ -138,6 +158,8 @@ const emit = defineEmits<{
   (e: 'retry', id: string): void
   (e: 'cancel', id: string): void
   (e: 'retry-all'): void
+  (e: 'dismiss', id: string): void
+  (e: 'clear-all'): void
 }>()
 
 function shortFileName(path: string) {
@@ -188,6 +210,8 @@ function clockTime(iso: string): string {
 
 const retryingId = ref<string | null>(null)
 const cancellingId = ref<string | null>(null)
+const dismissingId = ref<string | null>(null)
+const clearingAll = ref(false)
 const retryingAll = ref(false)
 const retryMsg = ref('')
 const retryOk = ref(false)
@@ -210,6 +234,24 @@ async function onCancel(id: string) {
   }
 }
 
+async function onDismiss(id: string) {
+  dismissingId.value = id
+  try {
+    emit('dismiss', id)
+  } finally {
+    setTimeout(() => { dismissingId.value = null }, 400)
+  }
+}
+
+async function onClearAll() {
+  clearingAll.value = true
+  try {
+    emit('clear-all')
+  } finally {
+    setTimeout(() => { clearingAll.value = false }, 600)
+  }
+}
+
 async function onRetryAll() {
   retryingAll.value = true
   retryMsg.value = ''
@@ -224,6 +266,25 @@ defineExpose({ showRetryMsg: (msg: string, ok: boolean) => { retryMsg.value = ms
 </script>
 
 <style scoped>
+/* Quieter than Retry: clearing the list is the housekeeping action, not the
+   one an operator came here to press. */
+.btn-clear-all {
+  background: transparent;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-secondary);
+}
+.btn-clear-all:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+.btn-dismiss {
+  min-width: 28px;
+  padding-inline: 8px;
+  color: var(--text-secondary);
+}
+.btn-dismiss:hover:not(:disabled) {
+  color: var(--accent-crimson);
+}
 .panel {
   background: var(--bg-panel);
   border: 1px solid var(--border-subtle);

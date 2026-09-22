@@ -25,7 +25,24 @@ what to change and what happens if you do not.
 >   operator data today: **§7.2.1**.
 > - **§4.1 — `GET /api/assets` now carries an `ETag`.** Entirely optional.
 >
-> Items 1–6 in the table below are unchanged and still outstanding.
+> Items 1-6 in the table below are unchanged and still outstanding.
+
+> **Update, 2026-09-22 - the reliability handoff has been implemented.** This is
+> the transcoder's answer to `playouttranscodehandoff.md` (T-1 through T-7). It
+> is written up in full in **§13**. The short version for you:
+>
+> - **Nothing you parse changes shape.** No endpoint, field, or type is removed
+>   or renamed.
+> - **`keyframe_safe_start_ms` is now correct**, and every existing asset has
+>   been re-scanned. It was one GOP too late on every asset this service ever
+>   produced. You have already stopped applying it as a floor on the IN point
+>   (F-2), which was the right call and stays right.
+> - **`ready` now always means `mezzanine_ok = true`.** A QC-failed mezzanine is
+>   `error`. This is what your v2 mapping already assumed, so your
+>   `apply_strict_readiness` workaround becomes redundant rather than wrong -
+>   keep it, it costs nothing and it is defence in depth.
+> - **`missing` is now a status the server writes.** Your `IngestorStatus` union
+>   already has the branch. See §13.4.
 
 **The short version.** There are **two mandatory one-line changes**, both in
 `src-tauri/src/ingestor_api.rs`. Everything else is optional, informational, or
@@ -899,3 +916,195 @@ Added by the 2026-09-18 change set, in priority order:
    above (SSE `resync`, `error_category`, the retry semantics) only pay off if
    PlayOut surfaces ingest progress. If it never will, we can stop documenting
    them for you.
+
+---
+
+## 13. The reliability handoff, implemented (2026-09-22)
+
+This section answers `playouttranscodehandoff.md` item by item. **No wire
+contract changes shape.** Read §13.4 if you read nothing else — it is the only
+item that puts a value on the wire you were not seeing before.
+
+### 13.1 T-1 — `keyframe_safe_start_ms` was wrong on every asset. Fixed and backfilled.
+
+The keyframe scan parsed each line of ffprobe's CSV as a float. ffprobe appends
+an empty section — a bare trailing comma — to any frame carrying side data, and
+the first frame of a real mezzanine usually does, so the first line was
+`0.000000,`, which is not a valid float. The keyframe at pts 0 was dropped from
+every asset, `keyframe_safe_start_ms` became 2000 on 1080i50, and the station
+cut the first two seconds off every clip.
+
+Three things changed:
+
+- The parse reads the **first CSV field**, not the whole line.
+- The scan now asks for `packet=pts_time,flags` rather than `-skip_frame nokey
+  frame=pts_time`. It is ~3.5x faster on an 84-second mezzanine and the flag
+  lives in its own field, so the trailing-comma class of bug cannot recur.
+  Packets arrive in *decode* order, so the offsets are sorted before they are
+  stored or served.
+- A one-shot startup backfill re-scans every affected mezzanine and rewrites
+  `keyframe_safe_start_ms`, `keyframe_offsets_json` and the sidecar. It is
+  idempotent and its result is on `/api/v2/diagnostics` under
+  `keyframe_backfill`.
+
+Measured on this station's registry: 35 files, 36 rows (the extra is a
+sub-clip), every safe start now 0, second pass a no-op.
+
+**What this means for you:** nothing to change. `keyframe_safe_start_ms` is now
+a number you *could* trust, but you should still not raise an IN point with it —
+see §13.7.
+
+**One visible consequence:** every `trim_in_not_keyframe_aligned` warning
+currently attached to a sub-clip whose IN is 0 was false, because 0 was not in
+the parent's keyframe list. Those stop.
+
+### 13.2 T-2 / T-2b — the re-ingest loops are closed.
+
+Two distinct loops, both fixed together because the fix for one makes the other
+worse if applied alone.
+
+**The QC loop.** A QC-failed mezzanine was never recognised as a duplicate, so
+the same source was re-transcoded on every service start, failed the same check,
+and landed as another row. Eleven rows for three sources by the time it was
+caught.
+
+Now a QC verdict is *recorded* rather than rediscovered. Each failed row stores a
+`qc_verdict_key` — a hash of the source SHA-256 together with the encoding
+configuration and the validation policy — and a source whose key matches an
+existing failure is **skipped**, with the reason, exactly as a
+byte-identical-and-ready source already was. You will see these as `skipped`
+jobs, which you already handle.
+
+It is a re-checkable conclusion, not a blacklist: replacing the file, or changing
+any encoding or validation setting, invalidates every stored verdict and the
+media is judged again. An operator who widens `max_duration_delta_ms`
+specifically to accept the files that keep failing on it gets exactly that.
+
+A third loop, found while implementing this and **not** in the handoff, worked
+the same way one layer down: media that ffmpeg or ffprobe refuses outright fails
+with no QC findings at all, and the startup recovery sweep *deleted* its row so
+the watcher would re-offer the file — spending a full encode attempt on every
+restart. Three such files sit in this station's watch folder. The sweep now
+respects the same verdict key. Nothing about this reaches your side; it is
+visible as `metrics.permanently_failed_assets` on `/api/v2/diagnostics`.
+
+**The sub-clip loop.** A sub-clip carries its parent's fingerprint and its
+parent's `current_path` with a NULL `source_sha256`. The dedupe lookup could
+return it as the candidate duplicate of its own parent's source, read the NULL
+hash as "cannot confirm", and re-ingest the whole programme. Making a sub-clip
+re-encoded the thing it was cut from. There is now a real `parent_uuid` column,
+and the lookup excludes sub-clips and orders deterministically.
+
+`parent_uuid` is populated on the v2 `DbAssetSummary`, where the field already
+existed and was always `null`. Existing sub-clips were adopted onto their
+parents at migration.
+
+### 13.3 T-5 — `ready` with `mezzanine_ok = false` is now impossible.
+
+The recommended option was taken: **a QC-failed mezzanine is `status = "error"`**.
+This is what your v2 library mapping already assumed, so nothing on your side
+has to change and the `IngestorStatus` union does not grow.
+
+It is enforced at the schema, by a pair of `BEFORE INSERT`/`BEFORE UPDATE`
+triggers, not just on the publish path — the contradiction was reachable by hand
+from the DB viewer.
+
+Such a row keeps all of its metadata: real duration, geometry, keyframes, and a
+`warnings` array naming what it failed on. That is how an operator finds out
+why, and it is how the dedupe in §13.2 knows not to try again. It is also how
+you tell a QC failure (`duration_ms > 0`, file on disk) from a failed ingest
+(`duration_ms = 0`).
+
+Your `apply_strict_readiness` is now belt and braces. Keep it.
+
+### 13.4 T-4 — `missing` is a real status. **This is the one to read.**
+
+The server now stats every published mezzanine at startup and every 120 s, and
+moves rows between `ready` and `missing` in both directions — a file that comes
+back, on a remounted share, returns to `ready`.
+
+**You will start seeing `status: "missing"` on the wire** for assets you
+previously saw as `ready`. Your `IngestorStatus` union already has the branch
+and your v2 mapping already routes it, so this should be transparent — but it is
+a value that genuinely was not being sent before, so it is worth one look.
+
+Treat it as not airable. Your own `verify_paths_exist` (F-1) stays useful: it is
+faster than a 120 s tick and it is authoritative for your own rundown.
+
+Counted on `/api/v2/diagnostics` as `metrics.missing_assets` (`-1` means the
+count could not be read, not "none missing").
+
+### 13.5 T-3 — a media folder can have only one owner.
+
+The service stamps its `target_folder` with its own registry identity and
+**refuses to start** against a stamp belonging to a different registry. This is
+the guard that would have made the two-registry incident impossible rather than
+merely survivable.
+
+Marker file: `.playouttranscode-registry.json` in the target folder. Deleting it
+is the documented way to hand a folder over deliberately.
+
+Nothing on your side changes. If a station's service will not start and the log
+says the media folder is owned by another registry, that is this, and the
+message names the file and both registries.
+
+### 13.6 T-7 — a mezzanine with no keyframes is no longer "verified".
+
+`verify_closed_gop` returns `true` when there is nothing to check, so a scan that
+produced no offsets passed the GOP test by default and the asset was published
+`mezzanine_ok = 1` with an empty keyframe list — a mezzanine nobody verified,
+flagged as verified. A failed scan is now a blocking `keyframe_scan_failed`
+finding, so such an asset is `error`, not `ready`.
+
+A related bug in the opposite direction: the sub-clip alignment check guarded on
+`!keyframe_offsets_json.is_empty()`, which tests the **string**, and the column's
+default is the two characters `[]`. So for a parent with no keyframes the guard
+passed, the parsed list was empty, and every sub-clip of it was stamped
+`trim_in_not_keyframe_aligned` on no evidence. It now tests the parsed list.
+
+(The handoff described this the other way round — as the check "silently
+skipping". It was warning, not skipping. The fix is the same.)
+
+### 13.7 T-6 — `If-None-Match` on the asset list is still yours.
+
+Unchanged and correct: the server sends a weak `ETag` on `GET /api/v2/assets`
+and honours `If-None-Match`. Nothing was added or removed. At 39 assets it does
+not matter; at 5000 it is the operator's UI stalling every 30 s. Build against
+the server's existing support.
+
+### 13.8 What did not change
+
+Confirmed against your consuming code, and left alone deliberately:
+
+- `POST /api/assets/{uuid}/subclip` — response shape and semantics unchanged. It
+  still does **not** snap the IN point, and should not: CasparCG's FFmpeg
+  producer seeks to the preceding keyframe and decodes forward, so a
+  non-keyframe IN is frame-accurate anyway, and raising it would silently cut
+  programme. The warning is advisory. (The reliability audit said the transcoder
+  already snapped. It never did, and nobody should go looking for the code.)
+- `POST /api/assets/batch` — shape, uuid validation, `MAX_BATCH_UUIDS = 500`, and
+  the 422 on duplicate uuids are all unchanged.
+- The v2 asset DTO — no field removed or renamed. `parent_uuid` now carries a
+  value where it was always `null`.
+
+### 13.9 New endpoints and one additive field (2026-09-22, operator UI work)
+
+Nothing here is required of PlayOut. Listed so the two sides agree on what the
+service now offers.
+
+| Endpoint | Purpose |
+|---|---|
+| `DELETE /api/jobs/{id}` | Dismiss one finished job record. `409` while it is still running. |
+| `DELETE /api/jobs/finished?state=failed` | Clear finished job records in bulk. |
+| `DELETE /api/assets/{uuid}/purge?delete_file=true\|false` | Choose per call whether the mezzanine goes with the row. Omitted = today's behaviour. |
+| `POST /api/assets/{uuid}/clear-verdict` | Release one asset from the known-bad-media skip. |
+
+**One additive field on the asset payload:** `retry_suppressed` (bool) — the
+service has recorded that this media already failed under the current settings
+and will skip it rather than encode it again. Ignore it if you have no use for
+it; if you ever want to surface "this will not be retried" in the rundown, read
+that field rather than inferring it from `status` and `warnings`, which do not
+change when the verdict is cleared.
+
+**One new SSE event:** `job_removed`, carrying `{ "ids": [...] }`. An unknown
+event is already a no-op for you, so nothing breaks either way.

@@ -739,6 +739,160 @@ fn is_confirmed_duplicate(
     }
 }
 
+/// The findings on a stored row that make its failure reproducible, joined for
+/// a log line or a skip reason.
+fn reproducible_qc_reason(warnings_json: &str) -> String {
+    let codes: Vec<String> = serde_json::from_str::<Vec<String>>(warnings_json)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| !db::ENVIRONMENTAL_QC_CODES.contains(&c.as_str()))
+        .collect();
+    if codes.is_empty() {
+        "a reproducible QC failure".to_string()
+    } else {
+        codes.join(", ")
+    }
+}
+
+/// Identify a QC verdict: *which bytes* were judged, and *under what settings*.
+///
+/// Both halves matter, and the second is the one that makes a permanent skip
+/// safe. A QC verdict is reproducible -- the pipeline probes a finished encode
+/// against its source under a fixed policy, so identical bytes under identical
+/// settings reach an identical verdict, and encoding it again is pure waste.
+/// But it is only reproducible *while the settings hold*. An operator who
+/// widens `max_duration_delta_ms` precisely in order to accept the files that
+/// keep failing on it must not find them still being skipped.
+///
+/// So the key covers everything that could change the answer: the source bytes,
+/// the encoding configuration (which decides the profile, the CRF, the GOP and
+/// the audio target) and the validation policy (which decides what counts as a
+/// failure). Change any of it and no stored verdict matches, so every failed
+/// asset gets another hearing.
+///
+/// Struct serialisation is field-ordered, so this is stable across runs; adding
+/// a field to either config struct changes every key, which is the conservative
+/// direction -- it costs one re-encode of the failed set, not a wrong skip.
+pub fn qc_verdict_key(source_sha256: &str, config: &config::AppConfig) -> String {
+    use sha2::{Digest, Sha256};
+
+    let settings = serde_json::json!({
+        "encoding": config.encoding,
+        "validation": config.effective_validation_policy(),
+        "audio": config.effective_audio_policy(),
+    });
+
+    let mut hasher = Sha256::new();
+    hasher.update(source_sha256.as_bytes());
+    hasher.update(b"\x00");
+    hasher.update(
+        serde_json::to_string(&settings)
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    format!("{:x}", hasher.finalize())
+}
+
+/// Is this ingest failure a property of the **media**, rather than of the
+/// machine or the moment?
+///
+/// Not the same question as [`classify_error`], and the difference matters.
+/// `classify_error` decides whether to retry *within a job, seconds later*, so
+/// it calls a full disk `Permanent` — trying again immediately will not help.
+/// This decides whether to stop retrying *across restarts, for ever*, and by
+/// that standard a full disk is the most temporary problem there is.
+///
+/// Getting this wrong in one direction wastes an encode per restart. Getting it
+/// wrong in the other silently refuses a programme that would ingest fine once
+/// somebody empties the drive. So the environmental list is checked first and
+/// wins, and anything unrecognised is treated as retryable.
+///
+/// The verdict this feeds is keyed on the settings as well as the bytes, so
+/// `profile disabled` belongs here: re-enabling the profile changes the key and
+/// the media is tried again.
+pub fn is_media_permanent(err_msg: &str, is_validation_failure: bool) -> bool {
+    let lower = err_msg.to_ascii_lowercase();
+
+    // Checked first, and deliberately wins over everything below: these say
+    // nothing about the programme.
+    let environmental = [
+        "disk full",
+        "no space",
+        "space",
+        "os error 32",
+        "file locked",
+        "sharing violation",
+        "lock",
+        "busy",
+        "permission denied",
+        "access is denied",
+        "timeout",
+        "cancelled",
+        "canceled",
+        "resource temporarily unavailable",
+        "failed to spawn",
+    ];
+    if environmental.iter().any(|e| lower.contains(e)) {
+        return false;
+    }
+
+    // The output did not match its source. Same bytes, same settings, same
+    // answer.
+    if is_validation_failure {
+        return true;
+    }
+
+    [
+        "probe:",
+        "probe failed",
+        "no video stream",
+        "no audio stream",
+        "unsupported codec",
+        "invalid input",
+        "invalid data",
+        "moov atom not found",
+        "audio measurement failed",
+        "unsupported_audio_channel_layout",
+        "unsupported channel layout",
+        "profile disabled",
+    ]
+    .iter()
+    .any(|p| lower.contains(p))
+}
+
+/// Close out a failed ingest, recording a permanent verdict when the failure is
+/// a property of the media so the next restart does not spend another encode
+/// rediscovering it.
+#[allow(clippy::too_many_arguments)]
+fn record_ingest_failure(
+    handle: &tokio::runtime::Handle,
+    pool: &SqlitePool,
+    uuid: &str,
+    source_sha256: Option<&str>,
+    config: &config::AppConfig,
+    error_msg: &str,
+    is_validation_failure: bool,
+) {
+    if is_media_permanent(error_msg, is_validation_failure) {
+        if let Some(sha) = source_sha256 {
+            let key = qc_verdict_key(sha, config);
+            match handle.block_on(db::mark_error_permanent(pool, uuid, &key)) {
+                Ok(()) => {
+                    tracing::info!(
+                        "Asset {} failed on the media itself ({}); recorded so it is not \
+                         re-attempted until the file or the settings change",
+                        uuid,
+                        error_msg.chars().take(120).collect::<String>(),
+                    );
+                    return;
+                }
+                Err(e) => tracing::warn!("Could not record the permanent failure verdict: {}", e),
+            }
+        }
+    }
+    let _ = handle.block_on(db::mark_error(pool, uuid));
+}
+
 fn process_file_inner(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -920,6 +1074,65 @@ fn process_file_inner(
             return;
         }
 
+        // T-2. Before deciding to re-transcode: has this exact source already
+        // been through the encoder and failed QC for a reason that is a
+        // property of the source itself?
+        //
+        // It will fail the same way again -- the duration delta of a file whose
+        // container lies about its length does not change because we re-encode
+        // it -- and the failed row is now `error` (T-5), so the `usable` test
+        // above says "not usable" and the re-ingest cleanup no longer deletes
+        // it. Left alone, that is a service that re-encodes the same three
+        // files on every start and grows a registry row each time. Eleven rows
+        // for three sources by the time it was caught.
+        //
+        // The `.mov` and `.mxf` siblings of these files were already handled
+        // correctly, because their failure surfaces as a failed *job*, which
+        // the retry classifier calls `Permanent`. This is the same verdict for
+        // a failure that happens to surface as a warning on a completed one.
+        if let Some(our_hash) = full_hash_of_source() {
+            let verdict_key = qc_verdict_key(&our_hash, config);
+            match handle.block_on(db::find_reproducible_qc_failure(
+                pool,
+                &verdict_key,
+                &our_hash,
+            )) {
+                Ok(Some(failed)) => {
+                    let reason = reproducible_qc_reason(&failed.warnings);
+                    // Converge the legacy rows onto the precise test, so a later
+                    // settings change releases them along with everything else.
+                    if failed.qc_verdict_key.is_none() {
+                        if let Err(e) = handle.block_on(db::adopt_qc_verdict_key(
+                            pool,
+                            &failed.uuid,
+                            &verdict_key,
+                        )) {
+                            tracing::warn!("Could not stamp the QC verdict key: {}", e);
+                        }
+                    }
+                    tracing::info!(
+                        "Dedup: asset {} is byte-identical and already failed QC on {} under \
+                         these exact settings; re-transcoding would reach the same verdict, \
+                         skipping. Change the encoding or validation settings, or delete that \
+                         asset, to have it re-examined.",
+                        failed.uuid,
+                        reason,
+                    );
+                    skip_job(
+                        &failed.uuid,
+                        &format!(
+                            "Skipped: this media already failed QC on {} under the current \
+                             settings",
+                            reason
+                        ),
+                    );
+                    return;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!("Reproducible-QC-failure lookup failed: {}", e),
+            }
+        }
+
         if usable {
             tracing::info!(
                 "Dedup: fingerprint {} matched asset {} but the full hashes differ -- \
@@ -1057,7 +1270,16 @@ fn process_file_inner(
                 "failed",
                 &serde_json::json!({"id": job.id, "error": format!("Probe: {}", e)}).to_string(),
             );
-            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            // "No video stream found" does not become true on the next restart.
+            record_ingest_failure(
+                &handle,
+                pool,
+                &metadata_uuid,
+                source_sha256.as_deref(),
+                config,
+                &format!("Probe: {}", e),
+                false,
+            );
             publisher.cleanup_staging(&staged_output_path);
             return;
         }
@@ -1080,7 +1302,16 @@ fn process_file_inner(
             "failed",
             &serde_json::json!({"id": job.id, "error": "Profile disabled"}).to_string(),
         );
-        let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+        // Keyed on the settings too, so re-enabling the profile releases it.
+        record_ingest_failure(
+            &handle,
+            pool,
+            &metadata_uuid,
+            source_sha256.as_deref(),
+            config,
+            "Profile disabled",
+            false,
+        );
         publisher.cleanup_staging(&staged_output_path);
         return;
     }
@@ -1113,7 +1344,15 @@ fn process_file_inner(
                     e
                 );
                 queue.broadcast("failed", &serde_json::json!({"id": job.id, "error": format!("Audio measurement failed: {}", e)}).to_string());
-                let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+                record_ingest_failure(
+                    &handle,
+                    pool,
+                    &metadata_uuid,
+                    source_sha256.as_deref(),
+                    config,
+                    &format!("Audio measurement failed: {}", e),
+                    false,
+                );
                 publisher.cleanup_staging(&staged_output_path);
                 return;
             }
@@ -1410,14 +1649,18 @@ fn process_file_inner(
             let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
             let gop_frames = compute_gop_from_fps(fps);
 
-            // One keyframe scan, not two. `-skip_frame nokey` still demuxes
-            // every packet, so this reads the whole mezzanine; the safe start
-            // is simply the first offset that scan already returned.
-            let keyframe_offsets = extract_keyframe_offsets_ms(
+            // One keyframe scan, not two: the safe start is simply the first
+            // offset that scan already returned.
+            let keyframe_scan = extract_keyframe_offsets_ms(
                 tools.ffprobe.to_str().unwrap_or(""),
                 &result.output_path,
             );
+            let keyframe_scan_failed = keyframe_scan.is_failed();
+            let keyframe_offsets = keyframe_scan.into_offsets();
             let keyframe_safe_start_ms = keyframe_offsets.first().copied().unwrap_or(0);
+            // With no offsets there is nothing to check, so this says `true`.
+            // That is only honest while the scan itself succeeded -- hence the
+            // separate `keyframe_scan_failed` signal below (T-7).
             let closed_gop_ok = verify_closed_gop(&keyframe_offsets, gop_frames, fps);
             let faststart_ok = verify_faststart(&result.output_path);
 
@@ -1426,6 +1669,7 @@ fn process_file_inner(
                 &probe_data,
                 closed_gop_ok,
                 faststart_ok,
+                keyframe_scan_failed,
                 measured_loudness.as_ref(),
                 &audio_policy,
                 &config.effective_validation_policy(),
@@ -1626,6 +1870,31 @@ fn process_file_inner(
             let keyframe_offsets_json =
                 serde_json::to_string(&keyframe_offsets).unwrap_or_else(|_| "[]".to_string());
 
+            // Record what this verdict was reached on, but only when it is a
+            // verdict worth acting on later.
+            //
+            // A pass needs no key -- nothing is ever skipped on the strength of
+            // a success. Neither does a failure whose findings are *all*
+            // environmental: ffprobe failing to run says nothing about the
+            // programme and must not stop it being tried again. And a failure
+            // whose source we could not hash cannot be matched against a future
+            // ingest anyway.
+            //
+            // Writing the key only when the failure is genuinely suppressible
+            // is what lets `db::is_retry_suppressed` be a straight "is there a
+            // live key" test, so the API, the UI badge and the dedupe cannot
+            // drift apart on what "won't retry" means.
+            let reproducible = !warnings_list
+                .iter()
+                .all(|c| db::ENVIRONMENTAL_QC_CODES.contains(&c.as_str()));
+            let publish_verdict_key = if mezzanine_ok || !reproducible {
+                None
+            } else {
+                source_sha256
+                    .as_deref()
+                    .map(|h| qc_verdict_key(h, config))
+            };
+
             // Retried, because this is the last write of a job that may have
             // cost an hour of CPU and a transient `database is locked` must not
             // throw it away.
@@ -1648,6 +1917,7 @@ fn process_file_inner(
                         keyframe_safe_start_ms,
                         &warnings_list,
                         &keyframe_offsets_json,
+                        publish_verdict_key.as_deref(),
                     ))
                 },
             );
@@ -1782,7 +2052,20 @@ fn process_file_inner(
                 "failed",
                 &serde_json::json!({"id": job.id, "error": last_error}).to_string(),
             );
-            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+            // A failure of known bytes under known settings is a fact worth
+            // keeping, not a thing to rediscover every restart -- but only when
+            // it is the media that is at fault. `retry_class` is the wrong
+            // question here: it calls a full disk `Permanent`, which is right
+            // for "retry in 500 ms" and quite wrong for "never try again".
+            record_ingest_failure(
+                &handle,
+                pool,
+                &metadata_uuid,
+                source_sha256.as_deref(),
+                config,
+                &last_error,
+                is_val_fail,
+            );
             if final_output_path.exists() {
                 let _ = std::fs::remove_file(&final_output_path);
             }
@@ -1973,6 +2256,7 @@ pub fn run_qc_evaluation(
     source_probe: &probe::ProbeData,
     closed_gop_ok: bool,
     faststart_ok: bool,
+    keyframe_scan_failed: bool,
     measured_loudness: Option<&probe::MeasuredLoudness>,
     _audio_policy: &config::AudioPolicy,
     policy: &config::ValidationPolicy,
@@ -2069,6 +2353,25 @@ pub fn run_qc_evaluation(
             &mut blocking_errors,
             &mut warnings_count,
         );
+    }
+
+    // 4b. The keyframe scan itself (T-7).
+    //
+    // `closed_gop_ok` is `true` when there is nothing to check, so a scan that
+    // never produced an offset passed the GOP test by default and the asset
+    // went to `mezzanine_ok = 1` with `keyframe_offsets_json = "[]"`. That is a
+    // mezzanine nobody verified. It is blocking, unconditionally: closed GOP is
+    // the one property the whole frame-accurate contract rests on, and an
+    // operator who turns `enforce_closed_gop` off is saying "I accept an
+    // irregular GOP", not "I accept not knowing".
+    if keyframe_scan_failed {
+        findings.push(identity::ValidationFinding::error(
+            "keyframe_scan_failed",
+            "The keyframe scan produced no offsets, so the GOP structure is unverified",
+            Some("no keyframes reported".to_string()),
+            Some("at least one keyframe".to_string()),
+        ));
+        blocking_errors += 1;
     }
 
     // 5. Faststart check
@@ -2300,7 +2603,213 @@ fn wait_for_file_flush(path: &Path, timeout_ms: u64) -> bool {
     }
 }
 
-fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
+/// What the T-1 keyframe backfill did, for `/api/v2/diagnostics`.
+///
+/// A migration that corrects a number the whole station's trim behaviour hangs
+/// on has to be visible from outside: "it ran and it fixed 35 rows" is the
+/// difference between a fixed registry and a fixed binary sitting next to an
+/// unfixed registry.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct KeyframeBackfillReport {
+    pub finished: bool,
+    /// Distinct mezzanine files examined.
+    pub files_scanned: usize,
+    /// Registry rows whose keyframes were rewritten.
+    pub rows_updated: u64,
+    /// Sidecars whose `keyframe_safe_start_ms` was patched.
+    pub sidecars_patched: usize,
+    /// Files whose re-scan failed, or which are no longer on disk.
+    pub failed: usize,
+    /// Files already correct, so nothing was written.
+    pub already_correct: usize,
+}
+
+static KEYFRAME_BACKFILL: std::sync::RwLock<Option<KeyframeBackfillReport>> =
+    std::sync::RwLock::new(None);
+
+/// The last backfill report, or `None` if it has not run in this process.
+pub fn keyframe_backfill_report() -> Option<KeyframeBackfillReport> {
+    KEYFRAME_BACKFILL.read().ok().and_then(|g| g.clone())
+}
+
+fn set_keyframe_backfill_report(report: KeyframeBackfillReport) {
+    if let Ok(mut g) = KEYFRAME_BACKFILL.write() {
+        *g = Some(report);
+    }
+}
+
+/// Re-scan every mezzanine whose keyframes came from the broken parser, and
+/// correct the registry and the sidecars (T-1c).
+///
+/// Every asset this service ever produced carries a wrong
+/// `keyframe_safe_start_ms` -- the keyframe at pts 0 was dropped, so the value
+/// is one GOP too late. PlayOut applied it as a floor on the IN point and the
+/// station cut the first two seconds off every clip. PlayOut has stopped using
+/// the number, but it is still wrong in the registry, still served to every
+/// other consumer, and still what this service's own sub-clip alignment check
+/// tests against -- which is why a sub-clip with an IN of 0, genuinely on a
+/// keyframe, is flagged as not keyframe-aligned today.
+///
+/// Blocking, and idempotent: a second run finds the corrected rows already
+/// correct and writes nothing. Runs on its own OS thread at startup, off the
+/// async runtime, because each file is an ffprobe.
+pub fn backfill_keyframe_offsets(
+    pool: &SqlitePool,
+    handle: &tokio::runtime::Handle,
+    ffprobe: &Path,
+) -> KeyframeBackfillReport {
+    let mut report = KeyframeBackfillReport::default();
+
+    let targets = match handle.block_on(db::keyframe_rescan_targets(pool)) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("Keyframe backfill could not read the registry: {}", e);
+            report.finished = true;
+            set_keyframe_backfill_report(report.clone());
+            return report;
+        }
+    };
+
+    if targets.is_empty() {
+        tracing::info!("Keyframe backfill: nothing to correct");
+        report.finished = true;
+        set_keyframe_backfill_report(report.clone());
+        return report;
+    }
+
+    tracing::info!(
+        "Keyframe backfill: re-scanning {} mezzanine file(s) whose offsets came from the \
+         pre-T-1 parser",
+        targets.len()
+    );
+
+    let ffprobe_str = ffprobe.to_str().unwrap_or("");
+    for target in targets {
+        let path = Path::new(&target.current_path);
+        if !path.exists() {
+            // T-4's job, not this one. Counted so the numbers add up.
+            report.failed += 1;
+            continue;
+        }
+        report.files_scanned += 1;
+
+        let scan = extract_keyframe_offsets_ms(ffprobe_str, path);
+        let offsets = match scan {
+            KeyframeScan::Offsets(o) => o,
+            KeyframeScan::Failed(reason) => {
+                tracing::warn!(
+                    "Keyframe backfill: re-scan of {} failed ({}); leaving its row alone",
+                    target.current_path,
+                    reason
+                );
+                report.failed += 1;
+                continue;
+            }
+        };
+
+        let safe_start = offsets.first().copied().unwrap_or(0);
+        let json = serde_json::to_string(&offsets).unwrap_or_else(|_| "[]".to_string());
+        // Compare the whole list, not just the safe start. A short clip with a
+        // single keyframe already had a safe start of 0 *and* an empty offsets
+        // list -- the T-7 row -- so a safe-start comparison alone called it
+        // correct and left the list empty for ever.
+        if safe_start == target.keyframe_safe_start_ms && json == target.keyframe_offsets_json {
+            report.already_correct += 1;
+            continue;
+        }
+
+        match handle.block_on(db::apply_keyframe_rescan(
+            pool,
+            &target.current_path,
+            safe_start,
+            &json,
+        )) {
+            Ok(n) => {
+                report.rows_updated += n;
+                tracing::info!(
+                    "Keyframe backfill: {} -> safe start {} ms ({} keyframes), {} row(s) corrected \
+                     (was {} ms)",
+                    target.current_path,
+                    safe_start,
+                    offsets.len(),
+                    n,
+                    target.keyframe_safe_start_ms,
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Keyframe backfill: could not update rows for {}: {}",
+                    target.current_path,
+                    e
+                );
+                report.failed += 1;
+                continue;
+            }
+        }
+
+        match identity::patch_sidecar_keyframe_safe_start(path, safe_start) {
+            Ok(true) => report.sidecars_patched += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(
+                "Keyframe backfill: registry corrected for {} but its sidecar was not: {}",
+                target.current_path,
+                e
+            ),
+        }
+    }
+
+    report.finished = true;
+    tracing::info!(
+        "Keyframe backfill complete: {} file(s) scanned, {} row(s) corrected, {} sidecar(s) \
+         patched, {} already correct, {} failed",
+        report.files_scanned,
+        report.rows_updated,
+        report.sidecars_patched,
+        report.already_correct,
+        report.failed,
+    );
+    set_keyframe_backfill_report(report.clone());
+    report
+}
+
+/// The outcome of a keyframe scan.
+///
+/// A failed scan and a file with no keyframes both used to come back as an
+/// empty `Vec`, and the caller could not tell them apart: it took
+/// `.first().unwrap_or(0)`, got a safe start of 0, and QC passed the mezzanine
+/// as verified on the strength of a scan that never ran (T-7). They are
+/// different facts and the type now says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyframeScan {
+    /// ffprobe ran and reported these keyframe offsets, in milliseconds.
+    Offsets(Vec<i64>),
+    /// ffprobe could not be run, exited non-zero, or produced no usable
+    /// keyframe at all. Nothing about the GOP structure is known.
+    Failed(String),
+}
+
+impl KeyframeScan {
+    /// The offsets, or an empty slice when the scan failed.
+    pub fn offsets(&self) -> &[i64] {
+        match self {
+            KeyframeScan::Offsets(v) => v,
+            KeyframeScan::Failed(_) => &[],
+        }
+    }
+
+    pub fn is_failed(&self) -> bool {
+        matches!(self, KeyframeScan::Failed(_))
+    }
+
+    pub fn into_offsets(self) -> Vec<i64> {
+        match self {
+            KeyframeScan::Offsets(v) => v,
+            KeyframeScan::Failed(_) => Vec::new(),
+        }
+    }
+}
+
+fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> KeyframeScan {
     #[cfg(target_os = "windows")]
     use std::os::windows::process::CommandExt;
     #[cfg(target_os = "windows")]
@@ -2309,15 +2818,18 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
     const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
     let mut cmd = std::process::Command::new(ffprobe);
-    cmd.args(&[
+    // Packets, not decoded frames (T-1b). `-skip_frame nokey` still walks the
+    // decoder -- 0.412 s on an 84-second mezzanine against 0.119 s here, and
+    // the gap widens with duration. It also puts the keyframe flag in its own
+    // CSV field, so field 0 is unambiguously the pts and the trailing-comma
+    // class of bug below cannot recur.
+    cmd.args([
         "-v",
         "error",
         "-select_streams",
         "v:0",
-        "-skip_frame",
-        "nokey",
         "-show_entries",
-        "frame=pts_time",
+        "packet=pts_time,flags",
         "-of",
         "csv=p=0",
     ]);
@@ -2330,31 +2842,80 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> Vec<i64> {
         Ok(out) => out,
         Err(e) => {
             tracing::error!("Failed to execute ffprobe for keyframe scanning: {}", e);
-            return Vec::new();
+            return KeyframeScan::Failed(format!("ffprobe could not be run: {}", e));
         }
     };
 
     if !output.status.success() {
         let err_msg = String::from_utf8_lossy(&output.stderr);
         tracing::error!("ffprobe keyframe scanning failed: {}", err_msg);
-        return Vec::new();
+        return KeyframeScan::Failed(format!("ffprobe exited non-zero: {}", err_msg.trim()));
     }
 
-    parse_keyframe_pts_ms(&String::from_utf8_lossy(&output.stdout))
+    let mut offsets = parse_keyframe_packets_ms(&String::from_utf8_lossy(&output.stdout));
+    // Packets come out in **decode** order, and with B-frames that is not
+    // presentation order -- a real mezzanine emits `0.000000, 0.160000,
+    // 0.080000, 0.040000`. Keyframes happen to stay ordered among themselves in
+    // a closed-GOP stream, but `verify_closed_gop` walks the list pairwise and
+    // the offsets go out on the wire, so neither may depend on that holding.
+    // The old `-skip_frame nokey` frame scan was sorted for free, because
+    // decoded frames come out in display order.
+    offsets.sort_unstable();
+    offsets.dedup();
+    if offsets.is_empty() {
+        // ffprobe succeeded and reported not one keyframe. Every playable video
+        // stream has at least one, so either the stream is not video or the
+        // output shape changed under us. Either way the mezzanine is unverified.
+        tracing::error!(
+            "Keyframe scan of {} returned no keyframes; the mezzanine cannot be verified",
+            path.display()
+        );
+        return KeyframeScan::Failed("ffprobe reported no keyframes".to_string());
+    }
+
+    KeyframeScan::Offsets(offsets)
 }
 
-/// Turn ffprobe's `frame=pts_time` CSV into milliseconds.
+/// Turn ffprobe's `packet=pts_time,flags` CSV into keyframe offsets in ms.
 ///
 /// Split out so the offsets list and the safe-start value can never be
 /// produced by two subtly different parsers: the safe start is just the first
 /// element of this list.
-fn parse_keyframe_pts_ms(stdout: &str) -> Vec<i64> {
+///
+/// The parse is per *field*, not per line. The previous version did
+/// `line.parse::<f64>()` on the whole trimmed line, and ffprobe's CSV writer
+/// appends an empty section -- a bare trailing comma -- to any frame carrying
+/// side data. The first frame of a real mezzanine usually does, so the line was
+/// `0.000000,`, which is not a valid `f64`, and the keyframe at pts 0 was
+/// silently dropped from every asset the service ever produced. The safe start
+/// then became 2000 ms and PlayOut cut two seconds off the head of every clip
+/// (T-1).
+fn parse_keyframe_packets_ms(stdout: &str) -> Vec<i64> {
     stdout
         .lines()
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty() && *line != "N/A")
-        .filter_map(|line| line.parse::<f64>().ok())
-        .map(|t| (t * 1000.0).round() as i64)
+        .filter_map(|line| {
+            let mut fields = line.trim().split(',');
+            let pts = fields.next()?.trim();
+            if pts.is_empty() || pts == "N/A" {
+                return None;
+            }
+            let secs = pts.parse::<f64>().ok()?;
+            // A keyframe packet's flags field starts with `K` (`K_`, `K__`).
+            //
+            // Two shapes have no flags to inspect and both mean "keep": the
+            // older `frame=pts_time` output, which had one field and listed
+            // only keyframes, and the trailing-comma line that started all of
+            // this -- `0.000000,` is a pts plus an *empty* section, not a pts
+            // plus a non-keyframe flag.
+            let is_keyframe = match fields.next() {
+                Some(flags) if !flags.trim().is_empty() => flags.trim_start().starts_with('K'),
+                _ => true,
+            };
+            if !is_keyframe {
+                return None;
+            }
+            Some((secs * 1000.0).round() as i64)
+        })
         .collect()
 }
 
@@ -2394,7 +2955,7 @@ mod tests {
             "N/A\nN/A\n",
             "garbage\n1.000000\n",
         ] {
-            let offsets = parse_keyframe_pts_ms(stdout);
+            let offsets = parse_keyframe_packets_ms(stdout);
             assert_eq!(
                 offsets.first().copied().unwrap_or(0),
                 legacy_safe_start(stdout),
@@ -2404,8 +2965,145 @@ mod tests {
         }
 
         // And the rounding is the one written to the DB and the sidecar.
-        assert_eq!(parse_keyframe_pts_ms("0.083333\n"), vec![83]);
-        assert_eq!(parse_keyframe_pts_ms("2.0405\n"), vec![2041]);
+        assert_eq!(parse_keyframe_packets_ms("0.083333\n"), vec![83]);
+        assert_eq!(parse_keyframe_packets_ms("2.0405\n"), vec![2041]);
+    }
+
+    /// T-1. The exact bytes a real mezzanine produces. ffprobe's CSV writer
+    /// appends an empty section for a frame carrying side data, so the first
+    /// line is `0.000000,` -- and `"0.000000,".parse::<f64>()` is `Err`, so the
+    /// keyframe at pts 0 was dropped and the safe start became 2000 ms. The
+    /// station cut two seconds off the head of every clip on the strength of
+    /// it. The old test could not see this: it compared two parsers that were
+    /// wrong in the same way, on hand-written clean lines.
+    #[test]
+    fn the_keyframe_at_pts_zero_survives_a_trailing_comma() {
+        let real_frame_output = "0.000000,\r\n2.000000\r\n4.000000\r\n6.000000\r\n";
+        assert_eq!(
+            parse_keyframe_packets_ms(real_frame_output),
+            vec![0, 2000, 4000, 6000],
+        );
+        assert_eq!(
+            parse_keyframe_packets_ms(real_frame_output)
+                .first()
+                .copied()
+                .unwrap_or(0),
+            0,
+            "the safe start of a mezzanine whose first frame is a keyframe is 0",
+        );
+    }
+
+    /// T-1b. The packet shape the scan now asks for: pts in field 0, flags in
+    /// field 1, and every packet listed rather than only the keyframes.
+    #[test]
+    fn the_packet_scan_keeps_only_the_keyframe_packets() {
+        let packets = "\
+0.000000,K__\r\n\
+0.040000,__\r\n\
+0.080000,__\r\n\
+2.000000,K__\r\n\
+2.040000,__\r\n\
+4.000000,K_\r\n";
+        assert_eq!(parse_keyframe_packets_ms(packets), vec![0, 2000, 4000]);
+    }
+
+    /// Packets are emitted in decode order. The scan sorts before it returns,
+    /// because `verify_closed_gop` walks the list pairwise and the list itself
+    /// goes out on the wire as `keyframe_offsets`.
+    #[test]
+    fn the_offsets_are_sorted_whatever_order_the_packets_arrive_in() {
+        let mut out = parse_keyframe_packets_ms("4.000000,K__
+0.000000,K__
+2.000000,K__
+");
+        out.sort_unstable();
+        out.dedup();
+        assert_eq!(out, vec![0, 2000, 4000]);
+        assert!(
+            out.windows(2).all(|w| w[0] < w[1]),
+            "the GOP check assumes a strictly increasing list"
+        );
+    }
+
+    /// A discard flag or an unreadable pts must not become a keyframe at 0.
+    #[test]
+    fn the_packet_scan_skips_unusable_lines() {
+        assert_eq!(
+            parse_keyframe_packets_ms("N/A,K__\r\n\r\n,K__\r\n1.000000,K__\r\n"),
+            vec![1000],
+        );
+    }
+
+    /// T-7. `verify_closed_gop` returns `true` when there is nothing to check,
+    /// so a mezzanine whose keyframe scan produced nothing passed the GOP test
+    /// by default and went to `mezzanine_ok = 1` with an empty offsets list.
+    /// There is one such row in the registry: a mezzanine nobody verified,
+    /// flagged as verified.
+    #[test]
+    fn a_mezzanine_whose_keyframe_scan_failed_does_not_pass_qc() {
+        let p = config::ValidationPolicy::default();
+
+        // Same encode, same clean checks, twice -- the only difference is
+        // whether the scan that fed `closed_gop_ok` actually ran.
+        assert!(
+            qc(true, true, 48000, false, &p).passed,
+            "a clean encode with a real keyframe list passes"
+        );
+
+        let unverified = qc(true, true, 48000, true, &p);
+        assert!(
+            !unverified.passed,
+            "closed GOP unchecked is not closed GOP verified"
+        );
+        assert!(unverified
+            .findings
+            .iter()
+            .any(|f| f.code == "keyframe_scan_failed"));
+
+        // And it blocks even for an operator who has turned the GOP rule off.
+        // They are saying they accept an irregular GOP, not that they accept
+        // not knowing.
+        let lenient = config::ValidationPolicy {
+            enforce_closed_gop: false,
+            ..config::ValidationPolicy::default()
+        };
+        assert!(!qc(true, true, 48000, true, &lenient).passed);
+    }
+
+    /// The cross-restart verdict is a different question from the in-job retry
+    /// decision, and the difference is where the damage would be.
+    #[test]
+    fn only_the_media_makes_a_failure_permanent_across_restarts() {
+        // The real message from this station's watch folder.
+        assert!(is_media_permanent(
+            "Probe: No video stream found",
+            false
+        ));
+        assert!(is_media_permanent("Probe failed: moov atom not found", false));
+        assert!(is_media_permanent("Unsupported codec: dnxhr_444", false));
+        assert!(is_media_permanent("Audio measurement failed: x", false));
+        // The output did not match its source: same bytes, same answer.
+        assert!(is_media_permanent("duration drift", true));
+
+        // ...and the ones that must never be permanent. `classify_error` calls
+        // the first two `Permanent` -- correctly, for a retry 500 ms later --
+        // which is exactly why this cannot reuse it.
+        assert_eq!(
+            classify_error("Insufficient disk space on target volume", false),
+            RetryClass::Permanent,
+            "documents the in-job behaviour this must not inherit"
+        );
+        assert!(!is_media_permanent(
+            "Insufficient disk space on target volume",
+            false
+        ));
+        assert!(!is_media_permanent("Access is denied (os error 5)", false));
+        assert!(!is_media_permanent("ffmpeg timeout after 3600s", false));
+        assert!(!is_media_permanent("Cancelled by user", false));
+        assert!(!is_media_permanent("file locked by another process", false));
+
+        // Unrecognised stays retryable: a wasted encode is the cheap mistake.
+        assert!(!is_media_permanent("something nobody has seen before", false));
     }
 
     #[test]
@@ -2779,6 +3477,7 @@ mod tests {
         closed_gop_ok: bool,
         faststart_ok: bool,
         sample_rate: i64,
+        keyframe_scan_failed: bool,
         policy: &config::ValidationPolicy,
     ) -> identity::QcReport {
         let out = probe_at(10.0, sample_rate);
@@ -2788,6 +3487,7 @@ mod tests {
             &src,
             closed_gop_ok,
             faststart_ok,
+            keyframe_scan_failed,
             None,
             &config::AudioPolicy::default(),
             policy,
@@ -2797,10 +3497,10 @@ mod tests {
     #[test]
     fn with_the_default_policy_every_check_blocks() {
         let p = config::ValidationPolicy::default();
-        assert!(!qc(false, true, 48000, &p).passed, "closed GOP");
-        assert!(!qc(true, false, 48000, &p).passed, "faststart");
-        assert!(!qc(true, true, 44100, &p).passed, "sample rate");
-        assert!(qc(true, true, 48000, &p).passed, "a clean encode passes");
+        assert!(!qc(false, true, 48000, false, &p).passed, "closed GOP");
+        assert!(!qc(true, false, 48000, false, &p).passed, "faststart");
+        assert!(!qc(true, true, 44100, false, &p).passed, "sample rate");
+        assert!(qc(true, true, 48000, false, &p).passed, "a clean encode passes");
     }
 
     #[test]
@@ -2814,7 +3514,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = qc(true, false, 48000, &p);
+        let report = qc(true, false, 48000, false, &p);
         assert!(report.passed, "must no longer block");
         assert_eq!(report.blocking_errors, 0);
         assert!(report.warnings_count >= 1, "but it must still be recorded");
@@ -2832,15 +3532,15 @@ mod tests {
             ..Default::default()
         };
         // GOP is waived, faststart is not.
-        assert!(qc(false, true, 48000, &p).passed);
-        assert!(!qc(false, false, 48000, &p).passed);
+        assert!(qc(false, true, 48000, false, &p).passed);
+        assert!(!qc(false, false, 48000, false, &p).passed);
 
         let p = config::ValidationPolicy {
             enforce_48k_audio: false,
             ..Default::default()
         };
-        assert!(qc(true, true, 44100, &p).passed);
-        assert!(!qc(false, true, 44100, &p).passed);
+        assert!(qc(true, true, 44100, false, &p).passed);
+        assert!(!qc(false, true, 44100, false, &p).passed);
     }
 
     #[test]
@@ -2857,6 +3557,7 @@ mod tests {
             &src,
             true,
             true,
+            false,
             None,
             &config::AudioPolicy::default(),
             &policy,
@@ -2868,6 +3569,7 @@ mod tests {
             &src,
             true,
             true,
+            false,
             None,
             &config::AudioPolicy::default(),
             &policy,
@@ -2894,8 +3596,8 @@ mod tests {
         };
 
         let audio = config::AudioPolicy::default();
-        assert!(!run_qc_evaluation(&out, &src, true, true, None, &audio, &narrow).passed);
-        assert!(run_qc_evaluation(&out, &src, true, true, None, &audio, &wide).passed);
+        assert!(!run_qc_evaluation(&out, &src, true, true, false, None, &audio, &narrow).passed);
+        assert!(run_qc_evaluation(&out, &src, true, true, false, None, &audio, &wide).passed);
     }
 
     #[test]
@@ -2907,13 +3609,13 @@ mod tests {
             enforce_faststart: false,
             ..Default::default()
         };
-        assert!(qc(true, false, 48000, &lenient).passed);
+        assert!(qc(true, false, 48000, false, &lenient).passed);
 
         let strict_policy = config::ValidationPolicy {
             strict_ready_blocking: true,
             ..lenient
         };
-        let strict = qc(true, false, 48000, &strict_policy);
+        let strict = qc(true, false, 48000, false, &strict_policy);
         assert!(!strict.passed, "a warning now blocks");
         assert_eq!(strict.blocking_errors, 0, "it is still a warning, not an error");
         assert!(strict.warnings_count >= 1);
@@ -3551,6 +4253,7 @@ mod tests {
             &dummy_probe,
             true,
             true,
+            false,
             None,
             &policy,
             &config::ValidationPolicy::default(),
@@ -3585,6 +4288,7 @@ mod tests {
         let qc = run_qc_evaluation(
             &dummy_output,
             &dummy_source,
+            false,
             false,
             false,
             None,

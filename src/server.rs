@@ -145,6 +145,8 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/jobs/{id}/retry", post(post_retry_job))
         .route("/jobs/{id}/cancel", post(post_cancel_job))
         .route("/jobs/retry-failed", post(post_retry_all_failed))
+        .route("/jobs/finished", delete(delete_finished_jobs))
+        .route("/jobs/{id}", delete(delete_job))
         .route("/config", get(get_config).put(put_config))
         .route("/toolchain", get(get_toolchain_status))
         .route("/stats", get(get_stats))
@@ -169,6 +171,7 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/assets/{uuid}/subclip", post(post_subclip))
         .route("/assets/{uuid}/purge", delete(delete_purge_asset))
         .route("/assets/{uuid}/regenerate-sidecar", post(post_regenerate_sidecar))
+        .route("/assets/{uuid}/clear-verdict", post(post_clear_verdict))
         .route("/assets/{uuid}/trash", post(post_trash_asset).put(post_trash_asset))
         .route("/assets/{uuid}/restore", post(post_restore_asset).put(post_restore_asset))
         .route("/assets/batch", post(post_batch))
@@ -198,7 +201,8 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/config", get(get_config).put(put_config))
         .route("/profiles", get(get_profiles_v2))
         .route("/jobs", get(list_jobs))
-        .route("/jobs/{id}", get(get_job_v2))
+        .route("/jobs/{id}", get(get_job_v2).delete(delete_job))
+        .route("/jobs/finished", delete(delete_finished_jobs))
         .route("/jobs/{id}/cancel", post(post_cancel_job))
         .route("/jobs/{id}/retry", post(post_retry_job))
         .route("/assets", get(list_assets))
@@ -207,6 +211,7 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/assets/{uuid}/restore", post(post_restore_asset))
         .route("/assets/{uuid}/purge", delete(delete_purge_asset))
         .route("/assets/{uuid}/regenerate-sidecar", post(post_regenerate_sidecar))
+        .route("/assets/{uuid}/clear-verdict", post(post_clear_verdict))
         .route("/folders/trash", post(post_trash_folder))
         .route("/folders/restore", post(post_restore_folder))
         .route("/folders/purge", delete(delete_purge_folder))
@@ -1213,6 +1218,29 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
     let all_jobs = state.jobs.all();
     let db_ok = state.db_health().await;
 
+    // T-1c / T-4. A migration that corrects the number the station's trim
+    // behaviour hangs on, and a reconcile that decides whether an asset can be
+    // played at all, both have to be visible from outside the process. "The
+    // binary is fixed" and "the registry is fixed" are different facts.
+    let keyframe_backfill = crate::processor::keyframe_backfill_report();
+    let missing_assets = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM media_assets WHERE status = 'missing' AND deleted_at IS NULL",
+    )
+    .fetch_one(&*state.pool)
+    .await
+    .unwrap_or(-1);
+
+    // Media the service has stopped retrying because the same bytes under the
+    // same settings already failed. Visible so that "nothing is happening to my
+    // file" has an answer that is not "the watcher is broken".
+    let permanently_failed_assets = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM media_assets
+         WHERE status = 'error' AND qc_verdict_key IS NOT NULL AND deleted_at IS NULL",
+    )
+    .fetch_one(&*state.pool)
+    .await
+    .unwrap_or(-1);
+
     Json(serde_json::json!({
         "service": {
             "name": "PlayoutTranscode",
@@ -1235,7 +1263,11 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             // (T2-2). Support cannot ask for the right files without it.
             "data_dir": crate::paths::data_dir().to_string_lossy(),
         },
+        "keyframe_backfill": keyframe_backfill,
         "metrics": {
+            // -1 means the count could not be read, not "none missing".
+            "missing_assets": missing_assets,
+            "permanently_failed_assets": permanently_failed_assets,
             "pending_jobs": all_jobs.iter().filter(|j| j.state == JobState::Pending).count(),
             "active_jobs": all_jobs.iter().filter(|j| j.state == JobState::Processing).count(),
             "completed_jobs": all_jobs.iter().filter(|j| j.state == JobState::Completed).count(),
@@ -1250,6 +1282,104 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             "audio_mode": config.audio_policy.map(|p| format!("{:?}", p.mode)).unwrap_or_else(|| "legacy".into()),
         }
     }))
+}
+
+/// Which finished jobs a bulk dismiss should clear.
+#[derive(Debug, Deserialize, Default)]
+struct DismissQuery {
+    /// Comma-separated job states: `failed`, `completed`, `cancelled`.
+    /// Defaults to `failed`, which is the clogged one.
+    state: Option<String>,
+}
+
+/// Take one finished job off the queue.
+///
+/// Dismissing a job is about the *record*, not the media: the asset row, the
+/// mezzanine and the source file are all untouched. A job that is still pending
+/// or running is refused with 409 — cancel it first, so an encoder is never
+/// left running with nothing tracking it.
+async fn delete_job(
+    State(state): State<ServerState>,
+    AssetId(id): AssetId,
+) -> impl IntoResponse {
+    match state.jobs.dismiss(&id) {
+        Ok(job) => {
+            if let Err(e) = crate::db::delete_durable_job(&state.pool, &id).await {
+                // The record is already gone from the live queue, so the
+                // operator's screen is clean either way; say so rather than
+                // failing a request that visibly worked.
+                tracing::warn!("Job {} dismissed but its durable row remains: {}", id, e);
+            }
+            state.jobs.broadcast(
+                "job_removed",
+                &serde_json::json!({ "ids": [&id] }).to_string(),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "dismissed": 1, "id": id, "state": job.state })),
+            )
+                .into_response()
+        }
+        Err(crate::jobs::DismissError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response(),
+        Err(crate::jobs::DismissError::StillActive) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "job is still running",
+                "detail": "Cancel it first; a running encode must not lose the record tracking it."
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// Clear every finished job in the requested states — by default, the failed
+/// ones. Running and pending jobs are never touched.
+async fn delete_finished_jobs(
+    State(state): State<ServerState>,
+    Query(q): Query<DismissQuery>,
+) -> impl IntoResponse {
+    let wanted = q.state.unwrap_or_else(|| "failed".to_string());
+    let mut states = Vec::new();
+    for token in wanted.split(',').map(|t| t.trim().to_ascii_lowercase()) {
+        match token.as_str() {
+            "failed" => states.push(JobState::Failed),
+            "completed" => states.push(JobState::Completed),
+            "cancelled" | "canceled" => states.push(JobState::Cancelled),
+            "" => {}
+            other => {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": format!("unknown job state '{}'", other),
+                        "detail": "expected any of: failed, completed, cancelled"
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    }
+    if states.is_empty() {
+        states.push(JobState::Failed);
+    }
+
+    let ids = state.jobs.dismiss_all(&states);
+    if let Err(e) = crate::db::delete_durable_jobs(&state.pool, &ids).await {
+        tracing::warn!("{} job(s) dismissed but their durable rows remain: {}", ids.len(), e);
+    }
+    if !ids.is_empty() {
+        state
+            .jobs
+            .broadcast("job_removed", &serde_json::json!({ "ids": ids }).to_string());
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "dismissed": ids.len(), "ids": ids })),
+    )
+        .into_response()
 }
 
 async fn list_jobs(State(state): State<ServerState>) -> Json<Vec<crate::jobs::JobRecord>> {
@@ -2445,6 +2575,51 @@ async fn put_tp(
     }
 }
 
+/// Does a sub-clip's IN point land on one of its parent's keyframes?
+///
+/// Returns the warnings to record against the new row -- empty when it does, or
+/// when there is nothing to check against.
+///
+/// Two things this must not do:
+///
+/// * **Warn on the strength of a keyframe list that does not exist.** The guard
+///   used to be `!parent.keyframe_offsets_json.is_empty()`, which tests the
+///   *string*, and the column's default is the two characters `[]`. So for a
+///   parent whose keyframe scan produced nothing -- there is one such asset in
+///   the registry today, `mezzanine_ok = 1` and all -- the guard passed, the
+///   parsed list was empty, `any()` found nothing, and every sub-clip of it was
+///   stamped not-keyframe-aligned on no evidence at all (T-7). An unverified
+///   parent earns silence, not a verdict; the `keyframe_scan_failed` finding is
+///   where that fact now lives.
+/// * **Snap the IN point.** It does not, and the reliability audit was wrong to
+///   say it did. CasparCG's FFmpeg producer seeks to the preceding keyframe and
+///   decodes forward, so a non-keyframe IN is frame-accurate anyway; raising it
+///   would silently cut programme. The warning is advisory and that is all.
+fn subclip_keyframe_warnings(
+    parent_mezzanine_ok: bool,
+    parent_offsets: &[i64],
+    parent_fps: f64,
+    trim_in_ms: i64,
+) -> Vec<String> {
+    if !parent_mezzanine_ok || parent_offsets.is_empty() {
+        return Vec::new();
+    }
+    let frame_ms = if parent_fps > 0.0 {
+        1000.0 / parent_fps
+    } else {
+        40.0
+    };
+    let tolerance = frame_ms * 0.5;
+    let aligned = parent_offsets
+        .iter()
+        .any(|&kf| (kf - trim_in_ms).abs() as f64 <= tolerance);
+    if aligned {
+        Vec::new()
+    } else {
+        vec!["trim_in_not_keyframe_aligned".to_string()]
+    }
+}
+
 async fn post_subclip(
     State(state): State<ServerState>,
     AssetId(uuid): AssetId,
@@ -2516,28 +2691,20 @@ async fn post_subclip(
         ).into_response();
     }
 
-    let (sub_mezzanine_ok, sub_warnings) =
-        if parent.mezzanine_ok && !parent.keyframe_offsets_json.is_empty() {
-            let offsets: Vec<i64> =
-                serde_json::from_str(&parent.keyframe_offsets_json).unwrap_or_default();
-            let fps = if parent.fps_den > 0 {
-                parent.fps_num as f64 / parent.fps_den as f64
-            } else {
-                parent.fps
-            };
-            let frame_ms = if fps > 0.0 { 1000.0 / fps } else { 40.0 };
-            let tolerance = frame_ms * 0.5;
-            let aligned = offsets
-                .iter()
-                .any(|&kf| (kf - body.trim_in_ms).abs() as f64 <= tolerance);
-            if aligned {
-                (parent.mezzanine_ok, Vec::new())
-            } else {
-                (parent.mezzanine_ok, vec!["trim_in_not_keyframe_aligned".to_string()])
-            }
-        } else {
-            (parent.mezzanine_ok, Vec::new())
-        };
+    let parent_offsets: Vec<i64> =
+        serde_json::from_str(&parent.keyframe_offsets_json).unwrap_or_default();
+    let parent_fps = if parent.fps_den > 0 {
+        parent.fps_num as f64 / parent.fps_den as f64
+    } else {
+        parent.fps
+    };
+    let sub_mezzanine_ok = parent.mezzanine_ok;
+    let sub_warnings = subclip_keyframe_warnings(
+        parent.mezzanine_ok,
+        &parent_offsets,
+        parent_fps,
+        body.trim_in_ms,
+    );
 
     let warnings_json = serde_json::to_string(&sub_warnings).unwrap_or_else(|_| "[]".to_string());
 
@@ -2753,19 +2920,67 @@ async fn post_restore_folder(
     }
 }
 
-async fn delete_purge_asset(
+/// How far a single-asset purge should go.
+#[derive(Debug, Deserialize, Default)]
+struct PurgeQuery {
+    /// `false` removes the registry row and leaves the mezzanine on disk;
+    /// `true` removes both. Omitted keeps the historical behaviour, so existing
+    /// callers -- PlayOut among them -- are unaffected.
+    delete_file: Option<bool>,
+}
+
+/// Clear the recorded QC verdict on an asset, so its source is examined again.
+///
+/// The escape hatch for the skip. The service refuses to re-encode media whose
+/// exact bytes already failed under the exact current settings; this is how an
+/// operator overrides that for one asset without having to change a setting or
+/// delete the row.
+///
+/// Not behind `X-Confirm-Destructive`: it deletes nothing and its worst case is
+/// one wasted encode.
+async fn post_clear_verdict(
     State(state): State<ServerState>,
     AssetId(uuid): AssetId,
 ) -> impl IntoResponse {
-    let mode = if state
-        .config
-        .lock()
-        .effective_storage_policy()
-        .preserve_subclips_on_purge
-    {
-        db::PurgeMode::PreserveReferencedMezzanine
-    } else {
-        db::PurgeMode::DeleteUnreferencedMezzanine
+    match db::clear_qc_verdict(&state.pool, &uuid).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "cleared": true,
+                "detail": "This media will be examined again the next time it is offered."
+            })),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "cleared": false,
+                "detail": "No recorded verdict on this asset; nothing was skipping it."
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("DB error clearing the QC verdict for {}: {}", uuid, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database error"})),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn delete_purge_asset(
+    State(state): State<ServerState>,
+    AssetId(uuid): AssetId,
+    Query(q): Query<PurgeQuery>,
+) -> impl IntoResponse {
+    // The caller decides, because "take this off the list" and "delete the
+    // broadcast master" are different intentions and only the operator knows
+    // which one they have. Absent the parameter, behave exactly as before.
+    let mode = match q.delete_file {
+        Some(false) => db::PurgeMode::KeepMedia,
+        Some(true) | None => db::PurgeMode::DeleteMediaIfUnreferenced,
     };
     let cfg = state.config.lock().clone();
     let target_dir = if !cfg.paths.target_folder.is_empty() {
@@ -2914,16 +3129,11 @@ async fn delete_purge_folder(
         )
             .into_response();
     }
-    let mode = if state
-        .config
-        .lock()
-        .effective_storage_policy()
-        .preserve_subclips_on_purge
-    {
-        db::PurgeMode::PreserveReferencedMezzanine
-    } else {
-        db::PurgeMode::DeleteUnreferencedMezzanine
-    };
+    // `preserve_subclips_on_purge` used to choose between two enum variants
+    // that evaluated to the identical rule, so it never changed anything.
+    // Sub-clips are protected by the reference count on the media path, which
+    // is not a setting and cannot be switched off.
+    let mode = db::PurgeMode::DeleteMediaIfUnreferenced;
     let cfg = state.config.lock().clone();
     let target_dir = if !cfg.paths.target_folder.is_empty() {
         Some(std::path::Path::new(&cfg.paths.target_folder))
@@ -2950,16 +3160,11 @@ async fn delete_purge_folder(
 }
 
 async fn delete_empty_recycle_bin(State(state): State<ServerState>) -> impl IntoResponse {
-    let mode = if state
-        .config
-        .lock()
-        .effective_storage_policy()
-        .preserve_subclips_on_purge
-    {
-        db::PurgeMode::PreserveReferencedMezzanine
-    } else {
-        db::PurgeMode::DeleteUnreferencedMezzanine
-    };
+    // `preserve_subclips_on_purge` used to choose between two enum variants
+    // that evaluated to the identical rule, so it never changed anything.
+    // Sub-clips are protected by the reference count on the media path, which
+    // is not a setting and cannot be switched off.
+    let mode = db::PurgeMode::DeleteMediaIfUnreferenced;
     let cfg = state.config.lock().clone();
     let target_dir = if !cfg.paths.target_folder.is_empty() {
         Some(std::path::Path::new(&cfg.paths.target_folder))
@@ -3017,16 +3222,11 @@ async fn post_auto_purge(
         0
     };
 
-    let mode = if state
-        .config
-        .lock()
-        .effective_storage_policy()
-        .preserve_subclips_on_purge
-    {
-        db::PurgeMode::PreserveReferencedMezzanine
-    } else {
-        db::PurgeMode::DeleteUnreferencedMezzanine
-    };
+    // `preserve_subclips_on_purge` used to choose between two enum variants
+    // that evaluated to the identical rule, so it never changed anything.
+    // Sub-clips are protected by the reference count on the media path, which
+    // is not a setting and cannot be switched off.
+    let mode = db::PurgeMode::DeleteMediaIfUnreferenced;
     let cfg = state.config.lock().clone();
     let target_dir = if !cfg.paths.target_folder.is_empty() {
         Some(std::path::Path::new(&cfg.paths.target_folder))
@@ -3771,5 +3971,50 @@ mod tests {
             content_type_for(Path::new("x/blob")),
             "application/octet-stream"
         );
+    }
+
+    /// T-1 + T-7, at the point where the corrupt keyframe list did visible
+    /// damage: the sub-clip alignment check.
+    #[test]
+    fn a_subclip_cut_on_a_keyframe_earns_no_warning() {
+        // A corrected offsets list -- the one the T-1 backfill writes.
+        let offsets = [0_i64, 2000, 4000, 6000];
+
+        // 0 is the most common sub-clip IN there is, and it is a keyframe.
+        assert!(subclip_keyframe_warnings(true, &offsets, 25.0, 0).is_empty());
+        assert!(subclip_keyframe_warnings(true, &offsets, 25.0, 4000).is_empty());
+        // Within half a frame either side.
+        assert!(subclip_keyframe_warnings(true, &offsets, 25.0, 2015).is_empty());
+
+        // And a genuinely off-keyframe IN still says so.
+        assert_eq!(
+            subclip_keyframe_warnings(true, &offsets, 25.0, 3000),
+            vec!["trim_in_not_keyframe_aligned".to_string()]
+        );
+    }
+
+    /// The list the broken parser produced for every real mezzanine. A sub-clip
+    /// at 0 -- on a keyframe -- was flagged, because 0 had been dropped from
+    /// the list. Every such warning in the field today is false; the backfill
+    /// is what clears them.
+    #[test]
+    fn the_pre_backfill_offsets_are_what_made_the_warning_wrong() {
+        let corrupt = [2000_i64, 4000, 6000];
+        assert_eq!(
+            subclip_keyframe_warnings(true, &corrupt, 25.0, 0),
+            vec!["trim_in_not_keyframe_aligned".to_string()],
+            "documents the old behaviour this fix and its backfill exist to undo"
+        );
+    }
+
+    /// T-7. A parent whose keyframe scan produced nothing knows nothing about
+    /// alignment, and must not pretend otherwise. The old guard tested the
+    /// *string* `"[]"`, which is not empty, so it warned on every sub-clip of
+    /// such a parent.
+    #[test]
+    fn a_parent_with_no_keyframes_does_not_warn_about_alignment() {
+        assert!(subclip_keyframe_warnings(true, &[], 25.0, 3000).is_empty());
+        // Nor does an unverified parent.
+        assert!(subclip_keyframe_warnings(false, &[0, 2000], 25.0, 3000).is_empty());
     }
 }

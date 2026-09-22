@@ -16,6 +16,7 @@ pub mod identity;
 pub mod instance_lock;
 pub mod jobs;
 pub mod logging;
+pub mod media_root;
 pub mod paths;
 pub mod probe;
 pub mod processor;

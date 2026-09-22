@@ -21,6 +21,11 @@
         <h2 :id="titleId" class="cd-title">{{ title }}</h2>
         <p :id="bodyId" class="cd-body">{{ body }}</p>
         <p v-if="detail" class="cd-detail">{{ detail }}</p>
+        <!-- For the choice that belongs *inside* the decision, not before it:
+             whether a permanent delete also bins the media file. -->
+        <div v-if="$slots.extra" class="cd-extra">
+          <slot name="extra" />
+        </div>
         <div class="cd-actions">
           <button ref="cancelRef" class="btn cd-cancel" @click="$emit('cancel')">Cancel</button>
           <button class="btn cd-confirm" :disabled="busy" @click="$emit('confirm')">
@@ -106,6 +111,13 @@ watch(
   margin-top: 8px;
 }
 
+.cd-extra {
+  margin: 12px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-base);
+  font-size: 13px;
+}
 .cd-actions {
   display: flex;
   justify-content: flex-end;
