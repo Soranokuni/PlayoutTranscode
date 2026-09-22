@@ -22,6 +22,35 @@
       />
     </div>
 
+    <ConfirmDialog
+      :open="pending !== null"
+      :title="pending?.title ?? ''"
+      :body="pending?.body ?? ''"
+      :detail="pending?.detail"
+      :confirm-label="pending?.label ?? 'Confirm'"
+      :busy="busyUuid !== null"
+      @cancel="pending = null"
+      @confirm="runPending"
+    >
+      <!-- The file question belongs inside the decision, not before it. -->
+      <template v-if="pending?.kind === 'purge'" #extra>
+        <label class="file-opt">
+          <input v-model="alsoDeleteFile" type="checkbox" />
+          <span>
+            Also delete the media file from disk
+            <em v-if="pending.sharedWith" class="file-opt-note">
+              — kept anyway: {{ pending.sharedWith }} other entr{{ pending.sharedWith === 1 ? 'y' : 'ies' }} still play this file
+            </em>
+          </span>
+        </label>
+        <div class="file-opt-path">{{ pending.path }}</div>
+      </template>
+    </ConfirmDialog>
+
+    <div v-if="actionMsg" class="action-msg" :class="actionOk ? 'ok' : 'err'" role="status" aria-live="polite">
+      {{ actionMsg }}
+    </div>
+
     <div v-if="!displayedAssets.length" class="empty">
       No assets found.
     </div>
@@ -36,6 +65,7 @@
             <th>Rating</th>
             <th>Folder</th>
             <th>Path</th>
+            <th class="col-actions">Actions</th>
           </tr>
         </thead>
         <tbody>
@@ -45,6 +75,13 @@
             </td>
             <td>
               <span :class="['status-chip', asset.status]">{{ asset.status }}</span>
+              <!-- Otherwise an operator leaves the file in the watch folder,
+                   sees nothing happen, and concludes the watcher is broken. -->
+              <span
+                v-if="heldBack(asset)"
+                class="held-chip"
+                :title="`This media already failed on ${heldBack(asset)} under the current settings, so it is not encoded again. Use Try again to force one more attempt.`"
+              >won't retry</span>
             </td>
             <td class="cell-duration">{{ formatDuration(asset.duration_ms) }}</td>
             <td class="cell-rating">{{ asset.rating || '—' }}</td>
@@ -53,6 +90,27 @@
             </td>
             <td class="cell-path" :title="asset.current_path">
               {{ shortFileName(asset.current_path) }}
+            </td>
+            <td class="cell-actions">
+              <button
+                v-if="heldBack(asset)"
+                class="btn btn-mini"
+                :disabled="busyUuid === asset.uuid"
+                title="Examine this media again the next time it is offered, even though it failed before."
+                @click="onTryAgain(asset)"
+              >Try again</button>
+              <button
+                class="btn btn-mini"
+                :disabled="busyUuid === asset.uuid"
+                title="Move this entry to the recycle bin. The media file is not touched and you can restore it."
+                @click="askTrash(asset)"
+              >Remove</button>
+              <button
+                class="btn btn-mini btn-delete"
+                :disabled="busyUuid === asset.uuid"
+                title="Delete this entry for good, and optionally its media file."
+                @click="askPurge(asset)"
+              >Delete…</button>
             </td>
           </tr>
         </tbody>
@@ -75,12 +133,32 @@
 </template>
 
 <script setup lang="ts">
+import ConfirmDialog from './ConfirmDialog.vue'
 import { ref, computed, watch, onUnmounted } from 'vue'
 import type { AssetRecord } from '../composables/useEventStream'
 
+/**
+ * The delete actions arrive as props rather than being pulled from
+ * `useEventStream` here: that composable is not a singleton, so calling it in a
+ * second component would open a second SSE connection to the service. App.vue
+ * owns the connection and hands the wired calls down.
+ */
 const props = defineProps<{
   assets: AssetRecord[]
+  trashAsset: (uuid: string) => Promise<{ success: boolean; error?: string }>
+  purgeAsset: (
+    uuid: string,
+    deleteFile: boolean,
+  ) => Promise<{ success: boolean; mediaRemoved: boolean; warnings: string[]; error?: string }>
+  clearAssetVerdict: (uuid: string) => Promise<{ success: boolean; error?: string }>
 }>()
+
+/**
+ * Raised after any action that changes the registry, so the owner can refetch.
+ * Without it the row an operator just deleted stays on screen until the next
+ * poll, which reads as "the button did nothing".
+ */
+const emit = defineEmits<{ (e: 'changed'): void }>()
 
 const activeFilter = ref('all')
 const search = ref('')
@@ -112,8 +190,139 @@ const filters = [
   { key: 'all', label: 'All' },
   { key: 'ready', label: 'Ready' },
   { key: 'error', label: 'Error' },
+  // T-4. The server now says so itself when a published mezzanine is no longer
+  // on disk, instead of leaving it looking airable until someone tries.
+  { key: 'missing', label: 'Missing' },
   { key: 'processing', label: 'Processing' },
 ]
+
+/**
+ * Is the service refusing to encode this media again, and why?
+ *
+ * `retry_suppressed` comes from the server, which is the only side that knows:
+ * it depends on a recorded verdict key the payload does not carry. Inferring it
+ * here from the status and the warnings looked right and was wrong the moment
+ * an operator pressed Try again -- neither of those changes, so the badge went
+ * on claiming the media would not be retried after it had been released.
+ *
+ * Returns the reason for the tooltip, or '' when the row is not held back.
+ */
+const ENVIRONMENTAL = ['keyframe_scan_failed']
+function heldBack(asset: AssetRecord): string {
+  if (!asset.retry_suppressed) return ''
+  const real = (asset.warnings ?? []).filter((w) => !ENVIRONMENTAL.includes(w))
+  return real.join(', ') || 'a previous failure'
+}
+
+type PendingAction = {
+  kind: 'trash' | 'purge'
+  uuid: string
+  title: string
+  body: string
+  detail?: string
+  label: string
+  path?: string
+  sharedWith?: number
+}
+
+const pending = ref<PendingAction | null>(null)
+const alsoDeleteFile = ref(false)
+const busyUuid = ref<string | null>(null)
+const actionMsg = ref('')
+const actionOk = ref(false)
+
+function flash(msg: string, ok: boolean) {
+  actionMsg.value = msg
+  actionOk.value = ok
+  setTimeout(() => { actionMsg.value = '' }, 5000)
+}
+
+function assetLabel(a: AssetRecord) {
+  return a.display_name || a.uuid.slice(0, 8)
+}
+
+/** How many other rows play the same physical file (i.e. its sub-clips). */
+function othersSharingFile(a: AssetRecord): number {
+  if (!a.current_path) return 0
+  return props.assets.filter((x) => x.uuid !== a.uuid && x.current_path === a.current_path).length
+}
+
+function askTrash(a: AssetRecord) {
+  pending.value = {
+    kind: 'trash',
+    uuid: a.uuid,
+    title: `Remove "${assetLabel(a)}" from the library?`,
+    body: 'The entry moves to the recycle bin. The media file stays exactly where it is.',
+    detail: 'You can put it back from the recycle bin at any time.',
+    label: 'Remove',
+  }
+}
+
+function askPurge(a: AssetRecord) {
+  const shared = othersSharingFile(a)
+  // Default the checkbox off. The reversible choice is the one a tired
+  // operator should land on by pressing Return.
+  alsoDeleteFile.value = false
+  pending.value = {
+    kind: 'purge',
+    uuid: a.uuid,
+    title: `Delete "${assetLabel(a)}" permanently?`,
+    body: 'The registry entry is removed for good. This cannot be undone from the recycle bin.',
+    detail: shared
+      ? 'Its media file is shared with other entries, so the file itself is kept whatever you choose below.'
+      : undefined,
+    label: 'Delete permanently',
+    path: a.current_path,
+    sharedWith: shared || undefined,
+  }
+}
+
+async function onTryAgain(a: AssetRecord) {
+  busyUuid.value = a.uuid
+  try {
+    const r = await props.clearAssetVerdict(a.uuid)
+    if (r.success) emit('changed')
+    flash(
+      r.success
+        ? `"${assetLabel(a)}" will be examined again next time it is offered.`
+        : r.error || 'Could not clear the verdict',
+      r.success,
+    )
+  } finally {
+    busyUuid.value = null
+  }
+}
+
+async function runPending() {
+  const p = pending.value
+  if (!p) return
+  busyUuid.value = p.uuid
+  try {
+    if (p.kind === 'trash') {
+      const r = await props.trashAsset(p.uuid)
+      if (r.success) emit('changed')
+      flash(r.success ? 'Moved to the recycle bin.' : r.error || 'Could not remove', r.success)
+    } else {
+      const r = await props.purgeAsset(p.uuid, alsoDeleteFile.value)
+      if (r.success) emit('changed')
+      if (!r.success) {
+        flash(r.error || 'Could not delete', false)
+      } else if (alsoDeleteFile.value && !r.mediaRemoved) {
+        // Say so plainly rather than reporting a success the operator did not get.
+        flash(
+          'Entry deleted. The media file was kept: ' +
+            (r.warnings[0] || 'something else still references it.'),
+          true,
+        )
+      } else {
+        flash(r.mediaRemoved ? 'Entry and media file deleted.' : 'Entry deleted.', true)
+      }
+    }
+  } finally {
+    busyUuid.value = null
+    pending.value = null
+  }
+}
 
 function shortFileName(path: string) {
   return path?.split('\\').pop()?.split('/').pop() || path
@@ -327,6 +536,66 @@ tr:hover td {
 }
 .status-chip.error {
   background: rgba(229,57,53,0.12);
+  color: var(--accent-crimson);
+}
+.col-actions, .cell-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+.cell-actions .btn-mini + .btn-mini {
+  margin-left: 6px;
+}
+/* Not the global `.btn-danger`, which is a filled red block: one of those per
+   row turns the whole library into a wall of alarm and stops meaning anything.
+   Quiet until hovered, loud once it is the thing under the cursor. */
+.btn-delete {
+  color: var(--accent-crimson);
+  border-color: var(--border-subtle);
+}
+.btn-delete:hover:not(:disabled) {
+  background: var(--accent-crimson);
+  border-color: var(--accent-crimson);
+  color: #fff;
+}
+.held-chip {
+  margin-left: 6px;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 6px;
+  border-radius: 10px;
+  border: 1px solid var(--accent-crimson);
+  color: var(--accent-crimson);
+  white-space: nowrap;
+}
+.file-opt {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  cursor: pointer;
+}
+.file-opt-note {
+  display: block;
+  color: var(--text-secondary);
+  font-style: normal;
+  font-size: 12px;
+}
+.file-opt-path {
+  margin-top: 6px;
+  font-family: monospace;
+  font-size: 11px;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+.action-msg {
+  margin-bottom: 10px;
+  font-size: 12px;
+}
+.action-msg.ok { color: var(--accent-emerald); }
+.action-msg.err { color: var(--accent-crimson); }
+.status-chip.missing {
+  background: rgba(229,57,53,0.22);
   color: var(--accent-crimson);
 }
 </style>

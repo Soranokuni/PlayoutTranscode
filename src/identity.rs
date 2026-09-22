@@ -382,6 +382,64 @@ pub fn migrate_legacy_sidecars(videos_dir: &Path) -> SidecarMigration {
     out
 }
 
+/// Rewrite just `keyframe_safe_start_ms` in an existing sidecar, in place.
+///
+/// The T-1 backfill needs to correct one number on assets whose sidecars carry
+/// a loudness measurement, a QC report and a validation report that cannot be
+/// reconstructed from the registry row. Regenerating the payload from the row
+/// would silently drop all of it, so this patches the parsed JSON and leaves
+/// every other key exactly as it was.
+///
+/// Returns `Ok(false)` when the sidecar is absent or already correct -- neither
+/// is an error, and an asset ingested before sidecars were written has nothing
+/// to patch.
+pub fn patch_sidecar_keyframe_safe_start(
+    media_path: &Path,
+    keyframe_safe_start_ms: i64,
+) -> Result<bool, String> {
+    let sidecar_path = sidecar_path_for(media_path);
+    if !sidecar_path.exists() {
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(&sidecar_path)
+        .map_err(|e| format!("cannot read sidecar '{}': {}", sidecar_path.display(), e))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("sidecar '{}' is not valid JSON: {}", sidecar_path.display(), e))?;
+
+    let Some(obj) = doc.as_object_mut() else {
+        return Err(format!(
+            "sidecar '{}' is not a JSON object",
+            sidecar_path.display()
+        ));
+    };
+
+    if obj.get("keyframe_safe_start_ms").and_then(|v| v.as_i64()) == Some(keyframe_safe_start_ms) {
+        return Ok(false);
+    }
+    obj.insert(
+        "keyframe_safe_start_ms".to_string(),
+        serde_json::json!(keyframe_safe_start_ms),
+    );
+
+    let json = serde_json::to_string_pretty(&doc)
+        .map_err(|e| format!("cannot serialize the patched sidecar: {}", e))?;
+
+    // Same staging-then-rename as `write_sidecar_payload`: a half-written
+    // sidecar is what PlayOut hydrates from.
+    let tmp = sidecar_path.with_extension("tmp_json");
+    fs::write(&tmp, &json).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot write '{}': {}", tmp.display(), e)
+    })?;
+    fs::rename(&tmp, &sidecar_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("cannot publish '{}': {}", sidecar_path.display(), e)
+    })?;
+
+    Ok(true)
+}
+
 pub fn write_sidecar_payload(sidecar_path: &Path, payload: &SidecarPayload) -> Result<PathBuf, String> {
     if let Some(parent) = sidecar_path.parent() {
         if let Err(e) = fs::create_dir_all(parent) {
@@ -1004,6 +1062,8 @@ mod tests {
             keyframe_offsets_json: "[]".to_string(),
             deleted_at: None,
             original_virtual_folder: None,
+            parent_uuid: None,
+            qc_verdict_key: None,
         };
 
         // A 720p50 MPEG-2 asset with 5.1 audio: nothing like the 1080p25 H.264
@@ -1092,6 +1152,8 @@ mod tests {
             keyframe_offsets_json: "[]".into(),
             deleted_at: None,
             original_virtual_folder: None,
+            parent_uuid: None,
+            qc_verdict_key: None,
         };
 
         let path = build_sidecar_from_db_asset_with_probe(&asset, None).unwrap();
@@ -1132,6 +1194,8 @@ mod tests {
             keyframe_offsets_json: "[]".into(),
             deleted_at: None,
             original_virtual_folder: None,
+            parent_uuid: None,
+            qc_verdict_key: None,
         };
 
         let tools = crate::bootstrap::ToolPaths {
@@ -1182,6 +1246,8 @@ mod tests {
             keyframe_offsets_json: "[]".into(),
             deleted_at: None,
             original_virtual_folder: None,
+            parent_uuid: None,
+            qc_verdict_key: None,
         };
 
         let tools = crate::bootstrap::ToolPaths {

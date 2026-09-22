@@ -380,6 +380,16 @@ pub struct JobStateCounts {
     pub total: usize,
 }
 
+/// Why a job could not be taken off the rail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DismissError {
+    NotFound,
+    /// The job is still pending or running. Cancel it first; dismissing a
+    /// record whose encoder is still going would leave an ffmpeg process with
+    /// nothing tracking it.
+    StillActive,
+}
+
 #[derive(Clone)]
 pub struct JobQueue {
     jobs: Arc<RwLock<Vec<JobRecord>>>,
@@ -678,6 +688,44 @@ impl JobQueue {
             .collect();
         cancelled.sort_by(|a, b| b.finished_at.cmp(&a.finished_at));
         cancelled
+    }
+
+    /// Take one finished job off the queue.
+    ///
+    /// Only terminal jobs: a completed, failed, skipped or cancelled record is
+    /// history, and history is the operator's to clear. A pending or running
+    /// one is refused -- see [`DismissError::StillActive`] -- because
+    /// dismissing a record whose encoder is still going would leave an ffmpeg
+    /// process with nothing tracking it.
+    ///
+    /// Returns the removed record so the caller can report what went.
+    pub fn dismiss(&self, id: &str) -> Result<JobRecord, DismissError> {
+        let mut jobs = self.jobs.write();
+        let Some(idx) = jobs.iter().position(|j| j.id == id) else {
+            return Err(DismissError::NotFound);
+        };
+        if !jobs[idx].phase.is_terminal() {
+            return Err(DismissError::StillActive);
+        }
+        Ok(jobs.remove(idx))
+    }
+
+    /// Take every finished job in `states` off the queue at once.
+    ///
+    /// The bulk form of [`Self::dismiss`], and it inherits the same rule:
+    /// anything still running is left exactly where it is, whatever the caller
+    /// asked for.
+    pub fn dismiss_all(&self, states: &[JobState]) -> Vec<String> {
+        let mut jobs = self.jobs.write();
+        let mut removed = Vec::new();
+        jobs.retain(|j| {
+            let go = j.phase.is_terminal() && states.contains(&j.state);
+            if go {
+                removed.push(j.id.clone());
+            }
+            !go
+        });
+        removed
     }
 
     pub fn prune_old(&self, max_entries: usize) {
@@ -1173,5 +1221,108 @@ mod tests {
         assert_eq!(json["progress"], 100.0);
         assert_eq!(json["input_path"], "D:/media/in.mp4");
         assert_eq!(json["uuid"], "test-uuid-123");
+    }
+
+    fn queue() -> JobQueue {
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        JobQueue::new_in_memory(tx)
+    }
+
+    fn terminal_job(input: &str, phase: JobPhase) -> JobRecord {
+        let mut j = JobRecord::new(input, "ProfileA");
+        // Walk the phase machine rather than assigning, so these fixtures stay
+        // honest if the allowed transitions change.
+        let _ = j.transition_to(JobPhase::Probing, None);
+        match phase {
+            JobPhase::Failed => {
+                let _ = j.transition_to(JobPhase::Failed, None);
+            }
+            JobPhase::Skipped => {
+                let _ = j.transition_to(JobPhase::Skipped, None);
+            }
+            _ => {
+                let _ = j.transition_to(JobPhase::Planned, None);
+                let _ = j.transition_to(JobPhase::Encoding, None);
+                let _ = j.transition_to(JobPhase::Validating, None);
+                let _ = j.transition_to(JobPhase::Publishing, None);
+                let _ = j.transition_to(JobPhase::Completed, None);
+            }
+        }
+        assert!(j.phase.is_terminal(), "fixture must be terminal");
+        j
+    }
+
+    /// The × button. A finished record is history and history is the
+    /// operator's to clear.
+    #[test]
+    fn a_finished_job_can_be_dismissed() {
+        let q = queue();
+        let job = terminal_job("a.mxf", JobPhase::Failed);
+        let id = job.id.clone();
+        q.push(job);
+        assert_eq!(q.all().len(), 1);
+
+        let removed = q.dismiss(&id).expect("a failed job must be dismissable");
+        assert_eq!(removed.id, id);
+        assert!(q.all().is_empty());
+        assert_eq!(q.dismiss(&id).unwrap_err(), DismissError::NotFound);
+    }
+
+    /// Dismissing a running job would leave an ffmpeg process with nothing
+    /// tracking it -- no progress, no cancel, no way to find the PID.
+    #[test]
+    fn a_running_job_cannot_be_dismissed() {
+        let q = queue();
+        let mut job = JobRecord::new("live.mxf", "ProfileA");
+        let _ = job.transition_to(JobPhase::Probing, None);
+        let _ = job.transition_to(JobPhase::Planned, None);
+        let _ = job.transition_to(JobPhase::Encoding, None);
+        assert_eq!(job.phase, JobPhase::Encoding, "fixture must be running");
+        let id = job.id.clone();
+        q.push(job);
+
+        assert_eq!(q.dismiss(&id).unwrap_err(), DismissError::StillActive);
+        assert_eq!(q.all().len(), 1, "and it stays on the queue");
+    }
+
+    /// "Clear all failed" clears the failed ones and nothing else.
+    #[test]
+    fn a_bulk_dismiss_spares_everything_it_was_not_asked_for() {
+        let q = queue();
+        for _ in 0..3 {
+            q.push(terminal_job("bad.mxf", JobPhase::Failed));
+        }
+        q.push(terminal_job("good.mxf", JobPhase::Completed));
+        let mut running = JobRecord::new("live.mxf", "ProfileA");
+        let _ = running.transition_to(JobPhase::Probing, None);
+        let _ = running.transition_to(JobPhase::Planned, None);
+        let _ = running.transition_to(JobPhase::Encoding, None);
+        assert_eq!(running.phase, JobPhase::Encoding, "fixture must be running");
+        q.push(running);
+
+        let removed = q.dismiss_all(&[JobState::Failed]);
+        assert_eq!(removed.len(), 3);
+
+        let left = q.all();
+        assert_eq!(left.len(), 2, "the completed one and the running one stay");
+        assert!(left.iter().any(|j| j.state == JobState::Completed));
+        assert!(left.iter().any(|j| j.phase == JobPhase::Encoding));
+    }
+
+    /// A bulk dismiss must never take a running job, even when its state was
+    /// asked for -- the terminal check is not the caller's to waive.
+    #[test]
+    fn a_bulk_dismiss_never_takes_a_running_job() {
+        let q = queue();
+        let mut running = JobRecord::new("live.mxf", "ProfileA");
+        let _ = running.transition_to(JobPhase::Probing, None);
+        let _ = running.transition_to(JobPhase::Planned, None);
+        let _ = running.transition_to(JobPhase::Encoding, None);
+        assert_eq!(running.phase, JobPhase::Encoding, "fixture must be running");
+        let state = running.state;
+        q.push(running);
+
+        assert!(q.dismiss_all(&[state]).is_empty());
+        assert_eq!(q.all().len(), 1);
     }
 }

@@ -553,7 +553,14 @@ pub fn start_processing_loop(
             // Recovery sweep: purge DB rows whose source is still in the watch folder so the
             // watcher re-queues them; also purge rows whose source is gone. This is the
             // "auto-purge + retry on start" behaviour.
-            match db::recover_failed_assets(&pool, &watch, cfg.ingestion.auto_retry_on_start).await {
+            match db::recover_failed_assets(
+                &pool,
+                &watch,
+                cfg.ingestion.auto_retry_on_start,
+                |sha| crate::processor::qc_verdict_key(sha, &cfg),
+            )
+            .await
+            {
                 Ok(o) => {
                     if o.purged_for_retry > 0 || o.purged_dead > 0 || o.kept_dead > 0 {
                         handle_for_thread.add_log(
@@ -561,6 +568,19 @@ pub fn start_processing_loop(
                             &format!(
                                 "Recovery: purged {} retryable / {} dead, kept {} dead rows for inspection",
                                 o.purged_for_retry, o.purged_dead, o.kept_dead
+                            ),
+                        );
+                    }
+                    // Said separately, and said whenever it is non-zero. An
+                    // operator who leaves a file in the watch folder and sees
+                    // nothing happen is owed the reason, or they will conclude
+                    // the watcher is broken.
+                    if o.kept_permanent > 0 {
+                        handle_for_thread.add_log(
+                            "info",
+                            &format!(
+                                "Recovery: {} asset(s) already failed permanently on this exact                                  media and these exact settings, so they were not queued again.                                  Replace the file, change the encoding or validation settings,                                  or delete the asset to have it re-examined.",
+                                o.kept_permanent
                             ),
                         );
                     }

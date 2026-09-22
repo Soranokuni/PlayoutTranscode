@@ -139,8 +139,16 @@
             @retry="onRetryJob"
             @cancel="onCancelJob"
             @retry-all="askRetryAll"
+            @dismiss="onDismissJob"
+            @clear-all="onClearAllFailed"
           />
-          <AssetRegistryGrid :assets="assets" />
+          <AssetRegistryGrid
+            :assets="assets"
+            :trash-asset="trashAsset"
+            :purge-asset="purgeAsset"
+            :clear-asset-verdict="clearAssetVerdict"
+            @changed="fetchAssets"
+          />
 
           <div v-if="!serviceRunning && !stats.total" class="empty-state">
             <div style="font-size:18px;color:var(--text-secondary);margin-bottom:12px">Service is stopped</div>
@@ -395,8 +403,9 @@ const {
   jobs, assets, watchfolder, stats, config, toolchain,
   serviceRunning, serviceStatus, downloading, logs, logLines, linkState, uptimeMs,
   fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
-  setLogPolling, clearLogs, retryJob, cancelJob, retryAllFailed,
-  fetchServiceStatus,
+  setLogPolling, clearLogs, retryJob, cancelJob, retryAllFailed, dismissJob, dismissFinishedJobs,
+  trashAsset, purgeAsset, clearAssetVerdict,
+  fetchServiceStatus, fetchAssets,
   authRequired, applyApiToken,
 } = useEventStream()
 
@@ -497,6 +506,24 @@ async function onCancelJob(id: string) {
   const ok = !!r?.success
   const msg = ok ? 'Cancelling job…' : (r?.error || 'Cancel failed')
   ingestPanelRef.value?.showRetryMsg(msg, ok)
+}
+
+/**
+ * Dismissing a job clears a *record*, never media, so it is not put behind the
+ * confirm dialog -- an × that opens a modal is an × nobody presses twice.
+ */
+async function onDismissJob(id: string) {
+  const r = await dismissJob(id)
+  if (!r.success) ingestPanelRef.value?.showRetryMsg(r.error || 'Could not dismiss', false)
+}
+
+async function onClearAllFailed() {
+  const r = await dismissFinishedJobs('failed')
+  const ok = !r.error
+  ingestPanelRef.value?.showRetryMsg(
+    ok ? `Cleared ${r.dismissed} failed job${r.dismissed === 1 ? '' : 's'}` : (r.error as string),
+    ok,
+  )
 }
 
 type ConfirmKind = 'stop' | 'restart' | 'retryAll'

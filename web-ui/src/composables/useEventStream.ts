@@ -61,6 +61,14 @@ export interface AssetRecord {
   status: string
   display_name: string
   virtual_folder: string
+  /** QC findings. Present on the v1 asset payload; absent on older servers. */
+  warnings?: string[]
+  /**
+   * The service has recorded that this media already failed under the current
+   * settings and will skip it rather than encode it again. Absent on older
+   * servers, which never skipped anything.
+   */
+  retry_suppressed?: boolean
 }
 
 export interface HealthPayload {
@@ -443,6 +451,135 @@ export function useEventStream() {
     }
   }
 
+  /**
+   * Take one finished job off the queue.
+   *
+   * The record only: the asset row, the mezzanine and the source file are all
+   * untouched. The server refuses (409) for a job that is still running, so a
+   * stray click cannot orphan a live encode.
+   */
+  async function dismissJob(id: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const r = await apiFetch('/api/jobs/' + encodeURIComponent(id), { method: 'DELETE' })
+      if (r.ok) {
+        // Drop it locally rather than waiting for the round trip: the × should
+        // feel instant, and the `job_removed` event reconciles every other tab.
+        if (jobs.value.delete(id)) triggerRef(jobs)
+        return { success: true }
+      }
+      const text = await r.text()
+      const parsed = text ? (JSON.parse(text) as { error?: string; detail?: string }) : {}
+      return { success: false, error: parsed.detail || parsed.error || `HTTP ${r.status}` }
+    } catch (e) {
+      console.error('[useEventStream] dismissJob failed:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /** Clear every finished job in the given states. Defaults to the failed ones. */
+  async function dismissFinishedJobs(
+    state = 'failed',
+  ): Promise<{ dismissed: number; error?: string }> {
+    try {
+      const r = await apiFetch('/api/jobs/finished?state=' + encodeURIComponent(state), {
+        method: 'DELETE',
+      })
+      const text = await r.text()
+      const parsed = text ? (JSON.parse(text) as { dismissed?: number; ids?: string[]; error?: string }) : {}
+      if (!r.ok) return { dismissed: 0, error: parsed.error || `HTTP ${r.status}` }
+      for (const id of parsed.ids ?? []) jobs.value.delete(id)
+      triggerRef(jobs)
+      return { dismissed: parsed.dismissed ?? 0 }
+    } catch (e) {
+      console.error('[useEventStream] dismissFinishedJobs failed:', e)
+      return { dismissed: 0, error: String(e) }
+    }
+  }
+
+  /**
+   * Take an asset out of the library, reversibly.
+   *
+   * Soft delete: the row moves to the recycle bin and the media file is not
+   * touched, so a mis-click costs a Restore rather than a re-ingest.
+   */
+  async function trashAsset(uuid: string): Promise<{ success: boolean; error?: string }> {
+    try {
+      const r = await apiFetch('/api/assets/' + encodeURIComponent(uuid) + '/trash', {
+        method: 'POST',
+      })
+      if (r.ok) return { success: true }
+      const text = await r.text()
+      const parsed = text ? (JSON.parse(text) as { error?: string }) : {}
+      return { success: false, error: parsed.error || `HTTP ${r.status}` }
+    } catch (e) {
+      console.error('[useEventStream] trashAsset failed:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
+  /**
+   * Delete an asset permanently.
+   *
+   * `deleteFile` is the difference between "take it off the list" and "and bin
+   * the mezzanine too". The server refuses to remove a file that a sub-clip
+   * still plays regardless of what is asked for.
+   */
+  async function purgeAsset(
+    uuid: string,
+    deleteFile: boolean,
+  ): Promise<{ success: boolean; mediaRemoved: boolean; warnings: string[]; error?: string }> {
+    try {
+      const r = await apiFetchDestructive(
+        '/api/assets/' + encodeURIComponent(uuid) + '/purge?delete_file=' + (deleteFile ? 'true' : 'false'),
+        { method: 'DELETE' },
+      )
+      const text = await r.text()
+      const parsed = text
+        ? (JSON.parse(text) as { media_removed?: boolean; warnings?: string[]; error?: string })
+        : {}
+      if (!r.ok) {
+        return {
+          success: false,
+          mediaRemoved: false,
+          warnings: parsed.warnings ?? [],
+          error: parsed.error || `HTTP ${r.status}`,
+        }
+      }
+      return {
+        success: true,
+        mediaRemoved: !!parsed.media_removed,
+        warnings: parsed.warnings ?? [],
+      }
+    } catch (e) {
+      console.error('[useEventStream] purgeAsset failed:', e)
+      return { success: false, mediaRemoved: false, warnings: [], error: String(e) }
+    }
+  }
+
+  /**
+   * Let the service reconsider media it has given up on.
+   *
+   * Clears the recorded QC verdict, so the next time this source is offered it
+   * is judged from scratch instead of skipped.
+   */
+  async function clearAssetVerdict(
+    uuid: string,
+  ): Promise<{ success: boolean; error?: string }> {
+    try {
+      const r = await apiFetch(
+        '/api/assets/' + encodeURIComponent(uuid) + '/clear-verdict',
+        { method: 'POST' },
+      )
+      if (r.ok) return { success: true }
+      const text = await r.text()
+      const parsed = text ? (JSON.parse(text) as { error?: string }) : {}
+      return { success: false, error: parsed.error || `HTTP ${r.status}` }
+    } catch (e) {
+      console.error('[useEventStream] clearAssetVerdict failed:', e)
+      return { success: false, error: String(e) }
+    }
+  }
+
   /** Re-queue all currently-failed jobs in one shot. */
   async function retryAllFailed(): Promise<{ submitted: number; source_missing: number; errors: number }> {
     try {
@@ -588,6 +725,17 @@ export function useEventStream() {
         scheduleTerminalRefresh(payload?.uuid)
         break
       }
+      // Another tab (or this one) dismissed job records. Drop them rather than
+      // refetching the whole list for a removal we can apply directly.
+      case 'job_removed': {
+        const payload = data as { ids?: string[] }
+        let changed = false
+        for (const id of payload?.ids ?? []) {
+          if (jobs.value.delete(id)) changed = true
+        }
+        if (changed) triggerRef(jobs)
+        break
+      }
       case 'connected': {
         linkState.value = 'live'
         fetchAll()
@@ -631,6 +779,9 @@ export function useEventStream() {
     })
     // Emitted when an ingest was skipped as a confirmed duplicate (T2-6). It is
     // a terminal outcome, so the queue and the library both need refreshing.
+    sseConnection.addEventListener('job_removed', (e) => {
+      try { handleSSEEvent('job_removed', JSON.parse(e.data)) } catch { /* nothing to remove */ }
+    })
     sseConnection.addEventListener('skipped', (e) => {
       try { handleSSEEvent('skipped', JSON.parse(e.data)) } catch { handleSSEEvent('skipped', {}) }
     })
@@ -812,6 +963,11 @@ export function useEventStream() {
     retryJob,
     cancelJob,
     retryAllFailed,
+    dismissJob,
+    dismissFinishedJobs,
+    trashAsset,
+    purgeAsset,
+    clearAssetVerdict,
     shortFileName,
     authRequired,
     apiToken,
