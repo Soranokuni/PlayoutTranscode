@@ -290,7 +290,14 @@ CREATE INDEX IF NOT EXISTS idx_media_assets_fingerprint ON media_assets(fingerpr
 
   A failure whose findings are **all** environmental (`keyframe_scan_failed` —
   ffprobe could not be run) is never treated as permanent, and neither is a
-  failure with no recorded findings. Rows published before `qc_verdict_key`
+  failure with no recorded findings. A failure that never reached QC -- the
+  source would not probe, or the output did not match it -- records one code
+  in `warnings` beside its key, so it is recognised on re-ingest too:
+  `output_duration_mismatch`, `output_missing_video`, `no_video_stream`,
+  `no_audio_stream`, `unsupported_audio_channel_layout`,
+  `audio_measurement_failed`, `unsupported_codec`, `source_unreadable`,
+  `profile_disabled`, `source_probe_failed`, `output_validation_failed`,
+  `ingest_failed_permanently`. Rows published before `qc_verdict_key`
   existed have no record of the settings that judged them, so a much narrower
   test applies to them (`duration_delta_exceeded` only) until a skip stamps the
   current key onto them.

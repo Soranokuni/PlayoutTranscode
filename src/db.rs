@@ -473,8 +473,13 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
                  WHERE parent_uuid IS NULL
                    AND source_sha256 IS NULL
                    AND (trim_in_ms > 0
-                        OR (trim_out_ms <> 0 AND trim_out_ms <> duration_ms)))",
+                        OR (trim_out_ms <> 0 AND trim_out_ms <> duration_ms)))
+             + (SELECT COUNT(*) FROM media_assets
+                 WHERE status = 'error' AND mezzanine_ok = 0
+                   AND qc_verdict_key IS NOT NULL AND qc_verdict_key <> ?1
+                   AND warnings IN ('', '[]'))",
         )
+        .bind(QC_VERDICT_CLEARED)
         .fetch_one(pool)
         .await
         .unwrap_or(0);
@@ -565,6 +570,51 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
             tracing::info!(
                 "Adopted {} pre-existing sub-clip row(s) onto parent_uuid",
                 adopted.rows_affected()
+            );
+        }
+    }
+
+    // W-3. A permanent failure recorded before W-3 has its verdict key but
+    // `warnings = []`, which `find_reproducible_qc_failure` ignores -- so the
+    // source is encoded once more on the next start just to write the finding.
+    // The finding is recoverable: the failed job kept its error text. A live
+    // key on an `error` row was only ever written by `mark_error_permanent`,
+    // so a row whose jobs are gone still gets the generic code.
+    {
+        let rows: Vec<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT a.uuid,
+                    (SELECT j.error FROM transcode_jobs j
+                      WHERE j.uuid = a.uuid AND j.error IS NOT NULL
+                      ORDER BY j.created_at DESC LIMIT 1),
+                    (SELECT j.error_category FROM transcode_jobs j
+                      WHERE j.uuid = a.uuid AND j.error IS NOT NULL
+                      ORDER BY j.created_at DESC LIMIT 1)
+             FROM media_assets a
+             WHERE a.status = 'error'
+               AND a.mezzanine_ok = 0
+               AND a.qc_verdict_key IS NOT NULL
+               AND a.qc_verdict_key <> ?1
+               AND a.warnings IN ('', '[]')",
+        )
+        .bind(QC_VERDICT_CLEARED)
+        .fetch_all(pool)
+        .await?;
+        for (uuid, error, category) in &rows {
+            let code = crate::processor::permanent_failure_code(
+                error.as_deref().unwrap_or(""),
+                category.as_deref() == Some("validation_failure"),
+            );
+            sqlx::query("UPDATE media_assets SET warnings = ?1 WHERE uuid = ?2")
+                .bind(serde_json::json!([code]).to_string())
+                .bind(uuid)
+                .execute(pool)
+                .await?;
+        }
+        if !rows.is_empty() {
+            tracing::info!(
+                "Recorded the finding on {} permanently failed asset(s) that had a verdict but no \
+                 warnings (W-3); they will not be re-encoded",
+                rows.len()
             );
         }
     }
@@ -975,15 +1025,37 @@ pub async fn mark_error(pool: &SqlitePool, uuid: &str) -> Result<(), sqlx::Error
 /// the next start. Without it the sweep deletes the row, the watcher re-offers
 /// the file, and the whole encode is spent reaching the same conclusion —
 /// on every restart, for ever, on media that cannot be ingested.
+///
+/// `finding` is appended to `warnings` (W-3). The key alone kept the row past
+/// the startup sweep, but [`find_reproducible_qc_failure`] -- the check the
+/// ingest path makes when the watcher re-offers the source -- ignores a row
+/// with no findings, so the source was re-encoded anyway. Live rows 52, 56 and
+/// 57 were in exactly that state: key set, `warnings = []`.
 pub async fn mark_error_permanent(
     pool: &SqlitePool,
     uuid: &str,
     qc_verdict_key: &str,
+    finding: &str,
 ) -> Result<(), sqlx::Error> {
+    let current: Option<String> =
+        sqlx::query_scalar("SELECT warnings FROM media_assets WHERE uuid = ?1")
+            .bind(uuid)
+            .fetch_optional(pool)
+            .await?;
+    let mut findings: Vec<String> = current
+        .and_then(|w| serde_json::from_str(&w).ok())
+        .unwrap_or_default();
+    if !findings.iter().any(|f| f == finding) {
+        findings.push(finding.to_string());
+    }
+    let warnings = serde_json::to_string(&findings).unwrap_or_else(|_| "[]".to_string());
+
     sqlx::query(
-        "UPDATE media_assets SET status = 'error', qc_verdict_key = ?1 WHERE uuid = ?2",
+        "UPDATE media_assets SET status = 'error', qc_verdict_key = ?1, warnings = ?2
+         WHERE uuid = ?3",
     )
     .bind(qc_verdict_key)
+    .bind(warnings)
     .bind(uuid)
     .execute(pool)
     .await?;
@@ -4985,7 +5057,9 @@ mod tests {
         insert_processing(&pool, "bad", 910_010, Some("sha-bad"), &path, "Bad")
             .await
             .unwrap();
-        mark_error_permanent(&pool, "bad", "key-now").await.unwrap();
+        mark_error_permanent(&pool, "bad", "key-now", "no_video_stream")
+            .await
+            .unwrap();
 
         let key_for = |sha: &str| {
             if sha == "sha-bad" {
@@ -5009,6 +5083,31 @@ mod tests {
             .unwrap();
         assert_eq!(again.kept_permanent, 1);
         assert_eq!(again.purged_for_retry, 0);
+
+        // W-3. Keeping the row is only half of it: the watcher's initial scan
+        // still re-offers the source, and the ingest path asks
+        // `find_reproducible_qc_failure`, which ignores a row with no
+        // findings. The key used to be recorded with `warnings = []`, so the
+        // answer was "no" and the source was encoded again anyway.
+        let bad = find_by_uuid(&pool, "bad").await.unwrap().unwrap();
+        assert_eq!(bad.warnings, r#"["no_video_stream"]"#);
+        let hit = find_reproducible_qc_failure(&pool, "key-now", "sha-bad")
+            .await
+            .unwrap();
+        assert_eq!(
+            hit.map(|a| a.uuid).as_deref(),
+            Some("bad"),
+            "a re-offered source must be recognised as already judged"
+        );
+
+        // Recording it twice does not duplicate the finding.
+        mark_error_permanent(&pool, "bad", "key-now", "no_video_stream")
+            .await
+            .unwrap();
+        assert_eq!(
+            find_by_uuid(&pool, "bad").await.unwrap().unwrap().warnings,
+            r#"["no_video_stream"]"#
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5039,7 +5138,7 @@ mod tests {
             .unwrap();
         }
         // One was judged permanent under settings that have since changed...
-        mark_error_permanent(&pool, "settings-moved", "key-old")
+        mark_error_permanent(&pool, "settings-moved", "key-old", "output_duration_mismatch")
             .await
             .unwrap();
         // ...the other failed transiently and carries no verdict at all.
@@ -5211,6 +5310,83 @@ mod tests {
 
         // Idempotent: the next start is a no-op, not a second failure.
         run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W-3 backfill. Rows 52, 56 and 57 of the live registry: a permanent
+    /// verdict with `warnings = []`, which the ingest-time dedupe ignores. The
+    /// finding comes back from the failed job's error text.
+    #[tokio::test]
+    async fn verdicts_without_findings_get_their_finding_from_the_job() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let pool = init_schema(pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO media_assets
+               (uuid, fingerprint, source_sha256, current_path, status, qc_verdict_key, warnings)
+             VALUES
+               ('dur',     1, 's1', 'D:/w/a.mov', 'error', 'k1', '[]'),
+               ('novid',   2, 's2', 'D:/w/b.mxf', 'error', 'k2', '[]'),
+               ('nojob',   3, 's3', 'D:/w/c.mxf', 'error', 'k3', '[]'),
+               ('cleared', 4, 's4', 'D:/w/d.mxf', 'error', ?1,   '[]'),
+               ('transient', 5, 's5', 'D:/w/e.mxf', 'error', NULL, '[]')",
+        )
+        .bind(QC_VERDICT_CLEARED)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (id, uuid, error, category, at) in [
+            ("j0", "dur", "ffmpeg exited with code 1", "", "2026-09-21T10:00:00Z"),
+            (
+                "j1",
+                "dur",
+                "Duration mismatch: source=268.408s output=31.560s (diff=236848ms, tolerance=1200ms)",
+                "validation_failure",
+                "2026-09-22T11:15:48Z",
+            ),
+            ("j2", "novid", "Probe: No video stream found", "probe_failure", "2026-09-22T11:16:08Z"),
+            ("j3", "cleared", "Probe: No video stream found", "probe_failure", "2026-09-22T11:16:09Z"),
+        ] {
+            sqlx::query(
+                "INSERT INTO transcode_jobs
+                   (id, input_path, profile, uuid, state, phase, current_stage, error,
+                    error_category, created_at)
+                 VALUES (?1, 'x', 'A', ?2, 'Failed', 'failed', 'failed', ?3, NULLIF(?4, ''), ?5)",
+            )
+            .bind(id)
+            .bind(uuid)
+            .bind(error)
+            .bind(category)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let dir = std::env::temp_dir().join(format!("pt_test_w3_{}", uuid::Uuid::new_v4()));
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
+
+        let warnings = |uuid: &'static str| {
+            let pool = pool.clone();
+            async move { find_by_uuid(&pool, uuid).await.unwrap().unwrap().warnings }
+        };
+        assert_eq!(warnings("dur").await, r#"["output_duration_mismatch"]"#, "latest job wins");
+        assert_eq!(warnings("novid").await, r#"["no_video_stream"]"#);
+        assert_eq!(warnings("nojob").await, r#"["ingest_failed_permanently"]"#);
+        assert_eq!(warnings("cleared").await, "[]", "an operator's override is left alone");
+        assert_eq!(warnings("transient").await, "[]", "no verdict, nothing to record");
+
+        // And the ingest path now recognises them.
+        assert!(find_reproducible_qc_failure(&pool, "k2", "s2").await.unwrap().is_some());
+
+        // Idempotent.
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
+        assert_eq!(warnings("novid").await, r#"["no_video_stream"]"#);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
