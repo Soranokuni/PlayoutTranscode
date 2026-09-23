@@ -5,7 +5,7 @@ use crate::jobs::JobQueue;
 use parking_lot::Mutex;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex as StdMutex};
 use tokio::sync::mpsc;
 
@@ -460,11 +460,19 @@ pub fn start_processing_loop(
     job_queue: &JobQueue,
     tools: &ToolPaths,
     pool: Arc<SqlitePool>,
+    registry_id: &str,
 ) -> Result<(), String> {
     // Claims the state machine before anything else, so two concurrent
     // `POST /api/service/start` calls cannot both get past this point.
     let generation = handle.begin_start()?;
     *handle.started_config_hash.lock() = Some(runtime_config_hash(config));
+
+    // Refused outright: `create_dir_all("")` succeeds, and the claim would
+    // then stamp the working directory.
+    if config.paths.target_folder.trim().is_empty() {
+        handle.abandon_start(generation);
+        return Err("Target folder is not configured".to_string());
+    }
 
     // Creating the target folder used to be a side effect of
     // `AppConfig::validate()`, which meant an unauthenticated `PUT /api/config`
@@ -476,6 +484,17 @@ pub fn start_processing_loop(
             "Cannot create target folder '{}': {}",
             config.paths.target_folder, e
         ));
+    }
+
+    // W-4. The T-3 ownership claim used to run only in `run_service`, against
+    // the folder configured at process start. `PUT /api/config` with a new
+    // `target_folder` followed by `POST /api/service/start` then published into
+    // a folder nobody had claimed -- or one another registry already owns.
+    // Every start comes through here, so this is where it is enforced.
+    if let Err(e) = crate::media_root::claim(Path::new(&config.paths.target_folder), registry_id) {
+        tracing::error!("{}", e);
+        handle.abandon_start(generation);
+        return Err(e.to_string());
     }
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<ServiceCmd>(1);
@@ -1113,6 +1132,50 @@ mod lifecycle_tests {
         *release.lock().unwrap() = true;
         stop_processing(&handle);
         assert!(wait_until_stopped(&handle, Duration::from_secs(5)));
+    }
+
+    /// W-4. `PUT /api/config` can point the service at a new `target_folder`
+    /// while it is stopped; the next start must claim that folder, and refuse
+    /// one another registry owns, exactly as `run_service` does at boot.
+    #[tokio::test]
+    async fn a_start_refuses_a_target_folder_owned_by_another_registry() {
+        let root = std::env::temp_dir().join(format!("pt_test_w4_{}", uuid::Uuid::new_v4()));
+        let watch = root.join("watch");
+        let target = root.join("target");
+        std::fs::create_dir_all(&watch).unwrap();
+        crate::media_root::claim(&target, "someone-else").unwrap();
+        let marker = target.join(crate::media_root::MARKER_FILE_NAME);
+        let before = std::fs::read_to_string(&marker).unwrap();
+
+        let pool = Arc::new(crate::db::init_pool(&root.join("test.db")).await.unwrap());
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let jobs = JobQueue::new_in_memory(tx);
+        let tools = ToolPaths {
+            ffmpeg: PathBuf::from("ffmpeg"),
+            ffprobe: PathBuf::from("ffprobe"),
+        };
+        let mut cfg = AppConfig::default();
+        cfg.paths.watch_folder = watch.to_string_lossy().to_string();
+        cfg.paths.target_folder = target.to_string_lossy().to_string();
+
+        let handle = ServiceHandle::new();
+        let err = start_processing_loop(&handle, &cfg, &jobs, &tools, pool.clone(), "ours")
+            .unwrap_err();
+        assert!(err.contains("already owned"), "{err}");
+        assert_eq!(handle.state(), ServiceState::Stopped, "a refused start leaves nothing running");
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            before,
+            "the other registry's claim is untouched"
+        );
+
+        // No target at all is refused too, rather than claiming the cwd.
+        cfg.paths.target_folder = String::new();
+        let err = start_processing_loop(&handle, &cfg, &jobs, &tools, pool, "ours").unwrap_err();
+        assert!(err.contains("not configured"), "{err}");
+        assert_eq!(handle.state(), ServiceState::Stopped);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

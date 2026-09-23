@@ -1041,6 +1041,11 @@ The service stamps its `target_folder` with its own registry identity and
 the guard that would have made the two-registry incident impossible rather than
 merely survivable.
 
+The claim is made on every start of the processing loop, not only at process
+boot (W-4): after `PUT /api/config` changes `target_folder`,
+`POST /api/service/start` claims the new folder, or answers `409` with the
+ownership error if another registry holds it.
+
 Marker file: `.playouttranscode-registry.json` in the target folder. Deleting it
 is the documented way to hand a folder over deliberately.
 
