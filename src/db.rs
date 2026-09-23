@@ -1888,19 +1888,15 @@ pub async fn purge_single_asset_with_context(
         PurgeMode::KeepMedia => false,
         PurgeMode::DeleteMediaIfUnreferenced => remaining_refs == 0 && !path.is_empty(),
     };
-    // Only a `ready` row's `current_path` points at a published mezzanine.
-    // For `processing` and `error` rows it is still the *source* file, so the
-    // row goes but the file must not (F-19).
-    let should_remove_file = if should_remove_file && a.status != "ready" {
-        warnings.push(format!(
-            "Physical file cleanup skipped: asset status is '{}', not 'ready'",
-            a.status
-        ));
-        false
-    } else {
-        should_remove_file
-    };
-
+    // W-2. Whether the file is ours to delete is a question about where it is,
+    // not about the row's status. This used to skip every non-`ready` row on
+    // the theory that only `ready` pointed at a published mezzanine (F-19), but
+    // T-5 made a QC-failed *published* mezzanine `error` -- and those files
+    // outlived their rows: 11 orphaned `.mp4`s in the live media folder, all
+    // still playable by name in CasparCG. `validate_purge_path` already fails
+    // closed on anything outside `target_folder` or inside `watch_folder`, and
+    // config refuses overlapping roots, so a source file for a `processing` or
+    // pre-publish `error` row can never pass it.
     if remaining_refs > 0 {
         skipped_referenced_files.push(path.clone());
         warnings.push(format!(
@@ -4390,9 +4386,14 @@ mod tests {
     #[tokio::test]
     async fn test_purge_of_error_row_keeps_the_source_file() {
         let (pool, temp_dir) = setup_test_pool().await;
-        // For a `processing`/`error` row, `current_path` is still the SOURCE
-        // file in the watch folder. The row must go; the file must not.
-        let source = temp_dir.join("source_clip.mp4");
+        // For a `processing`/pre-publish `error` row, `current_path` is still
+        // the SOURCE file in the watch folder. The row must go; the file must
+        // not (F-19). Since W-2 that is decided by the path, not the status.
+        let target = temp_dir.join("target");
+        let watch = temp_dir.join("watch");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&watch).unwrap();
+        let source = watch.join("source_clip.mp4");
         std::fs::File::create(&source).unwrap();
 
         let uuid = "error-row-uuid";
@@ -4405,8 +4406,8 @@ mod tests {
             &pool,
             uuid,
             PurgeMode::DeleteMediaIfUnreferenced,
-            Some(&temp_dir),
-            None,
+            Some(&target),
+            Some(&watch),
         )
         .await
         .unwrap();
@@ -4421,10 +4422,70 @@ mod tests {
             result
                 .warnings
                 .iter()
-                .any(|w| w.contains("not 'ready'")),
+                .any(|w| w.contains("outside managed target")),
             "the operator must be told why cleanup was skipped: {:?}",
             result.warnings
         );
+
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// W-2. T-5 made a QC-failed *published* mezzanine `error`. Its file sits
+    /// in `target_folder` like any other mezzanine, and purging the row must
+    /// take the file and sidecar with it -- otherwise CasparCG can still play
+    /// an asset the registry no longer knows about.
+    #[tokio::test]
+    async fn test_purge_of_qc_failed_mezzanine_removes_the_file() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let target = temp_dir.join("target");
+        let watch = temp_dir.join("watch");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&watch).unwrap();
+        let media_file = target.join("qc_failed.mp4");
+        let sidecar_file = crate::identity::sidecar_path_for(&media_file);
+        std::fs::create_dir_all(sidecar_file.parent().unwrap()).unwrap();
+        std::fs::File::create(&media_file).unwrap();
+        std::fs::File::create(&sidecar_file).unwrap();
+
+        let uuid = "qc-failed-published";
+        insert_processing(&pool, uuid, 4343, Some("aa"), "D:/w/src.mxf", "QC fail")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool,
+            uuid,
+            &media_file.to_string_lossy(),
+            10000,
+            false,
+            25.0,
+            25,
+            1,
+            250,
+            50,
+            0,
+            &["duration_delta_exceeded".to_string()],
+            "[0]",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(find_by_uuid(&pool, uuid).await.unwrap().unwrap().status, "error");
+
+        let result = purge_single_asset_with_context(
+            &pool,
+            uuid,
+            PurgeMode::DeleteMediaIfUnreferenced,
+            Some(&target),
+            Some(&watch),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.rows_deleted, 1);
+        assert!(result.media_removed, "warnings: {:?}", result.warnings);
+        assert!(result.sidecar_removed);
+        assert!(!media_file.exists(), "a QC-failed mezzanine must not outlive its row");
+        assert!(!sidecar_file.exists());
 
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
@@ -4443,8 +4504,6 @@ mod tests {
         insert_processing(&pool, uuid, 8888, None, &media_file.to_string_lossy(), "Mezzanine")
             .await
             .unwrap();
-        // Only a `ready` row's current_path points at a published mezzanine;
-        // T1-7 refuses to delete files for any other status.
         mark_ready(
             &pool,
             uuid,
