@@ -339,16 +339,21 @@ pub fn transcode_file(
         }
     }
 
-    let _ = progress_tx.send(EncodeProgress {
-        frame: total_frames,
-        total_frames,
-        percent: 100.0,
-        fps: 0.0,
-        bitrate: String::new(),
-        speed: String::new(),
-        current_time_ms: duration_ms,
-        duration_ms,
-    });
+    // Only a clean exit finished the encode. A killed or failed ffmpeg used to
+    // report 100% here too, so a cancelled row jumped to "Finalizing 100%"
+    // just before it disappeared (UI-03).
+    if status.success() {
+        let _ = progress_tx.send(EncodeProgress {
+            frame: total_frames,
+            total_frames,
+            percent: 100.0,
+            fps: 0.0,
+            bitrate: String::new(),
+            speed: String::new(),
+            current_time_ms: duration_ms,
+            duration_ms,
+        });
+    }
 
     if status.success() {
         tracing::debug!(

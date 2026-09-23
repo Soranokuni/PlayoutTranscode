@@ -1008,6 +1008,23 @@ fn process_file_inner(
     let skip_job = |asset_uuid: &str, message: &str| {
         terminate_early(jobs::JobPhase::Skipped, None, message, Some(asset_uuid));
     };
+    // An adopted record the operator cancelled while it waited for a slot is
+    // already terminal. It used to be processed anyway, from the dispatcher's
+    // snapshot: a full SHA-256 of the source, a registry row, a probe and a
+    // loudness pass, all for a job the UI had long since shown as cancelled
+    // (UI-03). The live record is the one that counts.
+    if let Some(prior) = existing_job.as_ref() {
+        if let Some(live) = queue.get(&prior.id) {
+            if live.phase == jobs::JobPhase::Cancelled || live.cancel_requested {
+                tracing::info!(
+                    "Job {} was cancelled before it started; not processing {}",
+                    prior.id,
+                    input_path.display()
+                );
+                return;
+            }
+        }
+    }
 
     let watch_root = std::path::Path::new(&config.paths.watch_folder);
     // Both sides must end up spelled the same way or the containment check is
@@ -1287,6 +1304,42 @@ fn process_file_inner(
     // No explicit `job_update` here any more: the push or the Probing
     // transition above has already announced the record (UI-01).
 
+    // UI-03. The heartbeat only looked for a cancel during the encode itself,
+    // so an ✕ pressed during probing or the loudness pass waited for that
+    // whole stage to finish first. Every stage boundary now asks.
+    let is_cancel_requested = || {
+        queue
+            .get(&job.id)
+            .map(|j| {
+                j.cancel_requested
+                    || matches!(
+                        j.phase,
+                        jobs::JobPhase::CancelRequested | jobs::JobPhase::Cancelled
+                    )
+            })
+            .unwrap_or(false)
+    };
+    // The row was inserted by this run a few lines up and nothing was ever
+    // published under it, so it is removed rather than left as an `error`
+    // asset: a cancel is the operator's decision, not a fault in the media,
+    // and every cancelled ingest used to leave one more red row in the library.
+    let finish_cancelled = || {
+        tracing::info!("Job {} was cancelled by user request", job.id);
+        let _ = queue.transition(
+            &job.id,
+            jobs::JobPhase::Cancelled,
+            Some("Cancelled".into()),
+            |j| {
+                j.error = Some("Cancelled by user".into());
+                j.error_category = Some("cancelled".into());
+            },
+        );
+        publisher.cleanup_staging(&staged_output_path);
+        if let Err(e) = handle.block_on(db::purge_row_by_uuid(pool, &metadata_uuid)) {
+            tracing::warn!("Could not remove the row of cancelled job {}: {}", job.id, e);
+            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+        }
+    };
 
     let probe_data = match probe::probe_source(tools, input_path) {
         Ok(p) => p,
@@ -1348,6 +1401,11 @@ fn process_file_inner(
             false,
         );
         publisher.cleanup_staging(&staged_output_path);
+        return;
+    }
+
+    if is_cancel_requested() {
+        finish_cancelled();
         return;
     }
 
@@ -1449,6 +1507,13 @@ fn process_file_inner(
 
     while attempt <= max_attempts {
         publisher.cleanup_staging(&staged_output_path);
+
+        // Before every attempt, not just the first: a cancel that lands while
+        // a failed attempt is backing off must not start another ffmpeg.
+        if is_cancel_requested() {
+            finish_cancelled();
+            return;
+        }
 
         let stage_label = if max_attempts > 1 {
             format!(
@@ -1555,17 +1620,21 @@ fn process_file_inner(
                         // Kill only this job's FFmpeg. This used to iterate
                         // the whole shared pid list, so cancelling one clip
                         // killed every concurrent encode (F-12).
-                        if !crate::service_handle::kill_ffmpeg_for_job(
+                        if crate::service_handle::kill_ffmpeg_for_job(
                             &hb_pids,
                             &hb_jid,
                             crate::service_handle::kill_process_tree,
                         ) {
-                            tracing::warn!(
-                                "Cancel requested for job {} but no FFmpeg pid was registered",
-                                hb_jid
-                            );
+                            break;
                         }
-                        break;
+                        // No pid yet: the cancel landed between the Encoding
+                        // transition and ffmpeg registering itself. Breaking
+                        // here left that encode to run to completion, so keep
+                        // polling until there is something to kill (UI-03).
+                        tracing::debug!(
+                            "Cancel requested for job {} before its FFmpeg pid was registered; retrying",
+                            hb_jid
+                        );
                     }
                 }
             }
@@ -1589,28 +1658,8 @@ fn process_file_inner(
         let _ = hb_stop_tx.send(());
         let _ = hb_thread.join();
 
-        let is_cancelled = queue
-            .get(&job.id)
-            .map(|j| {
-                j.cancel_requested
-                    || j.phase == jobs::JobPhase::CancelRequested
-                    || j.phase == jobs::JobPhase::Cancelled
-            })
-            .unwrap_or(false);
-
-        if is_cancelled {
-            tracing::info!("Job {} was cancelled by user request", job.id);
-            let _ = queue.transition(
-                &job.id,
-                jobs::JobPhase::Cancelled,
-                Some("Cancelled".into()),
-                |j| {
-                    j.error = Some("Cancelled by user".into());
-                    j.error_category = Some("cancelled".into());
-                },
-            );
-            publisher.cleanup_staging(&staged_output_path);
-            let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
+        if is_cancel_requested() {
+            finish_cancelled();
             return;
         }
 
@@ -1728,14 +1777,30 @@ fn process_file_inner(
                 .map(|f| f.code.clone())
                 .collect();
 
-            let _ = queue.transition(
+            // The point of no return, decided under the queue's lock: a cancel
+            // that arrived during validation makes this transition illegal
+            // (CancelRequested -> Publishing), and from here on
+            // `request_cancel` refuses. Ignoring this result used to publish a
+            // cancelled job anyway and leave its record stuck in
+            // `cancel_requested` for good -- not dismissable, not
+            // re-cancellable, until a restart (UI-03).
+            if let Err(e) = queue.transition(
                 &job.id,
                 jobs::JobPhase::Publishing,
                 Some("Publishing".into()),
                 |j| {
                     j.output_path = Some(final_output_path.to_string_lossy().into_owned());
                 },
-            );
+            ) {
+                if is_cancel_requested() {
+                    finish_cancelled();
+                    return;
+                }
+                // Not a cancel: only the job record is off (gone, or in a phase
+                // nothing expected). The media passed QC, so publishing goes
+                // ahead exactly as it always did.
+                tracing::warn!("Job {} could not enter Publishing: {}", job.id, e);
+            }
 
             // Everything after a successful `publish` that can still fail has
             // the same remedy: get the orphaned mezzanine out of the library,

@@ -2118,14 +2118,21 @@ async fn post_retry_job(
     AssetId(id): AssetId,
     body: Option<Json<RetryJobBody>>,
 ) -> impl IntoResponse {
-    let jobs = state.jobs.all_recent();
-    let Some(job) = jobs.into_iter().find(|j| j.id == id) else {
+    let Some(job) = state.jobs.get(&id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "job not found"})),
         )
             .into_response();
     };
+    // Checked again, atomically, by `requeue_for_retry`; this early answer
+    // just spares a path validation for a job that cannot be retried.
+    if !matches!(
+        job.phase,
+        crate::jobs::JobPhase::Failed | crate::jobs::JobPhase::Skipped
+    ) {
+        return retry_refused(crate::jobs::RetryError::NotRetryable(job.phase));
+    }
     let path_str: String = body
         .and_then(|b| b.input_path.clone())
         .unwrap_or(job.input_path.clone());
@@ -2163,25 +2170,38 @@ async fn post_retry_job(
                 .into_response();
         }
     };
+    // Requeue *before* dispatching, under the queue's lock (UI-03): a second
+    // click finds the job already Queued and is refused, and the dispatcher
+    // can never reach Probing ahead of the Failed -> Queued transition.
+    if let Err(e) = state.jobs.requeue_for_retry(&id, "Re-queued (manual retry)") {
+        return retry_refused(e);
+    }
     // Pass the job id so the dispatcher adopts this record rather than
     // creating a second one and leaving this one Pending forever (F-13).
     match state.service_handle.submit_retry(validated, Some(id.clone())) {
-        Ok(_) => {
-            let _ = state.jobs.transition(
-                &id,
-                crate::jobs::JobPhase::Queued,
-                Some("Re-queued (manual retry)".into()),
-                |j| {
-                    j.error = None;
-                    j.error_category = None;
-                    j.stderr_log = None;
-                    j.finished_at = None;
-                    j.attempt = j.attempt.saturating_add(1);
-                },
-            );
-            Json(serde_json::json!({"success": true})).into_response()
+        Ok(_) => Json(serde_json::json!({"success": true})).into_response(),
+        Err(e) => {
+            state.jobs.revert_retry(&id, &e);
+            (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response()
         }
-        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response(),
+    }
+}
+
+fn retry_refused(e: crate::jobs::RetryError) -> Response {
+    match e {
+        crate::jobs::RetryError::NotFound => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "job not found"})),
+        )
+            .into_response(),
+        crate::jobs::RetryError::NotRetryable(phase) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Only a failed or skipped job can be retried; this one is {}", phase.as_str()),
+                "phase": phase.as_str(),
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -2189,11 +2209,24 @@ async fn post_cancel_job(
     State(state): State<ServerState>,
     AssetId(id): AssetId,
 ) -> impl IntoResponse {
+    use crate::jobs::CancelError;
     match state.jobs.request_cancel(&id) {
         Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
-        Err(e) => (
+        Err(CancelError::NotFound) => (
             StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": e })),
+            Json(serde_json::json!({ "error": format!("Job {} not found", id) })),
+        )
+            .into_response(),
+        Err(CancelError::AlreadyFinished) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "The job has already finished" })),
+        )
+            .into_response(),
+        Err(CancelError::Publishing) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "The job is publishing and can no longer be cancelled",
+            })),
         )
             .into_response(),
     }
@@ -2230,23 +2263,20 @@ async fn post_retry_all_failed(State(state): State<ServerState>) -> impl IntoRes
             missing += 1;
             continue;
         }
+        // Same order as the single retry: requeue atomically, then dispatch.
+        // A job retried individually since `failed()` was read is skipped
+        // here instead of being dispatched a second time.
+        if state
+            .jobs
+            .requeue_for_retry(&job.id, "Re-queued (bulk retry)")
+            .is_err()
+        {
+            continue;
+        }
         match state.service_handle.submit_retry(path, Some(job.id.clone())) {
-            Ok(_) => {
-                let _ = state.jobs.transition(
-                    &job.id,
-                    crate::jobs::JobPhase::Queued,
-                    Some("Re-queued (bulk retry)".into()),
-                    |j| {
-                        j.error = None;
-                        j.error_category = None;
-                        j.stderr_log = None;
-                        j.finished_at = None;
-                        j.attempt = j.attempt.saturating_add(1);
-                    },
-                );
-                submitted += 1;
-            }
-            Err(_) => {
+            Ok(_) => submitted += 1,
+            Err(e) => {
+                state.jobs.revert_retry(&job.id, &e);
                 errors += 1;
             }
         }

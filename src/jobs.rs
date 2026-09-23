@@ -390,6 +390,24 @@ pub enum DismissError {
     StillActive,
 }
 
+/// Why a cancel was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CancelError {
+    NotFound,
+    /// Completed, failed, skipped or already cancelled: nothing left to stop.
+    AlreadyFinished,
+    /// The atomic publish is under way and cannot be interrupted.
+    Publishing,
+}
+
+/// Why a retry was refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryError {
+    NotFound,
+    /// Only a failed or skipped job can be retried; this one is not.
+    NotRetryable(JobPhase),
+}
+
 #[derive(Clone)]
 pub struct JobQueue {
     jobs: Arc<RwLock<Vec<JobRecord>>>,
@@ -577,24 +595,83 @@ impl JobQueue {
         }
     }
 
-    pub fn request_cancel(&self, id: &str) -> Result<(), String> {
+    /// Ask a job to stop.
+    ///
+    /// Refused for a job that has already finished and for one that is
+    /// publishing. Both used to be accepted: a finished job kept a stale
+    /// `cancel_requested = true` that killed its next *retry* two seconds in,
+    /// and a publishing job reported "cancelling" while the publish -- which
+    /// is an atomic rename plus a registry write, and cannot be interrupted --
+    /// went ahead anyway (UI-03).
+    pub fn request_cancel(&self, id: &str) -> Result<(), CancelError> {
         let mut jobs = self.jobs.write();
-        if let Some(job) = jobs.iter_mut().find(|j| j.id == id) {
-            job.cancel_requested = true;
-            if job.phase == JobPhase::Queued {
-                let _ = job.transition_to(JobPhase::Cancelled, Some("Cancelled".into()));
-            } else if !job.phase.is_terminal() && job.phase != JobPhase::CancelRequested {
-                let _ =
-                    job.transition_to(JobPhase::CancelRequested, Some("Cancel requested".into()));
-            }
-            let job_clone = job.clone();
-            drop(jobs);
-            self.announce(&job_clone);
-            self.enqueue_persist(job_clone);
-            Ok(())
-        } else {
-            Err(format!("Job {} not found", id))
+        let Some(job) = jobs.iter_mut().find(|j| j.id == id) else {
+            return Err(CancelError::NotFound);
+        };
+        if job.phase.is_terminal() {
+            return Err(CancelError::AlreadyFinished);
         }
+        if job.phase == JobPhase::Publishing {
+            return Err(CancelError::Publishing);
+        }
+        job.cancel_requested = true;
+        if job.phase == JobPhase::Queued {
+            let _ = job.transition_to(JobPhase::Cancelled, Some("Cancelled".into()));
+            job.error = Some("Cancelled by user".into());
+            job.error_category = Some("cancelled".into());
+        } else if job.phase != JobPhase::CancelRequested {
+            let _ = job.transition_to(JobPhase::CancelRequested, Some("Cancel requested".into()));
+        }
+        let job_clone = job.clone();
+        drop(jobs);
+        self.announce(&job_clone);
+        self.enqueue_persist(job_clone);
+        Ok(())
+    }
+
+    /// Put a failed or skipped job back on the queue, atomically.
+    ///
+    /// The check and the transition happen under one write lock. The handler
+    /// used to look the job up, dispatch it, and only then transition it --
+    /// and `Queued -> Queued` is a legal no-op -- so a double-clicked Retry
+    /// dispatched the same record twice, and a dispatcher that reached
+    /// Probing first made the later `Failed -> Queued` illegal, leaving the
+    /// job `Pending` for its whole encode (UI-03).
+    pub fn requeue_for_retry(
+        &self,
+        id: &str,
+        stage: &str,
+    ) -> Result<JobRecord, RetryError> {
+        let mut jobs = self.jobs.write();
+        let Some(job) = jobs.iter_mut().find(|j| j.id == id) else {
+            return Err(RetryError::NotFound);
+        };
+        if !matches!(job.phase, JobPhase::Failed | JobPhase::Skipped) {
+            return Err(RetryError::NotRetryable(job.phase));
+        }
+        job.transition_to(JobPhase::Queued, Some(stage.to_string()))
+            .map_err(|_| RetryError::NotRetryable(job.phase))?;
+        job.error = None;
+        job.error_category = None;
+        job.stderr_log = None;
+        job.finished_at = None;
+        job.cancel_requested = false;
+        job.progress = 0.0;
+        job.attempt = job.attempt.saturating_add(1);
+        let job_clone = job.clone();
+        drop(jobs);
+        self.announce(&job_clone);
+        self.enqueue_persist(job_clone.clone());
+        Ok(job_clone)
+    }
+
+    /// Undo [`Self::requeue_for_retry`] when the dispatcher refused the job.
+    pub fn revert_retry(&self, id: &str, reason: &str) {
+        let reason = reason.to_string();
+        let _ = self.transition(id, JobPhase::Failed, Some("Failed".into()), |j| {
+            j.error = Some(reason);
+            j.attempt = j.attempt.saturating_sub(1);
+        });
     }
 
     #[allow(dead_code)]
@@ -1358,6 +1435,117 @@ mod tests {
         assert!(q.dismiss_all(&[state]).is_empty());
         assert_eq!(q.all().len(), 1);
     }
+
+    fn job_in(phases: &[JobPhase]) -> JobRecord {
+        let mut j = JobRecord::new("clip.mxf", "ProfileA");
+        for p in phases {
+            j.transition_to(*p, None).unwrap();
+        }
+        j
+    }
+
+    const RUNNING: &[JobPhase] = &[JobPhase::Probing, JobPhase::Planned, JobPhase::Encoding];
+
+    /// UI-03. A finished job used to accept a cancel and keep
+    /// `cancel_requested = true`, which then killed its next retry.
+    #[test]
+    fn a_finished_job_refuses_a_cancel() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.push(JobPhase::Failed);
+        let job = job_in(&phases);
+        let id = job.id.clone();
+        q.push(job);
+
+        assert_eq!(q.request_cancel(&id), Err(CancelError::AlreadyFinished));
+        assert!(!q.get(&id).unwrap().cancel_requested);
+    }
+
+    /// UI-03. The publish cannot be interrupted, so a cancel must not claim it.
+    #[test]
+    fn a_publishing_job_refuses_a_cancel() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.extend([JobPhase::Validating, JobPhase::Publishing]);
+        let job = job_in(&phases);
+        let id = job.id.clone();
+        q.push(job);
+
+        assert_eq!(q.request_cancel(&id), Err(CancelError::Publishing));
+        assert_eq!(q.get(&id).unwrap().phase, JobPhase::Publishing);
+    }
+
+    /// UI-03. A cancel during validation must make the Publishing transition
+    /// illegal -- that is what lets the processor abandon the publish.
+    #[test]
+    fn a_cancel_during_validation_blocks_the_publish() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.push(JobPhase::Validating);
+        let job = job_in(&phases);
+        let id = job.id.clone();
+        q.push(job);
+
+        q.request_cancel(&id).unwrap();
+        assert!(q
+            .transition(&id, JobPhase::Publishing, None, |_| {})
+            .is_err());
+        q.transition(&id, JobPhase::Cancelled, None, |_| {}).unwrap();
+        assert_eq!(q.get(&id).unwrap().state, JobState::Cancelled);
+    }
+
+    #[test]
+    fn a_queued_job_is_cancelled_outright() {
+        let q = queue();
+        let job = JobRecord::new("queued.mxf", "ProfileA");
+        let id = job.id.clone();
+        q.push(job);
+
+        q.request_cancel(&id).unwrap();
+        let live = q.get(&id).unwrap();
+        assert_eq!(live.phase, JobPhase::Cancelled);
+        assert!(live.finished_at.is_some());
+    }
+
+    /// UI-03. `Queued -> Queued` is a legal no-op, so the old handler let a
+    /// double-clicked Retry dispatch the same record twice.
+    #[test]
+    fn a_second_retry_of_the_same_job_is_refused() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.push(JobPhase::Failed);
+        let mut job = job_in(&phases);
+        job.cancel_requested = true;
+        let id = job.id.clone();
+        q.push(job);
+
+        let requeued = q.requeue_for_retry(&id, "retry").unwrap();
+        assert_eq!(requeued.phase, JobPhase::Queued);
+        assert!(!requeued.cancel_requested, "a stale cancel must not kill the retry");
+        assert_eq!(
+            q.requeue_for_retry(&id, "retry").unwrap_err(),
+            RetryError::NotRetryable(JobPhase::Queued)
+        );
+    }
+
+    #[test]
+    fn a_refused_dispatch_puts_the_job_back_as_failed() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.push(JobPhase::Failed);
+        let job = job_in(&phases);
+        let attempt = job.attempt;
+        let id = job.id.clone();
+        q.push(job);
+
+        q.requeue_for_retry(&id, "retry").unwrap();
+        q.revert_retry(&id, "Service is not running");
+        let live = q.get(&id).unwrap();
+        assert_eq!(live.phase, JobPhase::Failed);
+        assert_eq!(live.attempt, attempt);
+        assert_eq!(live.error.as_deref(), Some("Service is not running"));
+    }
+
     /// UI-01. Every transition reaches SSE subscribers with the full record.
     #[test]
     fn a_transition_is_announced_with_the_record() {
