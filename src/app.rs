@@ -340,13 +340,19 @@ pub async fn run_service(
     {
         service_handle.add_log("info", "Auto-starting service with configured watch folder");
         if let Ok(tools) = bootstrap::ensure_toolchain() {
-            let _ = service_handle::start_processing_loop(
+            let registry_id = db::registry_id(&pool)
+                .await
+                .map_err(|e| anyhow::anyhow!("Could not read this registry's identity: {}", e))?;
+            if let Err(e) = service_handle::start_processing_loop(
                 &service_handle,
                 &app_config,
                 &job_queue,
                 &tools,
                 pool.clone(),
-            );
+                &registry_id,
+            ) {
+                service_handle.add_log("error", &format!("Auto-start refused: {}", e));
+            }
         } else {
             service_handle.add_log("warn", "FFmpeg not found. Download from the web UI.");
         }

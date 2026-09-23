@@ -1933,12 +1933,24 @@ async fn post_start_service(State(state): State<ServerState>) -> impl IntoRespon
         }
     };
 
+    let registry_id = match db::registry_id(&state.pool).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("Could not read this registry's identity: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "success": false, "error": "internal_error" })),
+            );
+        }
+    };
+
     match crate::service_handle::start_processing_loop(
         &state.service_handle,
         &config,
         &state.jobs,
         &tools,
         state.pool.clone(),
+        &registry_id,
     ) {
         Ok(()) => (
             StatusCode::OK,
