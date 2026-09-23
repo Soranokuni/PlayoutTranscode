@@ -860,6 +860,41 @@ pub fn is_media_permanent(err_msg: &str, is_validation_failure: bool) -> bool {
     .any(|p| lower.contains(p))
 }
 
+/// The finding recorded in `warnings` for a failure [`is_media_permanent`]
+/// accepted (W-3). Without one, the verdict key is written but the ingest-time
+/// dedupe cannot use it, and the operator's "held back" badge has no reason to
+/// show. Most specific match first: `Probe: No video stream found` is a
+/// missing stream, not a generic probe failure.
+pub(crate) fn permanent_failure_code(error_msg: &str, is_validation_failure: bool) -> &'static str {
+    let lower = error_msg.to_ascii_lowercase();
+    [
+        ("duration mismatch", "output_duration_mismatch"),
+        ("no valid video stream in output", "output_missing_video"),
+        ("no video stream", "no_video_stream"),
+        ("no audio stream", "no_audio_stream"),
+        ("unsupported_audio_channel_layout", "unsupported_audio_channel_layout"),
+        ("unsupported channel layout", "unsupported_audio_channel_layout"),
+        ("audio measurement failed", "audio_measurement_failed"),
+        ("unsupported codec", "unsupported_codec"),
+        ("moov atom not found", "source_unreadable"),
+        ("invalid data", "source_unreadable"),
+        ("invalid input", "source_unreadable"),
+        ("profile disabled", "profile_disabled"),
+        // The source-probe prefix only: an output-probe error during
+        // validation also says "ffprobe" and is not about the source.
+        ("probe:", "source_probe_failed"),
+        ("probe failed", "source_probe_failed"),
+    ]
+    .iter()
+    .find(|(needle, _)| lower.contains(needle))
+    .map(|(_, code)| *code)
+    .unwrap_or(if is_validation_failure {
+        "output_validation_failed"
+    } else {
+        "ingest_failed_permanently"
+    })
+}
+
 /// Close out a failed ingest, recording a permanent verdict when the failure is
 /// a property of the media so the next restart does not spend another encode
 /// rediscovering it.
@@ -876,7 +911,8 @@ fn record_ingest_failure(
     if is_media_permanent(error_msg, is_validation_failure) {
         if let Some(sha) = source_sha256 {
             let key = qc_verdict_key(sha, config);
-            match handle.block_on(db::mark_error_permanent(pool, uuid, &key)) {
+            let finding = permanent_failure_code(error_msg, is_validation_failure);
+            match handle.block_on(db::mark_error_permanent(pool, uuid, &key, finding)) {
                 Ok(()) => {
                     tracing::info!(
                         "Asset {} failed on the media itself ({}); recorded so it is not \
@@ -3104,6 +3140,49 @@ mod tests {
 
         // Unrecognised stays retryable: a wasted encode is the cheap mistake.
         assert!(!is_media_permanent("something nobody has seen before", false));
+    }
+
+    /// W-3. Every permanent failure records a finding, or the ingest-time
+    /// dedupe cannot recognise it. The first three are the job errors of live
+    /// rows 52, 56 and 57, which were left with a verdict and `warnings = []`.
+    #[test]
+    fn a_permanent_failure_always_records_a_finding() {
+        assert_eq!(
+            permanent_failure_code(
+                "Duration mismatch: source=268.408s output=31.560s (diff=236848ms, tolerance=1200ms)",
+                true
+            ),
+            "output_duration_mismatch"
+        );
+        assert_eq!(
+            permanent_failure_code("Probe: No video stream found", false),
+            "no_video_stream",
+            "the specific cause, not the generic probe failure"
+        );
+        assert_eq!(
+            permanent_failure_code("Probe failed: moov atom not found", false),
+            "source_unreadable"
+        );
+        assert_eq!(permanent_failure_code("Probe: exit 1", false), "source_probe_failed");
+        assert_eq!(
+            permanent_failure_code(
+                "ffprobe returned an error without message (output may be premature or unreadable); see logs",
+                true
+            ),
+            "output_validation_failed",
+            "an output-probe error is not a source-probe failure"
+        );
+        for code in [
+            permanent_failure_code("Probe: No video stream found", false),
+            permanent_failure_code("anything", true),
+            permanent_failure_code("anything", false),
+        ] {
+            assert!(!code.is_empty());
+            assert!(
+                !crate::db::ENVIRONMENTAL_QC_CODES.contains(&code),
+                "{code} would be ignored by the reproducible-failure test"
+            );
+        }
     }
 
     #[test]
