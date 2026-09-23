@@ -1050,6 +1050,25 @@ fn process_file_inner(
     let skip_job = |asset_uuid: &str, message: &str| {
         terminate_early(jobs::JobPhase::Skipped, None, message, Some(asset_uuid));
     };
+    // A skip for a file that is merely being re-offered -- retained in the
+    // watch folder, seen again because the service started -- is not news.
+    // The first skip was recorded and shown; recording another one at every
+    // start put a fresh "skipped" row per retained source into the queue and
+    // the job table each time (PL-05). `hash_cached` is only true when this
+    // path, size, mtime and sampled fingerprint were hashed before.
+    let skip_or_ignore = |hash_cached: bool, asset_uuid: &str, message: &str| {
+        if hash_cached && existing_job.is_none() {
+            tracing::debug!(
+                "{} re-offered, already handled as {}: {}",
+                input_path.display(),
+                asset_uuid,
+                message
+            );
+        } else {
+            skip_job(asset_uuid, message);
+        }
+    };
+
     // An adopted record the operator cancelled while it waited for a slot is
     // already terminal. It used to be processed anyway, from the dispatcher's
     // snapshot: a full SHA-256 of the source, a registry row, a probe and a
@@ -1119,10 +1138,41 @@ fn process_file_inner(
     // already matched something. For a library of distinct media that is
     // approximately never, so the common path still reads 192 KiB, not 40 GB.
     let mut source_sha256: Option<String> = None;
+    // True when the hash came from the cache, i.e. this exact file, at this
+    // path, has been through here before (PL-05).
+    let hash_was_cached = std::cell::Cell::new(false);
+    let source_path_str = input_path.to_string_lossy().into_owned();
     let mut full_hash_of_source = || -> Option<String> {
         if source_sha256.is_none() {
+            if let (Some(size), Some(mtime)) = (initial_source_size, initial_source_mtime) {
+                if let Ok(Some(h)) = handle.block_on(db::cached_source_sha256(
+                    pool,
+                    &source_path_str,
+                    size,
+                    mtime,
+                    fingerprint,
+                )) {
+                    hash_was_cached.set(true);
+                    source_sha256 = Some(h);
+                    return source_sha256.clone();
+                }
+            }
             match fingerprint::compute_full_sha256(input_path) {
-                Ok(h) => source_sha256 = Some(h),
+                Ok(h) => {
+                    if let (Some(size), Some(mtime)) = (initial_source_size, initial_source_mtime) {
+                        if let Err(e) = handle.block_on(db::store_source_sha256(
+                            pool,
+                            &source_path_str,
+                            size,
+                            mtime,
+                            fingerprint,
+                            &h,
+                        )) {
+                            tracing::debug!("Could not cache the source hash: {}", e);
+                        }
+                    }
+                    source_sha256 = Some(h)
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Full hash failed for {}: {} -- treating as not-a-duplicate",
@@ -1162,7 +1212,8 @@ fn process_file_inner(
             // `Skipped` for it, which maps to the v1 `Completed` state so the
             // wire contract is unchanged (T2-4 had to report this as `Failed`
             // for want of anywhere else to put it).
-            skip_job(
+            skip_or_ignore(
+                hash_was_cached.get(),
                 &existing.uuid,
                 "Skipped: an identical asset is already ingested",
             );
@@ -1213,7 +1264,8 @@ fn process_file_inner(
                         failed.uuid,
                         reason,
                     );
-                    skip_job(
+                    skip_or_ignore(
+                        hash_was_cached.get(),
                         &failed.uuid,
                         &format!(
                             "Skipped: this media already failed QC on {} under the current \
@@ -1330,6 +1382,14 @@ fn process_file_inner(
                     j.error = None;
                     j.error_category = None;
                     j.finished_at = None;
+                    // A record re-queued by crash recovery kept the progress
+                    // of the run that died, so a probing job showed "54%".
+                    j.progress = 0.0;
+                    j.current_frame = 0;
+                    j.current_time_ms = 0;
+                    j.encode_fps = 0.0;
+                    j.encode_bitrate.clear();
+                    j.encode_speed.clear();
                 },
             );
             queue.get(&prior.id).unwrap_or_else(|| prior.clone())

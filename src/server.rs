@@ -2022,14 +2022,27 @@ async fn post_start_service(State(state): State<ServerState>) -> impl IntoRespon
         }
     };
 
-    match crate::service_handle::start_processing_loop(
-        &state.service_handle,
-        &config,
-        &state.jobs,
-        &tools,
-        state.pool.clone(),
-        &registry_id,
-    ) {
+    // Off the runtime (PL-07): starting creates the target folder and writes
+    // the media-root claim into it, and on an SMB target that stops answering
+    // either one held a runtime worker for the whole network timeout.
+    let started = {
+        let handle = state.service_handle.clone();
+        let jobs = state.jobs.clone();
+        let pool = state.pool.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::service_handle::start_processing_loop(
+                &handle,
+                &config,
+                &jobs,
+                &tools,
+                pool,
+                &registry_id,
+            )
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("start task failed: {}", e)))
+    };
+    match started {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -2053,7 +2066,10 @@ async fn post_start_service(State(state): State<ServerState>) -> impl IntoRespon
 }
 
 async fn post_stop_service(State(state): State<ServerState>) -> Json<serde_json::Value> {
-    crate::service_handle::stop_processing(&state.service_handle);
+    // `stop_processing` runs one synchronous `taskkill` per running encode.
+    // Off the runtime, like every other process spawn (PL-07).
+    let handle = state.service_handle.clone();
+    let _ = tokio::task::spawn_blocking(move || crate::service_handle::stop_processing(&handle)).await;
     // Returns while the state is still `Stopping`: the worker thread has to
     // unwind before the service is really stopped, and holding this request
     // open for it would put a 60 s teardown inside an HTTP round-trip. Poll

@@ -192,7 +192,11 @@ pub async fn watch_loop(
         stable_polls_min,
     );
 
-    let mut tick_count: u64 = 0;
+    // Walk on the first pass rather than a full interval in: files already
+    // in the folder at start -- retained sources, and the jobs a stop or a
+    // crash re-queued -- used to wait 60 s while newly notified files went
+    // first (W-6).
+    let mut tick_count: u64 = u64::MAX / 2;
     // Backs off to a reconciliation cadence while `notify` is delivering.
     let poll_ticks = effective_poll_interval_secs(poll_secs, notify_rx.is_some());
     tracing::info!(
@@ -201,6 +205,15 @@ pub async fn watch_loop(
         if notify_rx.is_some() { "healthy" } else { "unavailable" },
     );
     let mut last_dropped_report: u64 = 0;
+    // Paths `notify` has reported and that are not yet queued.
+    let mut hot: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let hot_ticks = poll_secs.max(1);
+    let rules = ReadinessRules {
+        settle_secs,
+        stable_polls_min,
+        include_extensions: &include_extensions,
+        exclude_extensions: &exclude_extensions,
+    };
 
     loop {
         if let Some(ref mut rx) = notify_rx {
@@ -239,6 +252,7 @@ pub async fn watch_loop(
                     }
                     entry.size = size;
                     entry.modified_epoch_secs = modified;
+                    hot.insert(path.to_path_buf());
                 }
             }
         }
@@ -283,80 +297,180 @@ pub async fn watch_loop(
             candidates.retain(|path, _| current_paths.contains(path));
             queued.retain(|path, _| current_paths.contains(path));
 
-            for candidate in &current_candidates {
-                let ext = candidate
-                    .path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
-                if !is_extension_allowed(ext, &include_extensions, &exclude_extensions) {
-                    continue;
-                }
-
-                let entry =
-                    candidates
-                        .entry(candidate.path.clone())
-                        .or_insert_with(|| WatchCandidate {
-                            path: candidate.path.clone(),
-                            size: 0,
-                            modified_epoch_secs: 0,
-                            stable_polls: 0,
-                        });
-
-                if candidate.size > entry.size {
-                    entry.stable_polls = 0;
-                    entry.size = candidate.size;
-                    entry.modified_epoch_secs = candidate.modified_epoch_secs;
-                    continue;
-                }
-
-                if candidate.size == entry.size
-                    && candidate.modified_epoch_secs == entry.modified_epoch_secs
+            // Whatever the walk found that is not queued yet is watched at the
+            // fast cadence until it is, instead of waiting for further walks.
+            for c in &current_candidates {
+                let ext = c.path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if queued.get(&c.path).copied() != Some((c.size, c.modified_epoch_secs))
+                    && is_extension_allowed(ext, &include_extensions, &exclude_extensions)
                 {
-                    entry.stable_polls += 1;
-                } else {
-                    entry.stable_polls = 1;
-                    entry.size = candidate.size;
-                    entry.modified_epoch_secs = candidate.modified_epoch_secs;
+                    hot.insert(c.path.clone());
                 }
-
-                if entry.stable_polls < stable_polls_min {
-                    continue;
-                }
-
-                let age_secs = now_secs.saturating_sub(candidate.modified_epoch_secs);
-                if age_secs < settle_secs {
-                    continue;
-                }
-
-                let identity = (candidate.size, candidate.modified_epoch_secs);
-                if queued.get(&candidate.path).copied() == Some(identity) {
-                    continue;
-                }
-
-                if !is_file_available_for_reading(&candidate.path) {
-                    tracing::debug!("Watch: file still locked: {}", candidate.path.display());
-                    continue;
-                }
-
-                tracing::info!(
-                    "Watch: stable file ready: {} ({} bytes, age {}s, stable polls {})",
-                    candidate.path.display(),
-                    candidate.size,
-                    age_secs,
-                    entry.stable_polls,
-                );
-
-                if tx.send(candidate.path.clone()).await.is_err() {
+            }
+            for (path, identity) in stable_and_ready(
+                &current_candidates,
+                &mut candidates,
+                &queued,
+                &rules,
+                now_secs,
+            ) {
+                hot.remove(&path);
+                if tx.send(path.clone()).await.is_err() {
                     tracing::error!("Watch: channel closed, stopping");
                     return;
                 }
-                queued.insert(candidate.path.clone(), identity);
+                queued.insert(path, identity);
+            }
+        } else if !hot.is_empty() && tick_count.is_multiple_of(hot_ticks) {
+            // W-6. Between walks, re-stat only what `notify` reported. Only the
+            // walk used to judge stability, and with a healthy `notify` that
+            // walk backs off to every 60 s -- so with the default two stable
+            // polls a file dropped into the folder sat for one to two minutes
+            // before anything happened. A handful of `stat`s every `poll_secs`
+            // is nothing next to a full walk.
+            let paths: Vec<PathBuf> = hot.iter().cloned().collect();
+            let observed = match tokio::task::spawn_blocking(move || stat_candidates(&paths)).await {
+                Ok(o) => o,
+                Err(e) => {
+                    tracing::error!("Watch: stat task failed: {}", e);
+                    Vec::new()
+                }
+            };
+            // Gone since the event: nothing to wait for.
+            let present: std::collections::HashSet<&PathBuf> =
+                observed.iter().map(|c| &c.path).collect();
+            hot.retain(|p| present.contains(p));
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            for (path, identity) in
+                stable_and_ready(&observed, &mut candidates, &queued, &rules, now_secs)
+            {
+                hot.remove(&path);
+                if tx.send(path.clone()).await.is_err() {
+                    tracing::error!("Watch: channel closed, stopping");
+                    return;
+                }
+                queued.insert(path, identity);
             }
         }
 
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+}
+
+/// The thresholds a candidate has to clear before it is handed on.
+struct ReadinessRules<'a> {
+    settle_secs: u64,
+    stable_polls_min: u32,
+    include_extensions: &'a [String],
+    exclude_extensions: &'a [String],
+}
+
+/// Fold one round of observations into `candidates` and return the files that
+/// are now stable, settled, readable and not already queued, with the
+/// `(size, mtime)` identity to record for each.
+///
+/// Shared by the full walk and the between-walks re-stat of `notify`'s paths,
+/// so both judge a file by exactly the same rules.
+fn stable_and_ready(
+    observed: &[WatchCandidate],
+    candidates: &mut HashMap<PathBuf, WatchCandidate>,
+    queued: &HashMap<PathBuf, (u64, u64)>,
+    rules: &ReadinessRules<'_>,
+    now_secs: u64,
+) -> Vec<(PathBuf, (u64, u64))> {
+    let mut ready = Vec::new();
+    for candidate in observed {
+        let ext = candidate
+            .path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+        if !is_extension_allowed(ext, rules.include_extensions, rules.exclude_extensions) {
+            continue;
+        }
+
+        let entry = candidates
+            .entry(candidate.path.clone())
+            .or_insert_with(|| WatchCandidate {
+                path: candidate.path.clone(),
+                size: 0,
+                modified_epoch_secs: 0,
+                stable_polls: 0,
+            });
+
+        if candidate.size > entry.size {
+            entry.stable_polls = 0;
+            entry.size = candidate.size;
+            entry.modified_epoch_secs = candidate.modified_epoch_secs;
+            continue;
+        }
+
+        if candidate.size == entry.size && candidate.modified_epoch_secs == entry.modified_epoch_secs {
+            entry.stable_polls += 1;
+        } else {
+            entry.stable_polls = 1;
+            entry.size = candidate.size;
+            entry.modified_epoch_secs = candidate.modified_epoch_secs;
+        }
+
+        if entry.stable_polls < rules.stable_polls_min {
+            continue;
+        }
+
+        let age_secs = now_secs.saturating_sub(candidate.modified_epoch_secs);
+        if age_secs < rules.settle_secs {
+            continue;
+        }
+
+        let identity = (candidate.size, candidate.modified_epoch_secs);
+        if queued.get(&candidate.path).copied() == Some(identity) {
+            continue;
+        }
+
+        if !is_file_available_for_reading(&candidate.path) {
+            tracing::debug!("Watch: file still locked: {}", candidate.path.display());
+            continue;
+        }
+
+        tracing::info!(
+            "Watch: stable file ready: {} ({} bytes, age {}s, stable polls {})",
+            candidate.path.display(),
+            candidate.size,
+            age_secs,
+            entry.stable_polls,
+        );
+        ready.push((candidate.path.clone(), identity));
+    }
+    ready
+}
+
+/// `stat` each path; the ones that are gone or not regular files are left out.
+fn stat_candidates(paths: &[PathBuf]) -> Vec<WatchCandidate> {
+    paths
+        .iter()
+        .filter_map(|path| {
+            let meta = fs::metadata(path).ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Some(WatchCandidate {
+                path: path.clone(),
+                size: meta.len(),
+                modified_epoch_secs: modified,
+                stable_polls: 0,
+            })
+        })
+        .collect()
 }
 
 fn create_notify_watcher(
@@ -497,5 +611,82 @@ mod tests {
         let _ = fs::remove_file(&part_file);
         let _ = fs::remove_file(&json_file);
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// W-6. The readiness rules the full walk and the notify re-stat share:
+    /// a file is handed on once it has held still for `stable_polls_min`
+    /// observations and is older than `settle_secs`, and only once per
+    /// `(size, mtime)`.
+    #[test]
+    fn a_file_is_ready_after_it_holds_still_and_only_once() {
+        let dir = std::env::temp_dir().join(format!("pt_w6_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let file = dir.join("clip.mxf");
+        fs::write(&file, b"media").unwrap();
+
+        let rules = ReadinessRules {
+            settle_secs: 5,
+            stable_polls_min: 2,
+            include_extensions: &[],
+            exclude_extensions: &[],
+        };
+        let mut candidates = HashMap::new();
+        let mut queued = HashMap::new();
+        let obs = |size: u64| {
+            vec![WatchCandidate {
+                path: file.clone(),
+                size,
+                modified_epoch_secs: 1_000,
+                stable_polls: 0,
+            }]
+        };
+
+        // First sight: growing from nothing.
+        assert!(stable_and_ready(&obs(5), &mut candidates, &queued, &rules, 2_000).is_empty());
+        // Still growing: the count restarts.
+        assert!(stable_and_ready(&obs(9), &mut candidates, &queued, &rules, 2_000).is_empty());
+        // One still observation is not enough...
+        assert!(stable_and_ready(&obs(9), &mut candidates, &queued, &rules, 2_000).is_empty());
+        // ...two is.
+        let ready = stable_and_ready(&obs(9), &mut candidates, &queued, &rules, 2_000);
+        assert_eq!(ready.len(), 1);
+        queued.insert(ready[0].0.clone(), ready[0].1);
+
+        // Already queued with this identity: not again.
+        assert!(stable_and_ready(&obs(9), &mut candidates, &queued, &rules, 2_000).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_inside_the_settle_window_waits() {
+        let rules = ReadinessRules {
+            settle_secs: 60,
+            stable_polls_min: 1,
+            include_extensions: &[],
+            exclude_extensions: &[],
+        };
+        let mut candidates = HashMap::new();
+        let queued = HashMap::new();
+        let obs = vec![WatchCandidate {
+            path: PathBuf::from("D:/w/fresh.mxf"),
+            size: 10,
+            modified_epoch_secs: 1_000,
+            stable_polls: 0,
+        }];
+        let _ = stable_and_ready(&obs, &mut candidates, &queued, &rules, 1_010);
+        assert!(stable_and_ready(&obs, &mut candidates, &queued, &rules, 1_010).is_empty());
+    }
+
+    #[test]
+    fn stat_leaves_out_what_is_gone() {
+        let dir = std::env::temp_dir().join(format!("pt_w6_stat_{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let here = dir.join("here.mxf");
+        fs::write(&here, b"x").unwrap();
+        let got = stat_candidates(&[here.clone(), dir.join("gone.mxf"), dir.clone()]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].path, here);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

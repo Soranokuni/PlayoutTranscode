@@ -494,8 +494,12 @@ impl JobQueue {
 
     pub fn populate(&self, records: Vec<JobRecord>) {
         let mut jobs = self.jobs.write();
+        // A set, not `jobs.iter().any(..)` per record: that was O(n²) over the
+        // whole job history at every start.
+        let mut seen: std::collections::HashSet<String> =
+            jobs.iter().map(|j| j.id.clone()).collect();
         for r in records {
-            if !jobs.iter().any(|j| j.id == r.id) {
+            if seen.insert(r.id.clone()) {
                 jobs.push(r);
             }
         }
@@ -837,12 +841,41 @@ impl JobQueue {
         removed
     }
 
+    /// Bound the in-memory queue to `max_entries`, dropping the oldest
+    /// *finished* records first.
+    ///
+    /// This used to sort by `created_at` and truncate, which could drop a job
+    /// that was still running: a retry keeps its original `created_at`, so an
+    /// old job being re-encoded was the first to go. Its heartbeat and
+    /// transitions then failed with "not found", cancel answered 404, the row
+    /// vanished from the UI and stayed `Processing` in the database until a
+    /// restart (PL-04). A running or queued job is never a candidate now, and
+    /// the order of the survivors is left alone.
     pub fn prune_old(&self, max_entries: usize) {
         let mut jobs = self.jobs.write();
-        if jobs.len() > max_entries {
-            jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            jobs.truncate(max_entries);
+        if jobs.len() <= max_entries {
+            return;
         }
+        let mut finished: Vec<(&str, &str)> = jobs
+            .iter()
+            .filter(|j| j.phase.is_terminal())
+            .map(|j| {
+                (
+                    j.finished_at.as_deref().unwrap_or(j.created_at.as_str()),
+                    j.id.as_str(),
+                )
+            })
+            .collect();
+        let excess = (jobs.len() - max_entries).min(finished.len());
+        if excess == 0 {
+            return;
+        }
+        finished.sort_unstable();
+        let drop: std::collections::HashSet<String> = finished[..excess]
+            .iter()
+            .map(|(_, id)| id.to_string())
+            .collect();
+        jobs.retain(|j| !drop.contains(&j.id));
     }
 
     /// Is anyone subscribed to the SSE stream right now?
@@ -1002,8 +1035,46 @@ async fn flush(
     };
     match crate::db::persist_jobs(&p.pool, &batch).await {
         Ok(()) => pending.clear(),
+        Err(e) if batch.len() > 1 => {
+            // One transaction per batch means one bad record failed all of
+            // them, on every tick, forever -- job persistence stopped for the
+            // whole service (PL-08). Find it: write each record on its own,
+            // keep the ones that fail for a transient reason (the whole pool
+            // is unwell) and drop only a record that fails alone.
+            tracing::warn!(
+                "Batch persist of {} job record(s) failed ({}); retrying one by one",
+                batch.len(),
+                e
+            );
+            let mut failed = 0usize;
+            for job in &batch {
+                match crate::db::persist_jobs(&p.pool, std::slice::from_ref(job)).await {
+                    Ok(()) => {
+                        pending.remove(&job.id);
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        tracing::error!("Failed to persist job {}: {}", job.id, e);
+                    }
+                }
+            }
+            if failed == batch.len() {
+                // Every record failed on its own too: the database is the
+                // problem, not a record. Keep them all for the next tick.
+                return;
+            }
+            // Some went through, so the ones left are poison. Drop them rather
+            // than let them fail every batch after this one.
+            if !pending.is_empty() {
+                tracing::error!(
+                    "Dropping {} job record(s) that cannot be persisted",
+                    pending.len()
+                );
+                pending.clear();
+            }
+        }
         Err(e) => {
-            // Keep the records queued rather than losing them; the next tick
+            // Keep the record queued rather than losing it; the next tick
             // retries. Coalescing means a persistent failure costs bounded
             // memory, not an unbounded backlog.
             tracing::error!("Failed to persist {} job record(s): {}", batch.len(), e);
@@ -1623,4 +1694,40 @@ mod tests {
         assert_eq!(q.get(&id).unwrap().phase, JobPhase::Failed);
     }
 
+    /// PL-04. Pruning used to sort by `created_at` and truncate, so an old job
+    /// being retried -- it keeps its `created_at` -- was the first to go.
+    #[test]
+    fn pruning_never_drops_a_running_job() {
+        let q = queue();
+        let mut old_running = job_in(RUNNING);
+        old_running.created_at = "2000-01-01T00:00:00Z".into();
+        let running_id = old_running.id.clone();
+        q.push(old_running);
+        for i in 0..5 {
+            let mut phases = RUNNING.to_vec();
+            phases.push(JobPhase::Failed);
+            let mut done = job_in(&phases);
+            done.finished_at = Some(format!("2026-01-0{}T00:00:00Z", i + 1));
+            q.push(done);
+        }
+
+        q.prune_old(3);
+        let left = q.all();
+        assert_eq!(left.len(), 3);
+        assert!(left.iter().any(|j| j.id == running_id), "the running job stays");
+        // The two survivors are the newest finished ones.
+        let mut finished: Vec<_> = left.iter().filter_map(|j| j.finished_at.clone()).collect();
+        finished.sort();
+        assert_eq!(finished, vec!["2026-01-04T00:00:00Z", "2026-01-05T00:00:00Z"]);
+    }
+
+    #[test]
+    fn pruning_a_queue_of_only_live_jobs_drops_nothing() {
+        let q = queue();
+        for _ in 0..4 {
+            q.push(job_in(RUNNING));
+        }
+        q.prune_old(2);
+        assert_eq!(q.all().len(), 4);
+    }
 }

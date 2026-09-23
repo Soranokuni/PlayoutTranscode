@@ -726,6 +726,25 @@ async fn init_schema(pool: SqlitePool) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    // PL-05. The full SHA-256 of a watch-folder source, keyed by what would
+    // change if the file did. Sources are kept in the watch folder by default,
+    // and every service start re-offers every one of them; each confirmed
+    // duplicate then cost a full read of the source -- 300 retained 20 GB
+    // files on a share is hours of I/O per restart, with new ingests starved
+    // of slots behind it. A cache, not a record: losing it costs one re-hash.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS source_hash_cache (
+            path        TEXT PRIMARY KEY NOT NULL,
+            size_bytes  INTEGER NOT NULL,
+            mtime_secs  INTEGER NOT NULL,
+            fingerprint INTEGER NOT NULL,
+            sha256      TEXT NOT NULL,
+            hashed_at   TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS transcode_jobs (
             id TEXT PRIMARY KEY NOT NULL,
@@ -1611,29 +1630,86 @@ pub async fn reconcile_missing_paths(
     pool: &SqlitePool,
     file_exists: impl Fn(&str) -> bool,
 ) -> Result<MissingReconcile, sqlx::Error> {
-    let rows: Vec<(String, String, String)> = sqlx::query_as(
+    let rows = published_rows(pool).await?;
+    let presence: Vec<bool> = rows
+        .iter()
+        .map(|(_, _, path)| !path.is_empty() && file_exists(path))
+        .collect();
+    apply_presence(pool, rows, presence).await
+}
+
+/// The sweep as the service runs it (PL-06): the `stat`s off the async
+/// runtime, and not at all when the target folder itself is unreachable.
+///
+/// The caller in `app.rs` said it used `spawn_blocking` and did not: every
+/// 120 s one runtime worker sat through N SMB round trips. Worse, a share
+/// that dropped for a few seconds made every `exists()` false, so the sweep
+/// flipped the *whole library* to `missing` and PlayOut refused every TAKE
+/// until the next pass. Not being able to see the folder is not the files
+/// being gone: `None` means the pass was skipped for that reason.
+pub async fn reconcile_missing_paths_off_runtime(
+    pool: &SqlitePool,
+    target_root: std::path::PathBuf,
+) -> Result<Option<MissingReconcile>, sqlx::Error> {
+    let rows = published_rows(pool).await?;
+    let paths: Vec<String> = rows.iter().map(|(_, _, p)| p.clone()).collect();
+    let presence = tokio::task::spawn_blocking(move || {
+        if !target_root.as_os_str().is_empty() && !target_root.is_dir() {
+            return None;
+        }
+        Some(
+            paths
+                .iter()
+                .map(|p| !p.is_empty() && Path::new(p).exists())
+                .collect::<Vec<bool>>(),
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+    match presence {
+        Some(presence) => apply_presence(pool, rows, presence).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn published_rows(pool: &SqlitePool) -> Result<Vec<(String, String, String)>, sqlx::Error> {
+    sqlx::query_as(
         "SELECT uuid, status, current_path FROM media_assets
          WHERE deleted_at IS NULL AND status IN ('ready', 'missing')",
     )
     .fetch_all(pool)
-    .await?;
+    .await
+}
 
+/// Move rows between `ready` and `missing` to match `presence`, in one
+/// transaction. Each UPDATE re-checks the status it read, so a row that was
+/// purged, re-published or edited between the SELECT and here is left alone.
+async fn apply_presence(
+    pool: &SqlitePool,
+    rows: Vec<(String, String, String)>,
+    presence: Vec<bool>,
+) -> Result<MissingReconcile, sqlx::Error> {
     let mut out = MissingReconcile::default();
+    let mut tx = pool.begin().await?;
 
-    for (uuid, status, path) in rows {
-        let present = !path.is_empty() && file_exists(&path);
+    for ((uuid, status, path), present) in rows.into_iter().zip(presence) {
         match (status.as_str(), present) {
             ("ready", false) => {
-                sqlx::query("UPDATE media_assets SET status = 'missing' WHERE uuid = ?1")
-                    .bind(&uuid)
-                    .execute(pool)
-                    .await?;
-                out.went_missing += 1;
-                tracing::warn!(
-                    "Asset {} is 'ready' but its mezzanine is gone from {}; marked 'missing'",
-                    uuid,
-                    path
-                );
+                let r = sqlx::query(
+                    "UPDATE media_assets SET status = 'missing' WHERE uuid = ?1 AND status = 'ready'",
+                )
+                .bind(&uuid)
+                .execute(&mut *tx)
+                .await?;
+                if r.rows_affected() > 0 {
+                    out.went_missing += 1;
+                    tracing::warn!(
+                        "Asset {} is 'ready' but its mezzanine is gone from {}; marked 'missing'",
+                        uuid,
+                        path
+                    );
+                }
             }
             ("missing", true) => {
                 // Back to `ready` only if the mezzanine still passed QC. The
@@ -1641,28 +1717,33 @@ pub async fn reconcile_missing_paths(
                 // it is the right refusal: a QC-failed row belongs at `error`.
                 let restored = sqlx::query(
                     "UPDATE media_assets SET status = 'ready'
-                     WHERE uuid = ?1 AND mezzanine_ok = 1",
+                     WHERE uuid = ?1 AND status = 'missing' AND mezzanine_ok = 1",
                 )
                 .bind(&uuid)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
                 if restored.rows_affected() > 0 {
                     out.came_back += 1;
                     tracing::info!("Asset {} is back on disk at {}; restored to 'ready'", uuid, path);
                 } else {
-                    sqlx::query("UPDATE media_assets SET status = 'error' WHERE uuid = ?1")
-                        .bind(&uuid)
-                        .execute(pool)
-                        .await?;
-                    tracing::warn!(
-                        "Asset {} is back on disk but never passed QC; moved to 'error'",
-                        uuid
-                    );
+                    let r = sqlx::query(
+                        "UPDATE media_assets SET status = 'error' WHERE uuid = ?1 AND status = 'missing'",
+                    )
+                    .bind(&uuid)
+                    .execute(&mut *tx)
+                    .await?;
+                    if r.rows_affected() > 0 {
+                        tracing::warn!(
+                            "Asset {} is back on disk but never passed QC; moved to 'error'",
+                            uuid
+                        );
+                    }
                 }
             }
             _ => {}
         }
     }
+    tx.commit().await?;
 
     out.missing_total = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM media_assets WHERE status = 'missing' AND deleted_at IS NULL",
@@ -2978,6 +3059,84 @@ pub async fn load_all_durable_jobs(
         sqlx::query_as("SELECT * FROM transcode_jobs ORDER BY created_at ASC")
             .fetch_all(pool)
             .await?;
+
+    Ok(rows.into_iter().map(|r| r.into_job_record()).collect())
+}
+
+/// The cached SHA-256 for `path`, if the file still has the size, mtime and
+/// sampled fingerprint it had when it was hashed (PL-05).
+pub async fn cached_source_sha256(
+    pool: &SqlitePool,
+    path: &str,
+    size_bytes: u64,
+    mtime_secs: u64,
+    fingerprint: i64,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT sha256 FROM source_hash_cache
+          WHERE path = ?1 AND size_bytes = ?2 AND mtime_secs = ?3 AND fingerprint = ?4",
+    )
+    .bind(path)
+    .bind(size_bytes as i64)
+    .bind(mtime_secs as i64)
+    .bind(fingerprint)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn store_source_sha256(
+    pool: &SqlitePool,
+    path: &str,
+    size_bytes: u64,
+    mtime_secs: u64,
+    fingerprint: i64,
+    sha256: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO source_hash_cache (path, size_bytes, mtime_secs, fingerprint, sha256, hashed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(path) DO UPDATE SET
+            size_bytes = excluded.size_bytes, mtime_secs = excluded.mtime_secs,
+            fingerprint = excluded.fingerprint, sha256 = excluded.sha256,
+            hashed_at = excluded.hashed_at",
+    )
+    .bind(path)
+    .bind(size_bytes as i64)
+    .bind(mtime_secs as i64)
+    .bind(fingerprint)
+    .bind(sha256)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// What the in-memory queue is seeded with at startup (PL-04): every job that
+/// is still pending or processing, plus the `recent_finished` most recently
+/// finished ones.
+///
+/// Startup used to load the entire `transcode_jobs` history, which only ever
+/// grows, and then `prune_old(500)` threw most of it away on the first job to
+/// finish. The full history stays in the table for the DB viewer.
+pub async fn load_durable_jobs_for_queue(
+    pool: &SqlitePool,
+    recent_finished: i64,
+) -> Result<Vec<crate::jobs::JobRecord>, sqlx::Error> {
+    let rows: Vec<DurableJobRow> = sqlx::query_as(
+        "SELECT * FROM (
+             SELECT * FROM transcode_jobs WHERE state IN ('Pending', 'Processing')
+             UNION ALL
+             SELECT * FROM (
+                 SELECT * FROM transcode_jobs
+                  WHERE state NOT IN ('Pending', 'Processing')
+                  ORDER BY COALESCE(finished_at, created_at) DESC
+                  LIMIT ?1
+             )
+         ) ORDER BY created_at ASC",
+    )
+    .bind(recent_finished)
+    .fetch_all(pool)
+    .await?;
 
     Ok(rows.into_iter().map(|r| r.into_job_record()).collect())
 }
@@ -6211,8 +6370,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-}
+    /// PL-06. An unreachable target folder must skip the pass, not flip the
+    /// whole library to `missing`.
+    #[tokio::test]
+    async fn an_unreachable_target_skips_the_reconcile() {
+        let (pool, dir) = setup_test_pool().await;
+        insert_processing(&pool, "kept", 900_101, Some("21"), "D:/w/k.mxf", "K")
+            .await
+            .unwrap();
+        mark_ready(
+            &pool, "kept", "Z:/nowhere/k.mp4", 1_000, true, 25.0, 25, 1, 25, 50, 0, &[], "[0]",
+            None,
+        )
+        .await
+        .unwrap();
 
+        let unreachable = dir.join("no-such-share");
+        let outcome = reconcile_missing_paths_off_runtime(&pool, unreachable)
+            .await
+            .unwrap();
+        assert!(outcome.is_none(), "the pass must be skipped");
+        assert_eq!(
+            find_by_uuid(&pool, "kept").await.unwrap().unwrap().status,
+            "ready"
+        );
+
+        // With the folder reachable, the gone file is reported as before.
+        let reachable = reconcile_missing_paths_off_runtime(&pool, dir.clone())
+            .await
+            .unwrap()
+            .expect("the pass runs");
+        assert_eq!(reachable.went_missing, 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PL-05. The cache answers only for the exact file it hashed.
+    #[tokio::test]
+    async fn the_source_hash_cache_matches_only_an_unchanged_file() {
+        let (pool, dir) = setup_test_pool().await;
+        store_source_sha256(&pool, "D:/w/a.mxf", 100, 7, 42, "abc").await.unwrap();
+
+        let hit = cached_source_sha256(&pool, "D:/w/a.mxf", 100, 7, 42).await.unwrap();
+        assert_eq!(hit.as_deref(), Some("abc"));
+        for (size, mtime, fp) in [(101, 7, 42), (100, 8, 42), (100, 7, 43)] {
+            assert!(
+                cached_source_sha256(&pool, "D:/w/a.mxf", size, mtime, fp)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "a changed file must miss: {} {} {}",
+                size,
+                mtime,
+                fp
+            );
+        }
+
+        // A re-hash replaces the entry.
+        store_source_sha256(&pool, "D:/w/a.mxf", 101, 9, 44, "def").await.unwrap();
+        let hit = cached_source_sha256(&pool, "D:/w/a.mxf", 101, 9, 44).await.unwrap();
+        assert_eq!(hit.as_deref(), Some("def"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// PL-04. Startup seeds the queue with everything unfinished and only the
+    /// newest finished jobs.
+    #[tokio::test]
+    async fn the_queue_is_seeded_with_live_jobs_and_recent_history() {
+        use crate::jobs::{JobPhase, JobRecord};
+        let (pool, dir) = setup_test_pool().await;
+
+        let mut records = Vec::new();
+        for i in 0..5 {
+            let mut j = JobRecord::new(&format!("D:/w/done{}.mxf", i), "A");
+            j.transition_to(JobPhase::Probing, None).unwrap();
+            j.transition_to(JobPhase::Failed, None).unwrap();
+            j.finished_at = Some(format!("2026-01-0{}T00:00:00Z", i + 1));
+            records.push(j);
+        }
+        let live = JobRecord::new("D:/w/live.mxf", "A");
+        let live_id = live.id.clone();
+        records.push(live);
+        persist_jobs(&pool, &records).await.unwrap();
+
+        let loaded = load_durable_jobs_for_queue(&pool, 2).await.unwrap();
+        assert_eq!(loaded.len(), 3, "the live job plus the two newest finished");
+        assert!(loaded.iter().any(|j| j.id == live_id));
+        let finished: Vec<_> = loaded
+            .iter()
+            .filter_map(|j| j.finished_at.clone())
+            .collect();
+        assert!(finished.contains(&"2026-01-05T00:00:00Z".to_string()));
+        assert!(finished.contains(&"2026-01-04T00:00:00Z".to_string()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
 
 #[cfg(test)]
 mod rating_tests {
@@ -6240,6 +6494,4 @@ mod rating_tests {
         assert!(!is_valid_rating("K|line\nbreak"));
         assert!(!is_valid_rating("NOT-A-RATING"));
     }
-
-
 }

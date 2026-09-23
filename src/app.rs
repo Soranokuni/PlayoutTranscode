@@ -168,7 +168,8 @@ pub async fn run_service(
         }
     }
     reconcile_pending_jobs(&pool).await;
-    if let Ok(existing_jobs) = db::load_all_durable_jobs(&pool).await {
+    // Matches the `prune_old(500)` bound the queue keeps while running.
+    if let Ok(existing_jobs) = db::load_durable_jobs_for_queue(&pool, 500).await {
         job_queue.populate(existing_jobs);
     }
 
@@ -303,22 +304,27 @@ pub async fn run_service(
     // each one is a round trip and a few thousand of them on the runtime would
     // stall every request in flight.
     let reconcile_pool = pool.clone();
+    let reconcile_root = target_root.clone();
     let reconcile_task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(MISSING_RECONCILE_INTERVAL);
         loop {
             ticker.tick().await;
-            let result = db::reconcile_missing_paths(&reconcile_pool, |p| {
-                std::path::Path::new(p).exists()
-            })
-            .await;
+            let result =
+                db::reconcile_missing_paths_off_runtime(&reconcile_pool, reconcile_root.clone())
+                    .await;
             match result {
-                Ok(r) if r.went_missing > 0 || r.came_back > 0 => tracing::info!(
+                Ok(Some(r)) if r.went_missing > 0 || r.came_back > 0 => tracing::info!(
                     "Path reconcile: {} asset(s) went missing, {} came back, {} missing in total",
                     r.went_missing,
                     r.came_back,
                     r.missing_total,
                 ),
-                Ok(_) => {}
+                Ok(Some(_)) => {}
+                Ok(None) => tracing::warn!(
+                    "Path reconcile skipped: target folder {} is not reachable, so no asset \
+                     was marked missing on its account",
+                    reconcile_root.display()
+                ),
                 Err(e) => tracing::error!("Path reconcile failed: {}", e),
             }
         }
