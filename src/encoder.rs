@@ -192,17 +192,32 @@ pub fn transcode_file(
         }
     };
 
+    // PL-01: dies with the service, however the service dies.
+    crate::child::adopt(&child);
+
     let pid = child.id();
     if let Some(ref pids) = active_pids {
         if let Ok(mut map) = pids.lock() {
             map.insert(job_id.to_string(), pid);
         }
     }
+    // Early exits below must reap the child (a bare `kill()` leaves a zombie
+    // on Linux and a leaked handle on Windows) and drop its pid, or a later
+    // cancel for this job would `taskkill` whatever process reused the number.
+    let abandon = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(ref pids) = active_pids {
+            if let Ok(mut map) = pids.lock() {
+                map.retain(|_, &mut v| v != pid);
+            }
+        }
+    };
 
     let stderr = match child.stderr.take() {
         Some(s) => s,
         None => {
-            let _ = child.kill();
+            abandon(&mut child);
             return EncodeResult {
                 output_path: output_path.to_path_buf(),
                 success: false,
@@ -215,7 +230,7 @@ pub fn transcode_file(
     let stdout = match child.stdout.take() {
         Some(s) => s,
         None => {
-            let _ = child.kill();
+            abandon(&mut child);
             return EncodeResult {
                 output_path: output_path.to_path_buf(),
                 success: false,

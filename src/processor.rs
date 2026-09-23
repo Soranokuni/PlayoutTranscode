@@ -439,6 +439,10 @@ impl TranscodeRunner for RealTranscodeRunner {
     }
 }
 
+/// "Is the run this job belongs to still going?" False once the service has
+/// been asked to stop (PL-02).
+pub type StillRunning = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 pub fn process_file_sync(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -448,6 +452,32 @@ pub fn process_file_sync(
     pool: &SqlitePool,
     active_pids: crate::service_handle::ActivePids,
     existing_job: Option<jobs::JobRecord>,
+) {
+    process_file_sync_gated(
+        queue,
+        tools,
+        target_root,
+        input_path,
+        config,
+        pool,
+        active_pids,
+        existing_job,
+        std::sync::Arc::new(|| true),
+    );
+}
+
+/// [`process_file_sync`] for the dispatcher, which knows when its run ends.
+#[allow(clippy::too_many_arguments)]
+pub fn process_file_sync_gated(
+    queue: &jobs::JobQueue,
+    tools: &bootstrap::ToolPaths,
+    target_root: &Path,
+    input_path: &Path,
+    config: &config::AppConfig,
+    pool: &SqlitePool,
+    active_pids: crate::service_handle::ActivePids,
+    existing_job: Option<jobs::JobRecord>,
+    still_running: StillRunning,
 ) {
     process_file_sync_with_runner(
         queue,
@@ -459,6 +489,7 @@ pub fn process_file_sync(
         active_pids,
         existing_job,
         &RealTranscodeRunner,
+        still_running,
     );
 }
 
@@ -472,6 +503,7 @@ pub fn process_file_sync_with_runner(
     active_pids: crate::service_handle::ActivePids,
     existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
+    still_running: StillRunning,
 ) {
     process_file_sync_with_runner_and_measurer(
         queue,
@@ -484,6 +516,7 @@ pub fn process_file_sync_with_runner(
         existing_job,
         runner,
         &probe::RealLoudnessMeasurer,
+        still_running,
     );
 }
 
@@ -498,6 +531,7 @@ pub fn process_file_sync_with_runner_and_measurer(
     existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
+    still_running: StillRunning,
 ) {
     let result = catch_unwind(AssertUnwindSafe(|| {
         process_file_inner(
@@ -511,6 +545,7 @@ pub fn process_file_sync_with_runner_and_measurer(
             existing_job.clone(),
             runner,
             measurer,
+            still_running,
         );
     }));
 
@@ -929,6 +964,12 @@ fn record_ingest_failure(
     let _ = handle.block_on(db::mark_error(pool, uuid));
 }
 
+/// How long a running encode may go without its media time advancing (PL-03).
+const ENCODE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The same, before the first progress report: ffmpeg is still probing an
+/// input opened with `-analyzeduration 500M`, which on a share is slow.
+const ENCODE_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn process_file_inner(
     queue: &jobs::JobQueue,
     tools: &bootstrap::ToolPaths,
@@ -940,6 +981,7 @@ fn process_file_inner(
     existing_job: Option<jobs::JobRecord>,
     runner: &impl TranscodeRunner,
     measurer: &impl probe::LoudnessMeasurer,
+    still_running: StillRunning,
 ) {
     // Every early return below happens before the main job record is created.
     //
@@ -1340,10 +1382,75 @@ fn process_file_inner(
             let _ = handle.block_on(db::mark_error(pool, &metadata_uuid));
         }
     };
+    // PL-02. The service is stopping: this run's work is abandoned, not failed.
+    // The record goes back to Queued and the row this run inserted goes away,
+    // so the next start ingests the file from scratch, as the stop dialog
+    // promises -- instead of a retry-classified failure relaunching ffmpeg.
+    let finish_interrupted = || {
+        tracing::info!(
+            "Job {} interrupted by the service stopping; it will be re-ingested on the next start",
+            job.id
+        );
+        // In memory first: it needs no runtime, and it is what the UI and the
+        // next start's adoption key on.
+        queue.requeue_interrupted(&job.id);
+        publisher.cleanup_staging(&staged_output_path);
+        // Not `handle.block_on`: by now the worker runtime this job runs on is
+        // shutting down, and sqlx's timer panics on it ("A Tokio 1.x context
+        // was found, but it is being shutdown"), which skipped everything
+        // after it. A throwaway runtime on its own thread is not tied to the
+        // stopping one; the pool's SQLite connections run on their own threads.
+        let purged = std::thread::scope(|s| {
+            s.spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map(|rt| rt.block_on(db::purge_row_by_uuid(pool, &metadata_uuid)))
+            })
+            .join()
+        });
+        if !matches!(purged, Ok(Ok(Ok(_)))) {
+            tracing::warn!(
+                "Could not remove the row of interrupted job {}; startup recovery will",
+                job.id
+            );
+        }
+    };
+    // One question for every stage boundary: stop now, and if so, how.
+    let stop_now = || {
+        if is_cancel_requested() {
+            finish_cancelled();
+            true
+        } else if !still_running() {
+            finish_interrupted();
+            true
+        } else {
+            false
+        }
+    };
+    // Makes the probe, loudness and keyframe children of this job killable by
+    // the same two signals (PL-01).
+    let _interrupt_scope = {
+        let q = queue.clone();
+        let id = job.id.clone();
+        let running = still_running.clone();
+        crate::child::interrupt_scope(std::sync::Arc::new(move || {
+            !running()
+                || q.get(&id)
+                    .map(|j| j.cancel_requested || j.phase == jobs::JobPhase::CancelRequested)
+                    .unwrap_or(false)
+        }))
+    };
 
     let probe_data = match probe::probe_source(tools, input_path) {
         Ok(p) => p,
         Err(e) => {
+            // An interrupted probe is not a verdict on the media: recording it
+            // as one would mark the file permanently failed (`probe:` is a
+            // Permanent class) because somebody pressed Stop.
+            if stop_now() {
+                return;
+            }
             let _ = queue.transition(
                 &job.id,
                 jobs::JobPhase::Failed,
@@ -1404,8 +1511,7 @@ fn process_file_inner(
         return;
     }
 
-    if is_cancel_requested() {
-        finish_cancelled();
+    if stop_now() {
         return;
     }
 
@@ -1422,6 +1528,11 @@ fn process_file_inner(
         ) {
             Ok(m) => m,
             Err(e) => {
+                // Same as the probe: "audio measurement failed" is Permanent,
+                // and a killed pass says nothing about the audio.
+                if stop_now() {
+                    return;
+                }
                 let _ = queue.transition(
                     &job.id,
                     jobs::JobPhase::Failed,
@@ -1508,10 +1619,10 @@ fn process_file_inner(
     while attempt <= max_attempts {
         publisher.cleanup_staging(&staged_output_path);
 
-        // Before every attempt, not just the first: a cancel that lands while
-        // a failed attempt is backing off must not start another ffmpeg.
-        if is_cancel_requested() {
-            finish_cancelled();
+        // Before every attempt, not just the first: a cancel or a stop that
+        // lands while a failed attempt is backing off must not start another
+        // ffmpeg.
+        if stop_now() {
             return;
         }
 
@@ -1605,12 +1716,64 @@ fn process_file_inner(
         let hb_wid = worker_id.clone();
         let hb_queue = queue.clone();
         let hb_pids = active_pids.clone();
+        let hb_running = still_running.clone();
+        let stalled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hb_stalled = stalled.clone();
 
         let hb_thread = std::thread::spawn(move || {
+            // PL-03 watchdog. The encoder blocks reading ffmpeg's progress
+            // pipe, so an ffmpeg wedged on a source share that stopped
+            // answering held its concurrency slot forever. Progress is
+            // measured in media time, so a slow encode is not a stalled one.
+            let mut last_media_ms = -1_i64;
+            let mut last_advance = std::time::Instant::now();
             while hb_stop_rx
                 .recv_timeout(std::time::Duration::from_millis(2000))
                 .is_err()
             {
+                // The run ended between the pre-attempt check and ffmpeg
+                // registering its pid, so the stop's kill-all missed it.
+                if !hb_running() {
+                    if crate::service_handle::kill_ffmpeg_for_job(
+                        &hb_pids,
+                        &hb_jid,
+                        crate::service_handle::kill_process_tree,
+                    ) {
+                        break;
+                    }
+                    continue;
+                }
+                if let Some(live) = hb_queue.get(&hb_jid) {
+                    if live.current_time_ms != last_media_ms {
+                        last_media_ms = live.current_time_ms;
+                        last_advance = std::time::Instant::now();
+                    }
+                    // Past the end of the media ffmpeg is relocating the moov
+                    // atom for faststart, which reports no progress at all and
+                    // can legitimately take minutes on a long programme.
+                    let finalizing = live.duration_ms > 0
+                        && live.current_time_ms >= live.duration_ms - 1_000;
+                    let limit = if last_media_ms > 0 {
+                        ENCODE_STALL_TIMEOUT
+                    } else {
+                        ENCODE_STARTUP_TIMEOUT
+                    };
+                    if !finalizing && last_advance.elapsed() >= limit {
+                        tracing::error!(
+                            "FFmpeg for job {} made no progress for {}s; killing it",
+                            hb_jid,
+                            last_advance.elapsed().as_secs()
+                        );
+                        hb_stalled.store(true, std::sync::atomic::Ordering::SeqCst);
+                        if crate::service_handle::kill_ffmpeg_for_job(
+                            &hb_pids,
+                            &hb_jid,
+                            crate::service_handle::kill_process_tree,
+                        ) {
+                            break;
+                        }
+                    }
+                }
                 if let Ok(cancel_req) = hb_queue.heartbeat(&hb_jid, &hb_wid, 10) {
                     if cancel_req {
                         tracing::warn!(
@@ -1658,8 +1821,9 @@ fn process_file_inner(
         let _ = hb_stop_tx.send(());
         let _ = hb_thread.join();
 
-        if is_cancel_requested() {
-            finish_cancelled();
+        // A stop kills every ffmpeg; without this the killed encode read as
+        // an ordinary retryable failure (PL-02).
+        if stop_now() {
             return;
         }
 
@@ -1725,6 +1889,16 @@ fn process_file_inner(
                 .error
                 .clone()
                 .unwrap_or_else(|| "FFmpeg encoding failed".to_string());
+            // Say why it died. "Exited with code 1" from a watchdog kill sent
+            // operators looking for a codec problem that was a network one.
+            // "timeout" keeps it in the Retryable class.
+            if stalled.load(std::sync::atomic::Ordering::SeqCst) {
+                validation_error = format!(
+                    "FFmpeg stalled (no progress for {}s; timeout) and was killed: {}",
+                    ENCODE_STALL_TIMEOUT.as_secs(),
+                    validation_error
+                );
+            }
         }
 
         if validation_ok {
@@ -2128,8 +2302,13 @@ fn process_file_inner(
                 .to_string(),
             );
 
-            if retry_delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(retry_delay_ms));
+            // In slices, so a cancel or stop during the back-off is honoured
+            // now rather than after it.
+            let resume_at =
+                std::time::Instant::now() + std::time::Duration::from_millis(retry_delay_ms);
+            while std::time::Instant::now() < resume_at && !is_cancel_requested() && still_running()
+            {
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             attempt += 1;
         } else {
@@ -3116,7 +3295,12 @@ fn extract_keyframe_offsets_ms(ffprobe: &str, path: &Path) -> KeyframeScan {
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    let output = match cmd.output() {
+    // Bounded (PL-01). A packet scan of an 84 s mezzanine takes ~0.12 s, so
+    // ten minutes only trips on a stalled volume, never on a long programme.
+    let output = match crate::child::output_with_timeout(
+        &mut cmd,
+        std::time::Duration::from_secs(600),
+    ) {
         Ok(out) => out,
         Err(e) => {
             tracing::error!("Failed to execute ffprobe for keyframe scanning: {}", e);
@@ -3646,6 +3830,18 @@ mod tests {
         let _ = std::fs::remove_file(&staged_path);
         let _ = std::fs::remove_file(&final_path);
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    /// PL-03. A watchdog kill must stay retryable: the usual cause is a share
+    /// that stopped answering, which the next attempt may well find back.
+    /// "stopped" in the message would have made it `Cancelled`.
+    #[test]
+    fn a_stalled_encode_is_retryable() {
+        let msg = format!(
+            "FFmpeg stalled (no progress for {}s; timeout) and was killed: ffmpeg exited with code 1",
+            ENCODE_STALL_TIMEOUT.as_secs()
+        );
+        assert_eq!(classify_error(&msg, false), RetryClass::Retryable);
     }
 
     #[test]

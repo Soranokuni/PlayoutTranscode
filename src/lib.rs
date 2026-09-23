@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod bootstrap;
+pub mod child;
 pub mod config;
 pub mod db;
 pub mod encoder;

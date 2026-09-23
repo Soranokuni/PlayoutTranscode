@@ -12,6 +12,10 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 #[cfg(target_os = "windows")]
 const BELOW_NORMAL_PRIORITY_CLASS: u32 = 0x00004000;
 
+/// Upper bound on one ffprobe of a source (PL-01). A healthy probe of even a
+/// multi-hour MXF on a share finishes in seconds.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One audio stream as ffprobe reports it.
 ///
 /// Only the first stream used to be probed, so an MXF with eight mono PCM
@@ -405,8 +409,9 @@ pub fn probe_media(tools: &ToolPaths, input_path: &Path) -> Result<ProbeData, St
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    let output = command
-        .output()
+    // Bounded (PL-01): a source on a share that stops answering used to hold
+    // this call, and the job's concurrency slot, forever.
+    let output = crate::child::output_with_timeout(&mut command, PROBE_TIMEOUT)
         .map_err(|e| format!("ffprobe exec failed: {}", e))?;
 
     if !output.status.success() {
@@ -611,8 +616,8 @@ fn detect_interlace(
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    let output = command
-        .output()
+    // Bounded and interruptible like every probe helper (PL-01).
+    let output = crate::child::output_with_timeout(&mut command, PROBE_TIMEOUT)
         .map_err(|e| format!("idet exec failed: {}", e))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
@@ -651,8 +656,7 @@ pub fn ffmpeg_caps(tools: &ToolPaths) -> FfmpegCaps {
         command.args(["-hide_banner", arg]);
         #[cfg(target_os = "windows")]
         command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
-        command
-            .output()
+        crate::child::output_with_timeout(&mut command, std::time::Duration::from_secs(30))
             .map(|o| {
                 let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
                 s.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -692,8 +696,7 @@ pub fn probe_audio_streams(
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    let output = command
-        .output()
+    let output = crate::child::output_with_timeout(&mut command, PROBE_TIMEOUT)
         .map_err(|e| format!("ffprobe exec failed: {}", e))?;
     if !output.status.success() {
         return Err("ffprobe failed on audio streams".into());
@@ -992,8 +995,12 @@ impl LoudnessMeasurer for RealLoudnessMeasurer {
         #[cfg(target_os = "windows")]
         command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-        let output = command
-            .output()
+        // Bounded and interruptible (PL-01). This pass decodes the whole
+        // programme's audio, so a cancel or a service stop used to wait for all
+        // of it. The timeout scales with the programme: roughly 100x realtime
+        // is typical, so allowing 1x realtime is generous without being never.
+        let timeout = std::time::Duration::from_secs_f64(duration_secs.max(0.0) + 600.0);
+        let output = crate::child::output_with_timeout(&mut command, timeout)
             .map_err(|e| format!("Failed to execute FFmpeg loudness measurement: {}", e))?;
 
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1034,9 +1041,11 @@ pub fn measure_output_loudness(tools: &ToolPaths, path: &Path) -> Result<OutputL
     #[cfg(target_os = "windows")]
     command.creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS);
 
-    let output = command
-        .output()
-        .map_err(|e| format!("Failed to execute output loudness measurement: {}", e))?;
+    // A decode of the mezzanine's audio only, typically ~100x realtime; half
+    // an hour trips on a stalled volume, not on a long programme (PL-01).
+    let output =
+        crate::child::output_with_timeout(&mut command, std::time::Duration::from_secs(1800))
+            .map_err(|e| format!("Failed to execute output loudness measurement: {}", e))?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     if !output.status.success() {
         return Err(format!(

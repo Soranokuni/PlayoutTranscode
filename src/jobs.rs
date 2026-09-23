@@ -665,6 +665,34 @@ impl JobQueue {
         Ok(job_clone)
     }
 
+    /// Put a job the service stop interrupted back to `Queued` (PL-02).
+    ///
+    /// Deliberately outside the phase machine: no operator transition leads
+    /// from `Encoding` back to `Queued`, but "the run this belonged to ended"
+    /// is not an operator transition. What it replaces is the crash-recovery
+    /// sweep, which only runs at process start -- so after an in-process
+    /// Stop/Start the record sat in `Processing` forever. Queued, the watcher's
+    /// next offer of the same file adopts it (`find_pending_by_input_path`).
+    pub fn requeue_interrupted(&self, id: &str) {
+        let mut jobs = self.jobs.write();
+        let Some(job) = jobs.iter_mut().find(|j| j.id == id) else {
+            return;
+        };
+        if job.phase.is_terminal() {
+            return;
+        }
+        job.phase = JobPhase::Queued;
+        job.state = JobState::Pending;
+        job.current_stage = "Re-queued (service stopped)".into();
+        job.progress = 0.0;
+        job.worker_id = None;
+        job.leased_until = None;
+        let job_clone = job.clone();
+        drop(jobs);
+        self.announce(&job_clone);
+        self.enqueue_persist(job_clone);
+    }
+
     /// Undo [`Self::requeue_for_retry`] when the dispatcher refused the job.
     pub fn revert_retry(&self, id: &str, reason: &str) {
         let reason = reason.to_string();
@@ -1562,6 +1590,37 @@ mod tests {
         let data: serde_json::Value = serde_json::from_str(&probing.data).unwrap();
         assert_eq!(data["phase"], "probing");
         assert_eq!(data["job"]["id"], id.as_str());
+    }
+
+    /// PL-02. A job interrupted by a service stop goes back to Queued so the
+    /// next start's watcher offer adopts it, instead of staying `Processing`
+    /// forever (crash recovery only runs at process start).
+    #[test]
+    fn an_interrupted_job_is_requeued_and_adoptable() {
+        let q = queue();
+        let job = job_in(RUNNING);
+        let id = job.id.clone();
+        let input = job.input_path.clone();
+        q.push(job);
+
+        q.requeue_interrupted(&id);
+        let live = q.get(&id).unwrap();
+        assert_eq!(live.phase, JobPhase::Queued);
+        assert_eq!(live.state, JobState::Pending);
+        assert_eq!(q.find_pending_by_input_path(&input).unwrap().id, id);
+    }
+
+    #[test]
+    fn a_finished_job_is_not_requeued_by_an_interruption() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.push(JobPhase::Failed);
+        let job = job_in(&phases);
+        let id = job.id.clone();
+        q.push(job);
+
+        q.requeue_interrupted(&id);
+        assert_eq!(q.get(&id).unwrap().phase, JobPhase::Failed);
     }
 
 }

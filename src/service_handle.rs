@@ -756,10 +756,28 @@ fn dispatch_one(
             return;
         }
 
+        // PL-02. The processor used to have no idea the service was stopping:
+        // a stop killed ffmpeg, the processor read that as a retryable
+        // "ffmpeg exited with code 1", and relaunched an ffmpeg nobody would
+        // ever kill -- which is also why a stop sat in `Stopping` for the
+        // whole re-encode.
+        let run_gate = gate.clone();
+        let still_running: crate::processor::StillRunning =
+            Arc::new(move || run_gate.is_current_run(generation));
         let _ = tokio::task::spawn_blocking(move || {
             // Permit is moved here and kept alive for the full duration of processing
             let _held_permit = permit;
-            crate::processor::process_file_sync(&jq, &t, &tg, &path, &c, &p, apids, existing);
+            crate::processor::process_file_sync_gated(
+                &jq,
+                &t,
+                &tg,
+                &path,
+                &c,
+                &p,
+                apids,
+                existing,
+                still_running,
+            );
         })
         .await;
     });

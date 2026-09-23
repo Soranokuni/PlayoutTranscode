@@ -96,7 +96,9 @@ fn run_version(tool: &Path) -> Option<String> {
     cmd.arg("-version");
     #[cfg(target_os = "windows")]
     cmd.creation_flags(CREATE_NO_WINDOW);
-    let output = cmd.output().ok()?;
+    // A `-version` that never returns used to stall service start (PL-01).
+    let output =
+        crate::child::output_with_timeout(&mut cmd, std::time::Duration::from_secs(30)).ok()?;
     if output.status.success() {
         let text = String::from_utf8_lossy(&output.stdout);
         text.lines().next().map(|s| s.to_string())
