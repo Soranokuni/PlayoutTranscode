@@ -441,9 +441,35 @@ a fresh connection from a replayed one.
 New terminal event for a confirmed duplicate (§5.3), carrying the uuid of the
 asset that already holds the content. Treat it like `completed`.
 
+### `job_update` (extended)
+
+Now sent on **every** job push, phase transition and cancel request — before,
+only once per job, at Probing. The documented `{ "id", "stage" }` fields are
+unchanged; `phase`, `state` and the full `job` record (the same shape as
+`GET /api/jobs`) are added, so a client can apply it without refetching.
+
+```
+event: job_update
+data: {"id":"…","stage":"Cancel requested","phase":"cancel_requested","state":"Processing","job":{…}}
+```
+
+### `assets_changed`
+
+```
+event: assets_changed
+data: {"uuid":"0b7e3c1a-5d2f-4e8b-9a61-3c4d5e6f7a8b"}
+```
+
+Sent after any successful asset, folder or recycle-bin mutation over the API
+(trim, rating, tp, rename, move, sub-clip, trash, restore, purge, batch,
+clear-verdict, regenerate-sidecar). `uuid` names the one asset that changed, or
+is `null` for an operation that can touch many (folders, batch, recycle bin) —
+refetch the list then. A refused request (4xx/5xx) is not announced.
+
 ### Unchanged
 
-`progress` still arrives at the same 250 ms throttle with the same fields.
+`progress` still arrives at the same 250 ms throttle with the same fields, plus
+an additive `current_frame`.
 `completed` and `failed` are unchanged. What changed internally is only how
 often the *database* is written, which you never see; `GET /api/jobs` still
 serves the live in-memory record.

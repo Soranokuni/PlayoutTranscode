@@ -2,7 +2,7 @@
   <section class="panel">
     <div class="panel-header">
       <span class="panel-title">ACTIVE INGEST QUEUE</span>
-      <span class="panel-badge">{{ processing.length + failed.length }}</span>
+      <span class="panel-badge">{{ processing.length + queued.length + failed.length }}</span>
       <button
         v-if="failed.length"
         class="btn btn-retry-all"
@@ -31,36 +31,43 @@
       >{{ retryMsg }}</span>
     </div>
 
-    <div v-if="!processing.length && !failed.length" class="empty">
+    <div v-if="!processing.length && !queued.length && !failed.length" class="empty">
       No active or failed ingests.
     </div>
 
     <div v-else class="queue-list">
       <div v-for="job in processing" :key="job.id" class="queue-row">
         <div class="queue-main">
-          <span v-if="job.attempt && job.attempt > 0" class="retry-chip" title="Retry attempt">
+          <span v-if="job.attempt && job.attempt > 1" class="retry-chip" title="Retry attempt">
             ⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span>
           </span>
           <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
-          <span v-if="job.phase" class="queue-phase">{{ job.phase }}</span>
+          <span v-if="job.phase" class="queue-phase" :class="{ cancelling: isCancelling(job) }">
+            {{ isCancelling(job) ? 'cancelling' : job.phase.replace('_', ' ') }}
+          </span>
           <span class="queue-profile">{{ job.profile }}</span>
           <ProgressBar
             :percent="job.progress"
-            :determinate="job.duration_secs > 0 || job.source_frame_count > 0"
+            :determinate="(job.duration_ms || 0) > 0 || job.duration_secs > 0 || job.source_frame_count > 0"
             :speed="job.encode_speed"
-            :duration-ms="(job.duration_secs || 0) * 1000"
+            :duration-ms="job.duration_ms || (job.duration_secs || 0) * 1000"
             :current-time-ms="job.current_time_ms || 0"
           />
           <span v-if="job.encode_fps" class="queue-fps">{{ Math.round(job.encode_fps) }} fps</span>
           <span v-if="job.encode_bitrate" class="queue-bitrate">{{ job.encode_bitrate }}</span>
+          <!-- Publishing is the atomic rename + registry write. It cannot be
+               interrupted, so a cancel there only promised something the
+               server would refuse. -->
           <button
+            v-if="job.phase !== 'publishing'"
             class="btn btn-mini btn-cancel"
-            :disabled="cancellingId === job.id"
-            title="Cancel transcode job"
-            @click="onCancel(job.id)"
+            :disabled="busy.has(job.id) || isCancelling(job)"
+            :aria-label="`Cancel the transcode of ${shortFileName(job.input_path)}`"
+            :title="isCancelling(job) ? 'Cancelling…' : 'Cancel transcode job'"
+            @click="run(job.id, () => cancel(job.id))"
           >
-            <span v-if="cancellingId === job.id">…</span>
-            <span v-else>✕</span>
+            <span v-if="busy.has(job.id) || isCancelling(job)" aria-hidden="true">…</span>
+            <span v-else aria-hidden="true">✕</span>
           </button>
         </div>
         <div v-if="job.source_frame_count" class="queue-meta">
@@ -70,10 +77,34 @@
         </div>
       </div>
 
+      <!-- Waiting behind max_concurrency, or re-queued by a retry. These used
+           to appear nowhere, so a retried job simply vanished until it
+           started. -->
+      <div v-for="job in queued" :key="job.id" class="queue-row">
+        <div class="queue-main">
+          <span v-if="job.attempt && job.attempt > 1" class="retry-chip" title="Retry attempt">
+            ⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span>
+          </span>
+          <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
+          <span class="queue-phase queued">queued</span>
+          <span class="queue-note">{{ job.current_stage }}</span>
+          <button
+            class="btn btn-mini btn-cancel"
+            :disabled="busy.has(job.id)"
+            :aria-label="`Cancel the queued job for ${shortFileName(job.input_path)}`"
+            title="Take this job out of the queue"
+            @click="run(job.id, () => cancel(job.id))"
+          >
+            <span v-if="busy.has(job.id)" aria-hidden="true">…</span>
+            <span v-else aria-hidden="true">✕</span>
+          </button>
+        </div>
+      </div>
+
       <div v-for="job in failed" :key="job.id" class="error-alert">
         <div class="error-header">
           <span class="queue-status failed">Failed</span>
-          <span v-if="job.attempt && job.attempt > 0" class="retry-chip">⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span></span>
+          <span v-if="job.attempt && job.attempt > 1" class="retry-chip">⟳ #{{ job.attempt }}<span v-if="job.max_attempts">/{{ job.max_attempts }}</span></span>
           <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
           <span
             v-if="job.error_category"
@@ -82,18 +113,23 @@
           >⚠ {{ describeErrorCategory(job.error_category).label }}</span>
           <span class="queue-profile">{{ job.profile }}</span>
           <div class="error-actions">
-            <button class="btn btn-mini" :disabled="retryingId === job.id" @click="onRetry(job.id)">
-              <span v-if="retryingId === job.id">…</span>
+            <button
+              class="btn btn-mini"
+              :disabled="busy.has(job.id)"
+              :aria-label="`Retry ${shortFileName(job.input_path)}`"
+              @click="run(job.id, () => retry(job.id))"
+            >
+              <span v-if="busy.has(job.id)">…</span>
               <span v-else>Retry</span>
             </button>
             <button
               class="btn btn-mini btn-dismiss"
-              :disabled="dismissingId === job.id"
+              :disabled="busy.has(job.id)"
               :aria-label="`Dismiss the failed job for ${shortFileName(job.input_path)}`"
               title="Remove this job record from the list. The asset and its media file are not touched."
-              @click="onDismiss(job.id)"
+              @click="run(job.id, () => dismiss(job.id))"
             >
-              <span v-if="dismissingId === job.id">…</span>
+              <span v-if="busy.has(job.id)" aria-hidden="true">…</span>
               <span v-else aria-hidden="true">✕</span>
             </button>
           </div>
@@ -119,7 +155,8 @@
       A job that finished used to vanish, and a duplicate that was skipped
       (state Completed, phase skipped) never appeared anywhere but as a number
       in the stats. An operator who dropped a file and saw nothing could not
-      tell "done" from "ignored" (UX-04).
+      tell "done" from "ignored" (UX-04). Cancelled jobs are listed too: they
+      fell out of every bucket, so a cancel looked like nothing had happened.
     -->
     <details v-if="recent.length" class="recent">
       <summary class="recent-summary">
@@ -127,8 +164,8 @@
       </summary>
       <div class="recent-list">
         <div v-for="job in recent" :key="job.id" class="recent-row">
-          <span class="recent-badge" :class="job.phase === 'skipped' ? 'skipped' : 'done'">
-            {{ job.phase === 'skipped' ? '⊘ skipped' : '✓ completed' }}
+          <span class="recent-badge" :class="recentKind(job)">
+            {{ recentLabel(job) }}
           </span>
           <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
           <span v-if="job.phase === 'skipped' && job.uuid" class="recent-note">
@@ -138,6 +175,15 @@
             {{ job.duration_secs.toFixed(1) }}s
           </span>
           <span v-if="job.finished_at" class="recent-note mono">{{ clockTime(job.finished_at) }}</span>
+          <button
+            class="btn btn-mini btn-dismiss recent-dismiss"
+            :disabled="busy.has(job.id)"
+            :aria-label="`Remove ${shortFileName(job.input_path)} from the recent list`"
+            title="Remove this record from the list. Assets and media files are not touched."
+            @click="run(job.id, () => dismiss(job.id))"
+          >
+            <span aria-hidden="true">✕</span>
+          </button>
         </div>
       </div>
     </details>
@@ -145,21 +191,27 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onUnmounted, ref } from 'vue'
 import type { JobRecord } from '../composables/useEventStream'
 import { describeErrorCategory } from '../lib/errorCategories'
 import ProgressBar from './ProgressBar.vue'
 
+/**
+ * Row actions are async function props rather than emits, so a button stays
+ * busy exactly as long as its request. With emits the spinner reset after a
+ * fixed 400 ms whatever the server was doing, and a stale Retry was clickable
+ * again while the first retry was still in flight.
+ */
 const props = defineProps<{
   jobs: Map<string, JobRecord>
+  retry: (id: string) => Promise<unknown>
+  cancel: (id: string) => Promise<unknown>
+  dismiss: (id: string) => Promise<unknown>
+  clearAll: () => Promise<unknown>
 }>()
 
 const emit = defineEmits<{
-  (e: 'retry', id: string): void
-  (e: 'cancel', id: string): void
   (e: 'retry-all'): void
-  (e: 'dismiss', id: string): void
-  (e: 'clear-all'): void
 }>()
 
 function shortFileName(path: string) {
@@ -172,34 +224,47 @@ function shortError(err?: string): string {
   return first.length > 220 ? first.slice(0, 217) + '…' : first
 }
 
-/**
- * One pass over the Map instead of one per list.
- *
- * With `jobs` mutated in place on progress (SF-03), this recomputes when a
- * job's identity changes rather than on every 250 ms tick.
- */
+function isCancelling(job: JobRecord): boolean {
+  return job.phase === 'cancel_requested' || !!job.cancel_requested
+}
+
+/** One pass over the Map instead of one per list. */
 const buckets = computed(() => {
   const processing: JobRecord[] = []
+  const queued: JobRecord[] = []
   const failed: JobRecord[] = []
-  const completed: JobRecord[] = []
+  const finished: JobRecord[] = []
   for (const job of props.jobs.values()) {
     if (job.state === 'Processing') processing.push(job)
+    else if (job.state === 'Pending') queued.push(job)
     else if (job.state === 'Failed') failed.push(job)
-    else if (job.state === 'Completed') completed.push(job)
+    else finished.push(job)
   }
-  return { processing, failed, completed }
+  queued.sort((a, b) => a.created_at.localeCompare(b.created_at))
+  return { processing, queued, failed, finished }
 })
 
 const processing = computed(() => buckets.value.processing)
+const queued = computed(() => buckets.value.queued)
 const failed = computed(() => buckets.value.failed)
 
 const RECENT_LIMIT = 20
 const recent = computed(() =>
-  buckets.value.completed
+  buckets.value.finished
     .slice()
     .sort((a, b) => (b.finished_at || '').localeCompare(a.finished_at || ''))
     .slice(0, RECENT_LIMIT),
 )
+
+function recentKind(job: JobRecord): string {
+  if (job.state === 'Cancelled') return 'cancelled'
+  return job.phase === 'skipped' ? 'skipped' : 'done'
+}
+
+function recentLabel(job: JobRecord): string {
+  if (job.state === 'Cancelled') return '✕ cancelled'
+  return job.phase === 'skipped' ? '⊘ skipped' : '✓ completed'
+}
 
 function clockTime(iso: string): string {
   const d = new Date(iso)
@@ -208,61 +273,57 @@ function clockTime(iso: string): string {
     : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
 }
 
-const retryingId = ref<string | null>(null)
-const cancellingId = ref<string | null>(null)
-const dismissingId = ref<string | null>(null)
+/** Ids with a request in flight: one slot per row, so rows don't fight. */
+const busy = ref(new Set<string>())
 const clearingAll = ref(false)
 const retryingAll = ref(false)
 const retryMsg = ref('')
 const retryOk = ref(false)
+let msgTimer = 0
 
-async function onRetry(id: string) {
-  retryingId.value = id
+async function run(id: string, action: () => Promise<unknown>) {
+  if (busy.value.has(id)) return
+  busy.value = new Set(busy.value).add(id)
   try {
-    emit('retry', id)
+    await action()
   } finally {
-    setTimeout(() => { retryingId.value = null }, 400)
-  }
-}
-
-async function onCancel(id: string) {
-  cancellingId.value = id
-  try {
-    emit('cancel', id)
-  } finally {
-    setTimeout(() => { cancellingId.value = null }, 400)
-  }
-}
-
-async function onDismiss(id: string) {
-  dismissingId.value = id
-  try {
-    emit('dismiss', id)
-  } finally {
-    setTimeout(() => { dismissingId.value = null }, 400)
+    const next = new Set(busy.value)
+    next.delete(id)
+    busy.value = next
   }
 }
 
 async function onClearAll() {
+  if (clearingAll.value) return
   clearingAll.value = true
   try {
-    emit('clear-all')
+    await props.clearAll()
   } finally {
-    setTimeout(() => { clearingAll.value = false }, 600)
+    clearingAll.value = false
   }
 }
 
-async function onRetryAll() {
-  retryingAll.value = true
+function onRetryAll() {
   retryMsg.value = ''
-  try {
-    emit('retry-all')
-  } finally {
-    setTimeout(() => { retryingAll.value = false }, 600)
-  }
+  emit('retry-all')
 }
 
-defineExpose({ showRetryMsg: (msg: string, ok: boolean) => { retryMsg.value = msg; retryOk.value = ok; setTimeout(() => { retryMsg.value = '' }, 4000) } })
+function showRetryMsg(msg: string, ok: boolean) {
+  retryMsg.value = msg
+  retryOk.value = ok
+  // An older message's timer used to clear a newer message early.
+  window.clearTimeout(msgTimer)
+  msgTimer = window.setTimeout(() => { retryMsg.value = '' }, 4000)
+}
+
+/** Driven by App for the confirm-then-retry-all round trip. */
+function setRetryingAll(value: boolean) {
+  retryingAll.value = value
+}
+
+onUnmounted(() => window.clearTimeout(msgTimer))
+
+defineExpose({ showRetryMsg, setRetryingAll })
 </script>
 
 <style scoped>
@@ -461,6 +522,33 @@ defineExpose({ showRetryMsg: (msg: string, ok: boolean) => { retryMsg.value = ms
 .recent-badge.skipped {
   color: var(--text-secondary);
   background: rgba(255, 255, 255, 0.05);
+}
+
+.recent-badge.cancelled {
+  color: var(--accent-amber);
+  background: rgba(255, 170, 40, 0.1);
+}
+
+.recent-dismiss {
+  margin-left: auto;
+  padding: 0 6px;
+  min-width: 0;
+}
+
+.queue-phase.queued {
+  color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.queue-phase.cancelling {
+  color: var(--accent-amber);
+  background: rgba(255, 170, 40, 0.1);
+}
+
+.queue-note {
+  font-size: 11px;
+  color: var(--text-secondary);
+  flex: 1;
 }
 
 .recent-note {

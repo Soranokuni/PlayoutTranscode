@@ -489,6 +489,7 @@ impl JobQueue {
 
     pub fn push(&self, job: JobRecord) {
         self.jobs.write().push(job.clone());
+        self.announce(&job);
         self.enqueue_persist(job);
     }
 
@@ -498,6 +499,7 @@ impl JobQueue {
             f(job);
             let job_clone = job.clone();
             drop(jobs);
+            self.announce(&job_clone);
             self.enqueue_persist(job_clone);
         }
     }
@@ -550,6 +552,7 @@ impl JobQueue {
             f(job);
             let job_clone = job.clone();
             drop(jobs);
+            self.announce(&job_clone);
             self.enqueue_persist(job_clone);
             Ok(())
         } else {
@@ -586,6 +589,7 @@ impl JobQueue {
             }
             let job_clone = job.clone();
             drop(jobs);
+            self.announce(&job_clone);
             self.enqueue_persist(job_clone);
             Ok(())
         } else {
@@ -742,6 +746,35 @@ impl JobQueue {
     /// thread produces one every 250 ms per running encode.
     pub fn has_subscribers(&self) -> bool {
         self.event_tx.receiver_count() > 0
+    }
+
+    /// Tell every subscriber what one job looks like now (UI-01).
+    ///
+    /// Called from each mutation that changes what an operator sees -- push,
+    /// transition, cancel request -- so a client no longer has to wait for its
+    /// 15 s safety-net poll. Before this only the terminal events went out:
+    /// pressing cancel, a job reaching `Cancelled`, a retry going back to
+    /// `Queued` and a fresh ingest appearing were all invisible until the next
+    /// poll or a page refresh. Emitting here, at the one choke point, rather
+    /// than at each call site is what keeps a future transition from being
+    /// silent again.
+    ///
+    /// Additive over the documented `{ id, stage }` payload: `phase`, `state`
+    /// and the full `job` record ride along. The progress path goes through
+    /// `update_local` and is deliberately not announced here; it has its own
+    /// throttled `progress` event.
+    fn announce(&self, job: &JobRecord) {
+        if !self.has_subscribers() {
+            return;
+        }
+        let payload = serde_json::json!({
+            "id": job.id,
+            "stage": job.current_stage,
+            "phase": job.phase,
+            "state": job.state,
+            "job": job,
+        });
+        self.broadcast("job_update", &payload.to_string());
     }
 
     /// Publish one SSE frame.
@@ -1325,4 +1358,22 @@ mod tests {
         assert!(q.dismiss_all(&[state]).is_empty());
         assert_eq!(q.all().len(), 1);
     }
+    /// UI-01. Every transition reaches SSE subscribers with the full record.
+    #[test]
+    fn a_transition_is_announced_with_the_record() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let q = JobQueue::new_in_memory(tx);
+        let job = JobRecord::new("clip.mxf", "ProfileA");
+        let id = job.id.clone();
+        q.push(job);
+        q.transition(&id, JobPhase::Probing, None, |_| {}).unwrap();
+
+        let pushed = rx.try_recv().unwrap();
+        assert_eq!(pushed.event, "job_update");
+        let probing = rx.try_recv().unwrap();
+        let data: serde_json::Value = serde_json::from_str(&probing.data).unwrap();
+        assert_eq!(data["phase"], "probing");
+        assert_eq!(data["job"]["id"], id.as_str());
+    }
+
 }

@@ -139,8 +139,9 @@ Event types actually emitted by the server:
 
 | type | data payload |
 |---|---|
-| `job_update` | `{ "id": string, "stage": string }` — emitted on queue push (`src/processor.rs:117`) |
-| `progress` | `{ "id", "percent": f64, "current_time_ms": i64, "duration_ms": i64, "determinate": bool, "fps": f64, "bitrate": string, "speed": string, "stage": string }` (`src/processor.rs:178-188`) |
+| `job_update` | `{ "id": string, "stage": string, "phase": string, "state": string, "job": JobRecord }` — emitted on every push, transition and cancel request (`JobQueue::announce`, UI-01); `phase`/`state`/`job` are additive |
+| `assets_changed` | `{ "uuid": string \| null }` — emitted after any 2xx asset/folder/recycle-bin mutation (`announce_asset_mutations`, UI-02); `null` = refetch the list |
+| `progress` | `{ "id", "percent": f64, "current_time_ms": i64, "duration_ms": i64, "determinate": bool, "current_frame": i64 (additive), "fps": f64, "bitrate": string, "speed": string, "stage": string }` (`src/processor.rs:178-188`) |
 | `completed` | `{ "id": string, "uuid": string }` (`src/processor.rs:353`) |
 | `failed` | `{ "id": string, "error": string }` (`src/processor.rs:129,143,365`; panic path `src/processor.rs:31-34`) |
 

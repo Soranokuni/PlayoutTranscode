@@ -252,9 +252,13 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/api/events", get(sse_events))
         .route("/api/v2/events", get(sse_events));
 
+    let announce_jobs = jobs.clone();
     let timed = Router::new()
         .nest("/api/v2", api_v2)
         .nest("/api", api)
+        .layer(axum::middleware::from_fn(move |req, next| {
+            announce_asset_mutations(announce_jobs.clone(), req, next)
+        }))
         .layer(tower_http::timeout::TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             REQUEST_TIMEOUT,
@@ -280,6 +284,59 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
             MAX_CONCURRENT_REQUESTS,
         ))
         .with_state(state)
+}
+
+/// Which library change a successful mutating request made, if any.
+///
+/// Returns the asset uuid when the route names exactly one asset, and
+/// `Some(None)` for a change that can touch many (folders, batch, the recycle
+/// bin). `None` for anything that is not a library mutation.
+fn asset_mutation_scope(method: &axum::http::Method, path: &str) -> Option<Option<String>> {
+    use axum::http::Method;
+    if matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS) {
+        return None;
+    }
+    let rest = path
+        .strip_prefix("/api/v2")
+        .or_else(|| path.strip_prefix("/api"))?;
+    let mut parts = rest.trim_start_matches('/').split('/');
+    match parts.next()? {
+        "assets" => match parts.next() {
+            // `/assets/batch` edits many rows at once.
+            Some("batch") | None => Some(None),
+            Some(uuid) if is_canonical_uuid(uuid) => Some(Some(uuid.to_string())),
+            Some(_) => None,
+        },
+        "folders" | "recycle-bin" => Some(None),
+        _ => None,
+    }
+}
+
+/// Tell SSE subscribers that the library changed (UI-02).
+///
+/// Nothing announced a trim, rating, rename, move, trash, restore or purge, so
+/// an edit made from PlayOut -- or from a second tab -- never reached this UI
+/// until a reload; the tab that made the change only saw it because it
+/// re-paged the whole library afterwards. One layer over the API covers every
+/// such route, present and future, and only fires after a 2xx.
+///
+/// Payload: `{ "uuid": string | null }`. A null uuid means "refetch the list".
+async fn announce_asset_mutations(
+    jobs: JobQueue,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let scope = asset_mutation_scope(req.method(), req.uri().path());
+    let response = next.run(req).await;
+    if let Some(uuid) = scope {
+        if response.status().is_success() {
+            jobs.broadcast(
+                "assets_changed",
+                &serde_json::json!({ "uuid": uuid }).to_string(),
+            );
+        }
+    }
+    response
 }
 
 /// `true` when `s` is a canonical, hyphenated UUID.

@@ -1284,10 +1284,9 @@ fn process_file_inner(
             job
         }
     };
-    queue.broadcast(
-        "job_update",
-        &serde_json::json!({"id": job.id, "stage": "Probing", "phase": "probing"}).to_string(),
-    );
+    // No explicit `job_update` here any more: the push or the Probing
+    // transition above has already announced the record (UI-01).
+
 
     let probe_data = match probe::probe_source(tools, input_path) {
         Ok(p) => p,
@@ -1523,6 +1522,7 @@ fn process_file_inner(
                             "current_time_ms": p.current_time_ms,
                             "duration_ms": p.duration_ms,
                             "determinate": determinate,
+                            "current_frame": p.frame,
                             "fps": p.fps,
                             "bitrate": p.bitrate,
                             "speed": p.speed,

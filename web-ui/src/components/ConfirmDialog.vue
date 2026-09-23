@@ -11,12 +11,12 @@
   <Teleport to="body">
     <div v-if="open" class="cd-backdrop" @click.self="$emit('cancel')">
       <div
+        ref="panelRef"
         class="cd-panel"
         role="alertdialog"
         aria-modal="true"
         :aria-labelledby="titleId"
         :aria-describedby="bodyId"
-        @keydown.esc="$emit('cancel')"
       >
         <h2 :id="titleId" class="cd-title">{{ title }}</h2>
         <p :id="bodyId" class="cd-body">{{ body }}</p>
@@ -38,7 +38,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, useId } from 'vue'
+import { ref, watch, nextTick, useId, onUnmounted } from 'vue'
 
 const props = defineProps<{
   open: boolean
@@ -50,7 +50,7 @@ const props = defineProps<{
   busy?: boolean
 }>()
 
-defineEmits<{
+const emit = defineEmits<{
   confirm: []
   cancel: []
 }>()
@@ -58,17 +58,62 @@ defineEmits<{
 const titleId = useId()
 const bodyId = useId()
 const cancelRef = ref<HTMLButtonElement | null>(null)
+const panelRef = ref<HTMLElement | null>(null)
+let opener: HTMLElement | null = null
+
+/**
+ * Esc and Tab are handled at the document, not on the panel: the panel-level
+ * `@keydown.esc` only fired while focus was inside it, so a click on the
+ * backdrop's edge left Esc dead, and Tab walked straight out of the "modal"
+ * into the page behind it.
+ */
+function onKeydown(e: KeyboardEvent) {
+  if (!props.open) return
+  if (e.key === 'Escape') {
+    e.preventDefault()
+    emit('cancel')
+    return
+  }
+  if (e.key !== 'Tab' || !panelRef.value) return
+  const focusable = Array.from(
+    panelRef.value.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+    ),
+  )
+  if (!focusable.length) return
+  const first = focusable[0]!
+  const last = focusable[focusable.length - 1]!
+  const active = document.activeElement
+  if (e.shiftKey && (active === first || !panelRef.value.contains(active))) {
+    e.preventDefault()
+    last.focus()
+  } else if (!e.shiftKey && (active === last || !panelRef.value.contains(active))) {
+    e.preventDefault()
+    first.focus()
+  }
+}
 
 // Focus lands on Cancel, never on the destructive button: a stray Return must
-// not be the thing that stops a bulk ingest.
+// not be the thing that stops a bulk ingest. On close it goes back to the
+// control that opened the dialog.
 watch(
   () => props.open,
   async (open) => {
-    if (!open) return
-    await nextTick()
-    cancelRef.value?.focus()
+    if (open) {
+      opener = document.activeElement as HTMLElement | null
+      document.addEventListener('keydown', onKeydown)
+      await nextTick()
+      cancelRef.value?.focus()
+    } else {
+      document.removeEventListener('keydown', onKeydown)
+      opener?.focus?.()
+      opener = null
+    }
   },
+  { immediate: true },
 )
+
+onUnmounted(() => document.removeEventListener('keydown', onKeydown))
 </script>
 
 <style scoped>

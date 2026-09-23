@@ -186,3 +186,135 @@ fn the_runtime_hash_covers_what_the_loop_captures_and_nothing_else() {
     c.logging.level = "debug".into();
     assert_eq!(runtime_config_hash(&c), baseline, "logging level");
 }
+
+/// Wait for the first event called `name` whose data satisfies `pred`.
+async fn wait_for_event(
+    response: reqwest::Response,
+    name: &str,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> Option<serde_json::Value> {
+    let events = read_events(response, 20, Duration::from_secs(5)).await;
+    events
+        .into_iter()
+        .filter(|(n, _)| n == name)
+        .filter_map(|(_, d)| serde_json::from_str::<serde_json::Value>(&d).ok())
+        .find(|d| pred(d))
+}
+
+/// UI-01. Pressing cancel used to change the job's phase without telling
+/// anyone, so the queue row sat unchanged until the UI's 15 s poll. The
+/// `job_update` must carry the whole record so the client can apply it.
+#[tokio::test]
+async fn a_cancel_request_is_announced_with_the_new_record() {
+    use playout_transcode::jobs::{JobPhase, JobRecord};
+    let s = common::spawn_test_server().await;
+
+    let mut job = JobRecord::new("D:/w/live.mxf", "ProfileA");
+    for p in [JobPhase::Probing, JobPhase::Planned, JobPhase::Encoding] {
+        job.transition_to(p, None).unwrap();
+    }
+    let id = job.id.clone();
+    s.jobs.push(job);
+
+    let r = s.get("/api/events").await;
+    let base = s.base_url.clone();
+    let cancel_id = id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = reqwest::Client::new()
+            .post(format!("{}/api/jobs/{}/cancel", base, cancel_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await;
+    });
+
+    let update = wait_for_event(r, "job_update", |d| d["id"] == id.as_str())
+        .await
+        .expect("cancel must emit a job_update");
+    assert_eq!(update["phase"], "cancel_requested", "{}", update);
+    assert_eq!(update["job"]["id"], id.as_str());
+    assert_eq!(update["job"]["cancel_requested"], true);
+    // The documented v1 fields stay.
+    assert!(update["stage"].is_string());
+}
+
+/// UI-01. A job that is still queued goes straight to `Cancelled`, and that
+/// terminal state is announced too.
+#[tokio::test]
+async fn cancelling_a_queued_job_announces_it_cancelled() {
+    use playout_transcode::jobs::JobRecord;
+    let s = common::spawn_test_server().await;
+
+    let job = JobRecord::new("D:/w/queued.mxf", "ProfileA");
+    let id = job.id.clone();
+    s.jobs.push(job);
+
+    let r = s.get("/api/events").await;
+    let base = s.base_url.clone();
+    let cancel_id = id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = reqwest::Client::new()
+            .post(format!("{}/api/jobs/{}/cancel", base, cancel_id))
+            .json(&serde_json::json!({}))
+            .send()
+            .await;
+    });
+
+    let update = wait_for_event(r, "job_update", |d| d["id"] == id.as_str())
+        .await
+        .expect("cancel must emit a job_update");
+    assert_eq!(update["state"], "Cancelled", "{}", update);
+}
+
+/// UI-02. A library change made over the API -- by PlayOut, or by another
+/// tab -- is announced, so an open UI does not keep showing the old row.
+#[tokio::test]
+async fn an_asset_mutation_is_announced_with_its_uuid() {
+    let s = common::spawn_test_server().await;
+    let uuid = "0b7e3c1a-5d2f-4e8b-9a61-3c4d5e6f7a8b";
+    let file = s.target_dir.join("a.mp4");
+    std::fs::write(&file, b"x").unwrap();
+    common::insert_ready_asset(&s.pool, uuid, 7, &file, "a").await;
+
+    let r = s.get("/api/events").await;
+    let base = s.base_url.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = reqwest::Client::new()
+            .post(format!("{}/api/assets/{}/trash", base, uuid))
+            .header("X-Confirm-Destructive", "yes")
+            .send()
+            .await;
+    });
+
+    let changed = wait_for_event(r, "assets_changed", |_| true)
+        .await
+        .expect("a trash must emit assets_changed");
+    assert_eq!(changed["uuid"], uuid);
+}
+
+/// UI-02. A refused mutation changed nothing, so it must not be announced.
+#[tokio::test]
+async fn a_failed_asset_mutation_is_not_announced() {
+    let s = common::spawn_test_server().await;
+    let missing = "11111111-2222-4333-8444-555555555555";
+
+    let r = s.get("/api/events").await;
+    let base = s.base_url.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let _ = reqwest::Client::new()
+            .post(format!("{}/api/assets/{}/trash", base, missing))
+            .header("X-Confirm-Destructive", "yes")
+            .send()
+            .await;
+    });
+
+    let events = read_events(r, 3, Duration::from_secs(2)).await;
+    assert!(
+        !events.iter().any(|(n, _)| n == "assets_changed"),
+        "a 404 must not be announced: {:?}",
+        events
+    );
+}

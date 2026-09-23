@@ -23,6 +23,8 @@
       </div>
     </div>
 
+    <div v-if="errorMsg" class="db-error" role="alert">{{ errorMsg }}</div>
+
     <!-- 1. CLIPS & SUBCLIPS TAB -->
     <div v-if="activeSubTab === 'assets'" class="db-tab-content">
       <div class="filter-toolbar">
@@ -42,6 +44,7 @@
             v-model="assetSearch"
             type="text"
             class="input search-input"
+            aria-label="Search assets"
             placeholder="Search by name, UUID, folder, path..."
             @input="debouncedFetchAssets"
           />
@@ -172,6 +175,7 @@
             v-model="jobSearch"
             type="text"
             class="input search-input"
+            aria-label="Search jobs"
             placeholder="Search by Job ID, UUID, Path, Error..."
             @input="debouncedFetchJobs"
           />
@@ -390,10 +394,16 @@
 
     <!-- DETAIL INSPECTION MODAL -->
     <div v-if="detailModalOpen" class="modal-overlay" @click.self="closeDetailModal">
-      <div class="modal-card panel">
+      <div
+        class="modal-card panel"
+        role="dialog"
+        aria-modal="true"
+        :aria-labelledby="modalTitleId"
+        @keydown.esc="closeDetailModal"
+      >
         <div class="modal-header">
-          <h3>{{ detailModalTitle }}</h3>
-          <button class="modal-close" @click="closeDetailModal">✕</button>
+          <h3 :id="modalTitleId">{{ detailModalTitle }}</h3>
+          <button ref="modalCloseRef" class="modal-close" aria-label="Close" @click="closeDetailModal">✕</button>
         </div>
 
         <div class="modal-body">
@@ -531,7 +541,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, useId, watch } from 'vue'
 import { apiFetch } from '../api/auth'
 
 interface DbOverview {
@@ -735,20 +745,22 @@ const detailModalTitle = computed(() => {
   return 'Record Inspection'
 })
 
-// Debounce timer
-let searchTimeout: any = null
+// One timer per search box. They shared one, so typing in the jobs search
+// cancelled a pending assets search and vice versa.
+let assetSearchTimeout = 0
+let jobSearchTimeout = 0
 
 function debouncedFetchAssets() {
-  clearTimeout(searchTimeout)
-  searchTimeout = setTimeout(() => {
+  window.clearTimeout(assetSearchTimeout)
+  assetSearchTimeout = window.setTimeout(() => {
     assetOffset.value = 0
     fetchAssets()
   }, 300)
 }
 
 function debouncedFetchJobs() {
-  clearTimeout(searchTimeout)
-  searchTimeout = setTimeout(() => {
+  window.clearTimeout(jobSearchTimeout)
+  jobSearchTimeout = window.setTimeout(() => {
     jobOffset.value = 0
     fetchJobs()
   }, 300)
@@ -814,7 +826,13 @@ async function fetchOverview() {
   }
 }
 
+// Rapid paging or filtering fires overlapping requests; without a sequence
+// number the slowest answer won and the table showed a page nobody asked for.
+let assetsSeq = 0
+let jobsSeq = 0
+
 async function fetchAssets() {
+  const seq = ++assetsSeq
   loadingAssets.value = true
   try {
     const params = new URLSearchParams({
@@ -824,17 +842,19 @@ async function fetchAssets() {
       offset: String(assetOffset.value),
     })
     const res = await apiFetch(`/api/v2/db/assets?${params}`)
-    if (res.ok) {
-      assetsPage.value = await res.json()
-    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const page = await res.json()
+    if (seq === assetsSeq) assetsPage.value = page
   } catch (err) {
     console.error('Failed to fetch DB assets:', err)
+    if (seq === assetsSeq) showError(`Could not load assets: ${err}`)
   } finally {
-    loadingAssets.value = false
+    if (seq === assetsSeq) loadingAssets.value = false
   }
 }
 
 async function fetchJobs() {
+  const seq = ++jobsSeq
   loadingJobs.value = true
   try {
     const params = new URLSearchParams({
@@ -844,13 +864,14 @@ async function fetchJobs() {
       offset: String(jobOffset.value),
     })
     const res = await apiFetch(`/api/v2/db/jobs?${params}`)
-    if (res.ok) {
-      jobsPage.value = await res.json()
-    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const page = await res.json()
+    if (seq === jobsSeq) jobsPage.value = page
   } catch (err) {
     console.error('Failed to fetch DB jobs:', err)
+    if (seq === jobsSeq) showError(`Could not load jobs: ${err}`)
   } finally {
-    loadingJobs.value = false
+    if (seq === jobsSeq) loadingJobs.value = false
   }
 }
 
@@ -881,14 +902,14 @@ async function fetchSchema() {
 
 async function inspectAsset(uuid: string) {
   try {
-    const res = await apiFetch(`/api/v2/db/assets/${uuid}`)
-    if (res.ok) {
-      inspectingAsset.value = await res.json()
-      inspectingJob.value = null
-      detailModalOpen.value = true
-    }
+    const res = await apiFetch(`/api/v2/db/assets/${encodeURIComponent(uuid)}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    inspectingAsset.value = await res.json()
+    inspectingJob.value = null
+    detailModalOpen.value = true
   } catch (err) {
     console.error('Failed to inspect asset:', err)
+    showError(`Could not open the asset: ${err}`)
   }
 }
 
@@ -897,7 +918,7 @@ const regeneratingSidecarUuid = ref<string | null>(null)
 async function regenerateSidecar(uuid: string) {
   regeneratingSidecarUuid.value = uuid
   try {
-    const res = await apiFetch(`/api/v2/assets/${uuid}/regenerate-sidecar`, { method: 'POST' })
+    const res = await apiFetch(`/api/v2/assets/${encodeURIComponent(uuid)}/regenerate-sidecar`, { method: 'POST' })
     if (res.ok) {
       await fetchAssets()
       if (inspectingAsset.value?.summary.uuid === uuid) {
@@ -905,11 +926,11 @@ async function regenerateSidecar(uuid: string) {
       }
     } else {
       const err = await res.json().catch(() => ({}))
-      alert(`Failed to regenerate sidecar: ${err.error || res.statusText}`)
+      showError(`Failed to regenerate sidecar: ${err.error || res.statusText || res.status}`)
     }
   } catch (err) {
     console.error('Failed to regenerate sidecar:', err)
-    alert(`Error regenerating sidecar: ${err}`)
+    showError(`Error regenerating sidecar: ${err}`)
   } finally {
     regeneratingSidecarUuid.value = null
   }
@@ -917,16 +938,43 @@ async function regenerateSidecar(uuid: string) {
 
 async function inspectJob(id: string) {
   try {
-    const res = await apiFetch(`/api/v2/db/jobs/${id}`)
-    if (res.ok) {
-      inspectingJob.value = await res.json()
-      inspectingAsset.value = null
-      detailModalOpen.value = true
-    }
+    const res = await apiFetch(`/api/v2/db/jobs/${encodeURIComponent(id)}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    inspectingJob.value = await res.json()
+    inspectingAsset.value = null
+    detailModalOpen.value = true
   } catch (err) {
     console.error('Failed to inspect job:', err)
+    showError(`Could not open the job: ${err}`)
   }
 }
+
+// Failures used to reach only the console (or a blocking `alert()`), so an
+// empty table could mean "no rows" or "the request failed".
+const errorMsg = ref('')
+let errorTimer = 0
+function showError(msg: string) {
+  errorMsg.value = msg
+  window.clearTimeout(errorTimer)
+  errorTimer = window.setTimeout(() => { errorMsg.value = '' }, 6000)
+}
+
+const modalTitleId = useId()
+const modalCloseRef = ref<HTMLButtonElement | null>(null)
+let modalOpener: HTMLElement | null = null
+
+// Move focus into the modal so Esc and Tab work without a click first, and
+// hand it back to whatever opened it on close.
+watch(detailModalOpen, async (open) => {
+  if (open) {
+    modalOpener = document.activeElement as HTMLElement | null
+    await nextTick()
+    modalCloseRef.value?.focus()
+  } else {
+    modalOpener?.focus?.()
+    modalOpener = null
+  }
+})
 
 function closeDetailModal() {
   detailModalOpen.value = false
@@ -996,6 +1044,12 @@ function jobStateBadgeClass(state: string): string {
 onMounted(() => {
   refreshCurrent()
 })
+
+onUnmounted(() => {
+  window.clearTimeout(assetSearchTimeout)
+  window.clearTimeout(jobSearchTimeout)
+  window.clearTimeout(errorTimer)
+})
 </script>
 
 <style scoped>
@@ -1003,6 +1057,15 @@ onMounted(() => {
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+
+.db-error {
+  font-size: 12px;
+  padding: 8px 12px;
+  color: var(--accent-crimson);
+  background: rgba(229, 57, 53, 0.08);
+  border-left: 2px solid var(--accent-crimson);
+  border-radius: 3px;
 }
 
 .db-header-bar {

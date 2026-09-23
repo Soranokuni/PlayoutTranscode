@@ -7,6 +7,7 @@
           v-for="f in filters"
           :key="f.key"
           :class="['filter-btn', { active: activeFilter === f.key }]"
+          :aria-pressed="activeFilter === f.key"
           @click="activeFilter = f.key"
         >
           {{ f.label }}
@@ -28,7 +29,7 @@
       :body="pending?.body ?? ''"
       :detail="pending?.detail"
       :confirm-label="pending?.label ?? 'Confirm'"
-      :busy="busyUuid !== null"
+      :busy="pending !== null && busy.has(pending.uuid)"
       @cancel="pending = null"
       @confirm="runPending"
     >
@@ -95,19 +96,19 @@
               <button
                 v-if="heldBack(asset)"
                 class="btn btn-mini"
-                :disabled="busyUuid === asset.uuid"
+                :disabled="busy.has(asset.uuid)"
                 title="Examine this media again the next time it is offered, even though it failed before."
                 @click="onTryAgain(asset)"
               >Try again</button>
               <button
                 class="btn btn-mini"
-                :disabled="busyUuid === asset.uuid"
+                :disabled="busy.has(asset.uuid)"
                 title="Move this entry to the recycle bin. The media file is not touched and you can restore it."
                 @click="askTrash(asset)"
               >Remove</button>
               <button
                 class="btn btn-mini btn-delete"
-                :disabled="busyUuid === asset.uuid"
+                :disabled="busy.has(asset.uuid)"
                 title="Delete this entry for good, and optionally its media file."
                 @click="askPurge(asset)"
               >Delete…</button>
@@ -158,7 +159,7 @@ const props = defineProps<{
  * Without it the row an operator just deleted stays on screen until the next
  * poll, which reads as "the button did nothing".
  */
-const emit = defineEmits<{ (e: 'changed'): void }>()
+const emit = defineEmits<{ (e: 'changed', uuid: string): void }>()
 
 const activeFilter = ref('all')
 const search = ref('')
@@ -174,7 +175,10 @@ watch(searchInput, (value) => {
     search.value = value
   }, SEARCH_DEBOUNCE_MS)
 })
-onUnmounted(() => window.clearTimeout(searchTimer))
+onUnmounted(() => {
+  window.clearTimeout(searchTimer)
+  window.clearTimeout(flashTimer)
+})
 
 const PAGE = 100
 const shown = ref(PAGE)
@@ -227,14 +231,25 @@ type PendingAction = {
 
 const pending = ref<PendingAction | null>(null)
 const alsoDeleteFile = ref(false)
-const busyUuid = ref<string | null>(null)
+/** Uuids with a request in flight. A single slot let two rows overwrite each
+ *  other's busy state. */
+const busy = ref(new Set<string>())
+function setBusy(uuid: string, on: boolean) {
+  const next = new Set(busy.value)
+  if (on) next.add(uuid)
+  else next.delete(uuid)
+  busy.value = next
+}
 const actionMsg = ref('')
 const actionOk = ref(false)
 
+let flashTimer = 0
 function flash(msg: string, ok: boolean) {
   actionMsg.value = msg
   actionOk.value = ok
-  setTimeout(() => { actionMsg.value = '' }, 5000)
+  // An older message's timer used to clear a newer message early.
+  window.clearTimeout(flashTimer)
+  flashTimer = window.setTimeout(() => { actionMsg.value = '' }, 5000)
 }
 
 function assetLabel(a: AssetRecord) {
@@ -278,10 +293,11 @@ function askPurge(a: AssetRecord) {
 }
 
 async function onTryAgain(a: AssetRecord) {
-  busyUuid.value = a.uuid
+  if (busy.value.has(a.uuid)) return
+  setBusy(a.uuid, true)
   try {
     const r = await props.clearAssetVerdict(a.uuid)
-    if (r.success) emit('changed')
+    if (r.success) emit('changed', a.uuid)
     flash(
       r.success
         ? `"${assetLabel(a)}" will be examined again next time it is offered.`
@@ -289,22 +305,22 @@ async function onTryAgain(a: AssetRecord) {
       r.success,
     )
   } finally {
-    busyUuid.value = null
+    setBusy(a.uuid, false)
   }
 }
 
 async function runPending() {
   const p = pending.value
-  if (!p) return
-  busyUuid.value = p.uuid
+  if (!p || busy.value.has(p.uuid)) return
+  setBusy(p.uuid, true)
   try {
     if (p.kind === 'trash') {
       const r = await props.trashAsset(p.uuid)
-      if (r.success) emit('changed')
+      if (r.success) emit('changed', p.uuid)
       flash(r.success ? 'Moved to the recycle bin.' : r.error || 'Could not remove', r.success)
     } else {
       const r = await props.purgeAsset(p.uuid, alsoDeleteFile.value)
-      if (r.success) emit('changed')
+      if (r.success) emit('changed', p.uuid)
       if (!r.success) {
         flash(r.error || 'Could not delete', false)
       } else if (alsoDeleteFile.value && !r.mediaRemoved) {
@@ -319,7 +335,7 @@ async function runPending() {
       }
     }
   } finally {
-    busyUuid.value = null
+    setBusy(p.uuid, false)
     pending.value = null
   }
 }
@@ -337,10 +353,12 @@ function formatDuration(ms: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`
 }
 
-/** All four chip counts in one pass, instead of one `filter` per chip on
+/** All the chip counts in one pass, instead of one `filter` per chip on
  *  every render. */
 const counts = computed<Record<string, number>>(() => {
-  const out: Record<string, number> = { all: 0, ready: 0, error: 0, processing: 0 }
+  // `missing` was absent here, so `asset.status in out` never matched and the
+  // Missing chip always read 0.
+  const out: Record<string, number> = { all: 0, ready: 0, error: 0, missing: 0, processing: 0 }
   for (const asset of props.assets) {
     out.all!++
     if (asset.status in out) out[asset.status]!++

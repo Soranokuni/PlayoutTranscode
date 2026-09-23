@@ -1,4 +1,4 @@
-import { ref, shallowRef, computed, triggerRef, onMounted, onUnmounted } from 'vue'
+import { ref, shallowRef, computed, onMounted, onUnmounted } from 'vue'
 import {
   apiFetch,
   apiFetchDestructive,
@@ -45,6 +45,8 @@ export interface ProgressPayload {
   current_time_ms: number
   duration_ms: number
   determinate: boolean
+  /** Absent on servers that predate UI-01. */
+  current_frame?: number
   fps: number
   bitrate: string
   speed: string
@@ -177,9 +179,13 @@ function shortFileName(path: string) {
 }
 
 export function useEventStream() {
-  // `shallowRef` + explicit `triggerRef`: a progress event mutates the record
-  // in place instead of rebuilding the whole Map, so a tick no longer
-  // invalidates every computed that reads `jobs` and re-renders every row.
+  // Every change assigns a *new* Map (UI-01). This used to mutate the Map in
+  // place and call `triggerRef`, which re-rendered App -- but App hands
+  // `jobs.value` to IngestQueuePanel as a prop, the prop was the same Map
+  // reference, and Vue skipped the child. So a cancel, a dismiss, a new job and
+  // every progress tick stayed invisible until the 15 s poll swapped the Map:
+  // the "press ✕ and nothing happens until I refresh" bug. Copying a few
+  // hundred entries per 250 ms tick is cheap, and it is reactive end to end.
   const jobs = shallowRef<Map<string, JobRecord>>(new Map())
   const assets = ref<AssetRecord[]>([])
   const health = ref<HealthPayload | null>(null)
@@ -261,7 +267,80 @@ export function useEventStream() {
     return { ok: true }
   }
 
+  /** Replace (or add) one job record. */
+  function putJob(job: JobRecord) {
+    const next = new Map(jobs.value)
+    next.set(job.id, job)
+    jobs.value = next
+    jobsEpoch++
+  }
+
+  /** Merge fields into one known job. Returns false if the id is unknown. */
+  function patchJob(id: string, patch: Partial<JobRecord>): boolean {
+    const existing = jobs.value.get(id)
+    if (!existing) return false
+    const next = new Map(jobs.value)
+    next.set(id, { ...existing, ...patch })
+    jobs.value = next
+    return true
+  }
+
+  function dropJobs(ids: Iterable<string>) {
+    let next: Map<string, JobRecord> | null = null
+    for (const id of ids) {
+      if (!(next ?? jobs.value).has(id)) continue
+      next ??= new Map(jobs.value)
+      next.delete(id)
+    }
+    if (next) {
+      jobs.value = next
+      jobsEpoch++
+    }
+  }
+
+  // A `GET /jobs` sent before a structural change (a dismiss, a cancel, a
+  // `job_update`) and answered after it describes the past; applying it
+  // brought a dismissed row back for up to 15 s. `jobsEpoch` counts structural
+  // changes -- not progress ticks, which would starve the poll -- and `liveSeq`
+  // drops answers overtaken by a newer request.
+  let jobsEpoch = 0
+  let liveSeq = 0
+  let staleJobsRetries = 0
+  let liveRefreshTimer = 0
+
+  /** Coalesce "something changed that I can't apply directly" into one poll. */
+  function scheduleLiveRefresh(delayMs = 300) {
+    if (liveRefreshTimer) return
+    liveRefreshTimer = window.setTimeout(() => {
+      liveRefreshTimer = 0
+      void fetchLive()
+    }, delayMs)
+  }
+
+  /**
+   * Read a JSON body without trusting it to be JSON. A proxy error page or an
+   * axum rejection is plain text, and `JSON.parse` on it used to reach the
+   * operator as "SyntaxError: Unexpected token <".
+   */
+  async function readJson<T extends object>(r: Response): Promise<Partial<T> & { error?: string }> {
+    const text = await r.text().catch(() => '')
+    if (text.trim()) {
+      try {
+        const parsed = JSON.parse(text) as Partial<T> & { error?: string; detail?: string }
+        if (!r.ok && !parsed.error) parsed.error = parsed.detail || `HTTP ${r.status}`
+        return parsed
+      } catch {
+        /* not JSON: fall through */
+      }
+    }
+    return (r.ok ? {} : { error: text.trim().slice(0, 200) || `HTTP ${r.status}` }) as Partial<T> & {
+      error?: string
+    }
+  }
+
   let sseConnection: EventSource | null = null
+  let connectedOnce = false
+  let reconnectTimer = 0
   let liveTimer = 0
   let staticTimer = 0
   let downloadTimer = 0
@@ -316,20 +395,37 @@ export function useEventStream() {
 
   /** Everything that changes while work is running. */
   async function fetchLive() {
+    const seq = ++liveSeq
+    const epoch = jobsEpoch
     const [h, j, st] = await Promise.all([
       apiGet<HealthPayload>('/health'),
       apiGet<JobRecord[]>('/jobs'),
       apiGet<ServiceStatusPayload>('/service/status'),
     ])
+    // A newer request is in flight; its answer is the one worth keeping.
+    if (seq !== liveSeq) return
     if (h) {
       serviceRunning.value = h.service_running
       uptimeMs.value = h.uptime_ms
       health.value = h
+      if (linkState.value === 'offline') linkState.value = 'reconnecting'
+    } else if (linkState.value !== 'live') {
+      // Stream down *and* the poll cannot reach the service. Say so, rather
+      // than "Reconnecting" forever over data that has stopped updating.
+      linkState.value = 'offline'
     }
     if (j) {
-      const map = new Map<string, JobRecord>()
-      for (const job of j) map.set(job.id, job)
-      jobs.value = map
+      if (epoch !== jobsEpoch && staleJobsRetries < 3) {
+        // Overtaken by a live change while in flight. Ask again rather than
+        // roll the list back; bounded so a busy queue cannot starve the poll.
+        staleJobsRetries++
+        scheduleLiveRefresh(500)
+      } else {
+        staleJobsRetries = 0
+        const map = new Map<string, JobRecord>()
+        for (const job of j) map.set(job.id, job)
+        jobs.value = map
+      }
     }
     if (st) {
       serviceStatus.value = st
@@ -422,6 +518,9 @@ export function useEventStream() {
     // PUT /config requires X-Confirm-Destructive (T1-5).
     await apiPut('/config', body, true)
     await fetchConfig()
+    // The top bar reads folders and concurrency from `/watchfolder`, which
+    // otherwise only refreshed on the 60 s static poll.
+    void fetchStatic()
     // The running loop kept its old clone of the config (F-23), so the save
     // may have left the service running on stale values. UX-01 turns this into
     // a visible banner instead of nothing happening.
@@ -441,10 +540,11 @@ export function useEventStream() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       })
-      const text = await r.text()
-      if (!text) return { success: r.ok }
-      const parsed = JSON.parse(text) as { success?: boolean; error?: string }
-      return { success: !!parsed.success, error: parsed.error }
+      const parsed = await readJson<{ success: boolean }>(r)
+      const success = r.ok && parsed.success !== false
+      // `job_update` normally lands first; this covers a stream that is down.
+      if (success) scheduleLiveRefresh()
+      return { success, error: parsed.error }
     } catch (e) {
       console.error('[useEventStream] retryJob failed:', e)
       return { success: false, error: String(e) }
@@ -464,12 +564,11 @@ export function useEventStream() {
       if (r.ok) {
         // Drop it locally rather than waiting for the round trip: the × should
         // feel instant, and the `job_removed` event reconciles every other tab.
-        if (jobs.value.delete(id)) triggerRef(jobs)
+        dropJobs([id])
         return { success: true }
       }
-      const text = await r.text()
-      const parsed = text ? (JSON.parse(text) as { error?: string; detail?: string }) : {}
-      return { success: false, error: parsed.detail || parsed.error || `HTTP ${r.status}` }
+      const parsed = await readJson(r)
+      return { success: false, error: parsed.error }
     } catch (e) {
       console.error('[useEventStream] dismissJob failed:', e)
       return { success: false, error: String(e) }
@@ -484,11 +583,9 @@ export function useEventStream() {
       const r = await apiFetch('/api/jobs/finished?state=' + encodeURIComponent(state), {
         method: 'DELETE',
       })
-      const text = await r.text()
-      const parsed = text ? (JSON.parse(text) as { dismissed?: number; ids?: string[]; error?: string }) : {}
-      if (!r.ok) return { dismissed: 0, error: parsed.error || `HTTP ${r.status}` }
-      for (const id of parsed.ids ?? []) jobs.value.delete(id)
-      triggerRef(jobs)
+      const parsed = await readJson<{ dismissed: number; ids: string[] }>(r)
+      if (!r.ok) return { dismissed: 0, error: parsed.error }
+      dropJobs(parsed.ids ?? [])
       return { dismissed: parsed.dismissed ?? 0 }
     } catch (e) {
       console.error('[useEventStream] dismissFinishedJobs failed:', e)
@@ -508,9 +605,8 @@ export function useEventStream() {
         method: 'POST',
       })
       if (r.ok) return { success: true }
-      const text = await r.text()
-      const parsed = text ? (JSON.parse(text) as { error?: string }) : {}
-      return { success: false, error: parsed.error || `HTTP ${r.status}` }
+      const parsed = await readJson(r)
+      return { success: false, error: parsed.error }
     } catch (e) {
       console.error('[useEventStream] trashAsset failed:', e)
       return { success: false, error: String(e) }
@@ -533,16 +629,13 @@ export function useEventStream() {
         '/api/assets/' + encodeURIComponent(uuid) + '/purge?delete_file=' + (deleteFile ? 'true' : 'false'),
         { method: 'DELETE' },
       )
-      const text = await r.text()
-      const parsed = text
-        ? (JSON.parse(text) as { media_removed?: boolean; warnings?: string[]; error?: string })
-        : {}
+      const parsed = await readJson<{ media_removed: boolean; warnings: string[] }>(r)
       if (!r.ok) {
         return {
           success: false,
           mediaRemoved: false,
           warnings: parsed.warnings ?? [],
-          error: parsed.error || `HTTP ${r.status}`,
+          error: parsed.error,
         }
       }
       return {
@@ -571,9 +664,8 @@ export function useEventStream() {
         { method: 'POST' },
       )
       if (r.ok) return { success: true }
-      const text = await r.text()
-      const parsed = text ? (JSON.parse(text) as { error?: string }) : {}
-      return { success: false, error: parsed.error || `HTTP ${r.status}` }
+      const parsed = await readJson(r)
+      return { success: false, error: parsed.error }
     } catch (e) {
       console.error('[useEventStream] clearAssetVerdict failed:', e)
       return { success: false, error: String(e) }
@@ -584,9 +676,9 @@ export function useEventStream() {
   async function retryAllFailed(): Promise<{ submitted: number; source_missing: number; errors: number }> {
     try {
       const r = await apiFetchDestructive('/api/jobs/retry-failed', { method: 'POST' })
-      const text = await r.text()
-      if (!text) return { submitted: 0, source_missing: 0, errors: 0 }
-      const parsed = JSON.parse(text) as { submitted?: number; source_missing?: number; errors?: number }
+      const parsed = await readJson<{ submitted: number; source_missing: number; errors: number }>(r)
+      if (!r.ok) return { submitted: 0, source_missing: 0, errors: 1 }
+      if ((parsed.submitted ?? 0) > 0) scheduleLiveRefresh()
       return {
         submitted: parsed.submitted ?? 0,
         source_missing: parsed.source_missing ?? 0,
@@ -606,7 +698,11 @@ export function useEventStream() {
    * came back would silently truncate the library at 1000 assets, which looks
    * exactly like assets having gone missing.
    */
+  let assetsSeq = 0
+  let assetsEpoch = 0
   async function fetchAssets(statusFilter?: string) {
+    const seq = ++assetsSeq
+    const epoch = assetsEpoch
     const PAGE = 1000
     const base = statusFilter ? `/assets?status=${encodeURIComponent(statusFilter)}&` : '/assets?'
     const collected: AssetRecord[] = []
@@ -646,6 +742,16 @@ export function useEventStream() {
       offset += batch.length
     }
 
+    // Superseded by a newer full fetch: drop this one.
+    if (seq !== assetsSeq) return
+    if (epoch !== assetsEpoch) {
+      // A single-asset refresh landed while this was paging; keep its copy.
+      const fresh = new Map(assets.value.map((a) => [a.uuid, a]))
+      collected.forEach((a, i) => {
+        const f = fresh.get(a.uuid)
+        if (f) collected[i] = f
+      })
+    }
     assets.value = collected
   }
 
@@ -656,8 +762,28 @@ export function useEventStream() {
    * of 30 files no longer reloads a 5 000-asset library 30 times (SF-02).
    */
   async function refreshAsset(uuid: string) {
-    const a = await apiGet<AssetRecord>(`/assets/${encodeURIComponent(uuid)}`)
-    if (!a) return
+    let r: Response
+    try {
+      r = await apiFetch(`/api/assets/${encodeURIComponent(uuid)}`)
+    } catch {
+      return
+    }
+    if (r.status === 404) {
+      // Trashed or purged: the single-asset route no longer serves it.
+      assetsEpoch++
+      assets.value = assets.value.filter((x) => x.uuid !== uuid)
+      return
+    }
+    if (!r.ok) return
+    let a: AssetRecord
+    try {
+      a = (await r.json()) as AssetRecord
+    } catch {
+      return
+    }
+    // A full re-page that started before this and lands after it would
+    // otherwise overwrite the fresher record with its older copy.
+    assetsEpoch++
     const index = assets.value.findIndex((x) => x.uuid === a.uuid)
     if (index >= 0) {
       assets.value.splice(index, 1, a)
@@ -690,26 +816,68 @@ export function useEventStream() {
     }, TERMINAL_DEBOUNCE_MS)
   }
 
+  const assetUuidsToRefresh = new Set<string>()
+  let assetUuidTimer = 0
+  /** Refresh named assets once each, however many job updates named them. */
+  function scheduleAssetRefreshFor(uuid: string) {
+    assetUuidsToRefresh.add(uuid)
+    if (assetUuidTimer) return
+    assetUuidTimer = window.setTimeout(() => {
+      assetUuidTimer = 0
+      const uuids = Array.from(assetUuidsToRefresh)
+      assetUuidsToRefresh.clear()
+      for (const u of uuids) void refreshAsset(u)
+    }, 300)
+  }
+
+  let assetsRefreshTimer = 0
+  /** A folder operation can emit a burst; page the library once for all of it. */
+  function scheduleAssetsRefresh() {
+    if (assetsRefreshTimer) return
+    assetsRefreshTimer = window.setTimeout(() => {
+      assetsRefreshTimer = 0
+      void fetchAssets()
+    }, TERMINAL_DEBOUNCE_MS)
+  }
+
   function handleSSEEvent(eventType: string, data: unknown) {
     switch (eventType) {
       case 'progress': {
         const p = data as ProgressPayload
-        const existing = jobs.value.get(p.id)
-        if (existing) {
-          // In place: rebuilding the Map on every tick invalidated every
-          // computed reading `jobs` and re-rendered every row, including the
-          // failed list with its <pre> stderr blocks (SF-03).
-          Object.assign(existing, {
-            progress: p.percent,
-            current_stage: p.stage,
-            current_frame: 0,
-            encode_fps: p.fps,
-            encode_bitrate: p.bitrate,
-            encode_speed: p.speed,
-            current_time_ms: p.current_time_ms,
-            duration_ms: p.duration_ms,
-          })
-          triggerRef(jobs)
+        const patch: Partial<JobRecord> = {
+          progress: p.percent,
+          current_stage: p.stage,
+          encode_fps: p.fps,
+          encode_bitrate: p.bitrate,
+          encode_speed: p.speed,
+          current_time_ms: p.current_time_ms,
+          duration_ms: p.duration_ms,
+        }
+        if (typeof p.current_frame === 'number') patch.current_frame = p.current_frame
+        // A retry-progress frame carries only `{ id, stage }`; don't blank
+        // the numbers it does not mention.
+        for (const k of Object.keys(patch) as (keyof JobRecord)[]) {
+          if (patch[k] === undefined) delete patch[k]
+        }
+        // Progress for a job this tab has never seen: it started between
+        // polls. Fetch it instead of dropping every tick until the next poll.
+        if (!patchJob(p.id, patch)) scheduleLiveRefresh()
+        break
+      }
+      // Sent on every push, transition and cancel request (UI-01), with the
+      // whole record, so it can be applied directly.
+      case 'job_update': {
+        const payload = data as { id?: string; job?: JobRecord }
+        if (payload?.job?.id) {
+          putJob(payload.job)
+          // The registry row a job works on appears at Probing and goes
+          // away on a cancel; neither reached the library until a reload.
+          const u = payload.job.uuid
+          const terminal = ['Completed', 'Failed', 'Cancelled'].includes(payload.job.state)
+          if (u && (terminal || !assets.value.some((a) => a.uuid === u))) scheduleAssetRefreshFor(u)
+        } else if (payload?.id) {
+          // A server that predates UI-01 sends only `{ id, stage }`.
+          scheduleLiveRefresh()
         }
         break
       }
@@ -725,21 +893,33 @@ export function useEventStream() {
         scheduleTerminalRefresh(payload?.uuid)
         break
       }
+      // A library mutation succeeded somewhere -- this tab, another tab, or
+      // PlayOut editing trim/rating/name (UI-02). One uuid is refreshed on its
+      // own; a folder, batch or recycle-bin change re-pages the library once.
+      case 'assets_changed': {
+        const payload = data as { uuid?: string | null }
+        if (payload?.uuid) {
+          void refreshAsset(payload.uuid)
+        } else {
+          scheduleAssetsRefresh()
+        }
+        break
+      }
       // Another tab (or this one) dismissed job records. Drop them rather than
       // refetching the whole list for a removal we can apply directly.
       case 'job_removed': {
         const payload = data as { ids?: string[] }
-        let changed = false
-        for (const id of payload?.ids ?? []) {
-          if (jobs.value.delete(id)) changed = true
-        }
-        if (changed) triggerRef(jobs)
+        dropJobs(payload?.ids ?? [])
         break
       }
       case 'connected': {
         linkState.value = 'live'
         fetchAll()
-        fetchAssets()
+        // `onMounted` already paged the library for the first connection;
+        // doing it again here fetched up to 5 000 assets twice on every load.
+        // A *re*connect may have missed changes, so that one still re-pages.
+        if (connectedOnce) fetchAssets()
+        connectedOnce = true
         break
       }
       // The server dropped events for this subscriber -- a throttled background
@@ -758,6 +938,8 @@ export function useEventStream() {
 
   function connectSSE() {
     if (sseConnection) sseConnection.close()
+    window.clearTimeout(reconnectTimer)
+    reconnectTimer = 0
     sseConnection = new EventSource(eventSourceUrl('/api/events'))
 
     sseConnection.addEventListener('progress', (e) => {
@@ -769,6 +951,12 @@ export function useEventStream() {
     sseConnection.addEventListener('failed', (e) => {
       try { handleSSEEvent('failed', JSON.parse(e.data)) } catch { /* ignore */ }
     })
+    sseConnection.addEventListener('job_update', (e) => {
+      try { handleSSEEvent('job_update', JSON.parse(e.data)) } catch { /* ignore */ }
+    })
+    sseConnection.addEventListener('assets_changed', (e) => {
+      try { handleSSEEvent('assets_changed', JSON.parse(e.data)) } catch { handleSSEEvent('assets_changed', {}) }
+    })
     sseConnection.addEventListener('connected', () => {
       handleSSEEvent('connected', {})
     })
@@ -777,11 +965,12 @@ export function useEventStream() {
     sseConnection.addEventListener('resync', (e) => {
       try { handleSSEEvent('resync', JSON.parse(e.data)) } catch { handleSSEEvent('resync', {}) }
     })
-    // Emitted when an ingest was skipped as a confirmed duplicate (T2-6). It is
-    // a terminal outcome, so the queue and the library both need refreshing.
+    // Another tab (or this one) dismissed job records.
     sseConnection.addEventListener('job_removed', (e) => {
       try { handleSSEEvent('job_removed', JSON.parse(e.data)) } catch { /* nothing to remove */ }
     })
+    // Emitted when an ingest was skipped as a confirmed duplicate (T2-6). It is
+    // a terminal outcome, so the queue and the library both need refreshing.
     sseConnection.addEventListener('skipped', (e) => {
       try { handleSSEEvent('skipped', JSON.parse(e.data)) } catch { handleSSEEvent('skipped', {}) }
     })
@@ -800,7 +989,8 @@ export function useEventStream() {
       linkState.value = 'reconnecting'
       schedulePolling()
       reconnectDelay = Math.min(reconnectDelay * 2, 5000)
-      setTimeout(connectSSE, reconnectDelay)
+      window.clearTimeout(reconnectTimer)
+      reconnectTimer = window.setTimeout(connectSSE, reconnectDelay)
     }
   }
 
@@ -874,6 +1064,24 @@ export function useEventStream() {
     return r
   }
 
+  /**
+   * Wait for the ingest loop to actually reach `stopped`.
+   *
+   * `POST /service/stop` answers while the state is still `stopping` -- the
+   * worker has to unwind its encodes first -- and a start in that window is
+   * refused with 409 "Service is stopping". Restart fired the start straight
+   * after the stop, so it failed every time a job was running.
+   */
+  async function waitForStopped(timeoutMs = 120_000): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      const st = await fetchServiceStatus()
+      if (st?.state === 'stopped') return true
+      await new Promise((resolve) => window.setTimeout(resolve, 500))
+    }
+    return false
+  }
+
   async function downloadFFmpeg() {
     const r = await apiPost<{ success: boolean }>('/download/start')
     if (r?.success) {
@@ -890,13 +1098,11 @@ export function useEventStream() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
       })
-      const text = await r.text()
-      if (!text) return { success: r.ok }
-      const parsed = JSON.parse(text) as { success?: boolean; error?: string }
-      if (parsed.success) {
-        await fetchAll()
-      }
-      return { success: !!parsed.success, error: parsed.error }
+      const parsed = await readJson<{ success: boolean }>(r)
+      const success = r.ok && parsed.success !== false
+      // `job_update` carries the new phase; this covers a stream that is down.
+      if (success) scheduleLiveRefresh()
+      return { success, error: parsed.error }
     } catch (e) {
       console.error('[useEventStream] cancelJob failed:', e)
       return { success: false, error: String(e) }
@@ -929,6 +1135,10 @@ export function useEventStream() {
     stopPolling()
     window.clearInterval(downloadTimer)
     window.clearTimeout(terminalTimer)
+    window.clearTimeout(liveRefreshTimer)
+    window.clearTimeout(assetsRefreshTimer)
+    window.clearTimeout(assetUuidTimer)
+    window.clearTimeout(reconnectTimer)
     document.removeEventListener('visibilitychange', onVisibilityChange)
     sseConnection?.close()
   })
@@ -956,8 +1166,10 @@ export function useEventStream() {
     fetchConfig,
     putConfig,
     fetchAssets,
+    refreshAsset,
     startService,
     stopService,
+    waitForStopped,
     downloadFFmpeg,
     clearLogs,
     retryJob,

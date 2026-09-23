@@ -11,7 +11,7 @@
       :busy="serviceBusy"
       @start="onStart"
       @stop="askStop"
-      @download="downloadFFmpeg"
+      @download="onDownload"
     />
 
     <!-- F-23 was fixed server-side: after a save the running loop keeps its old
@@ -136,18 +136,18 @@
           <IngestQueuePanel
             ref="ingestPanelRef"
             :jobs="jobs"
-            @retry="onRetryJob"
-            @cancel="onCancelJob"
+            :retry="onRetryJob"
+            :cancel="onCancelJob"
+            :dismiss="onDismissJob"
+            :clear-all="onClearAllFailed"
             @retry-all="askRetryAll"
-            @dismiss="onDismissJob"
-            @clear-all="onClearAllFailed"
           />
           <AssetRegistryGrid
             :assets="assets"
             :trash-asset="trashAsset"
             :purge-asset="purgeAsset"
             :clear-asset-verdict="clearAssetVerdict"
-            @changed="fetchAssets"
+            @changed="refreshAsset"
           />
 
           <div v-if="!serviceRunning && !stats.total" class="empty-state">
@@ -402,10 +402,10 @@ const activeTab = ref('dashboard')
 const {
   jobs, assets, watchfolder, stats, config, toolchain,
   serviceRunning, serviceStatus, downloading, logs, logLines, linkState, uptimeMs,
-  fetchConfig, putConfig, startService, stopService, downloadFFmpeg,
+  fetchConfig, putConfig, startService, stopService, waitForStopped, downloadFFmpeg,
   setLogPolling, clearLogs, retryJob, cancelJob, retryAllFailed, dismissJob, dismissFinishedJobs,
   trashAsset, purgeAsset, clearAssetVerdict,
-  fetchServiceStatus, fetchAssets,
+  fetchServiceStatus, refreshAsset,
   authRequired, applyApiToken,
 } = useEventStream()
 
@@ -498,7 +498,6 @@ async function onRetryJob(id: string) {
   const ok = !!r?.success
   const msg = ok ? 'Retrying job…' : (r?.error || 'Retry failed')
   ingestPanelRef.value?.showRetryMsg(msg, ok)
-  if (ok) { /* SSE will refresh state via fetchAll */ }
 }
 
 async function onCancelJob(id: string) {
@@ -601,6 +600,8 @@ async function runConfirmed() {
       const stopErr = (stopped as { error?: string } | null)?.error
       if (stopErr) {
         ingestPanelRef.value?.showRetryMsg(stopErr, false)
+      } else if (!(await waitForStopped())) {
+        ingestPanelRef.value?.showRetryMsg('The service is still stopping; start it again once it has stopped', false)
       } else {
         const started = await startService()
         if (started && !started.success) {
@@ -618,7 +619,8 @@ async function runConfirmed() {
 }
 
 async function onRetryAll() {
-  const r = await retryAllFailed()
+  ingestPanelRef.value?.setRetryingAll(true)
+  const r = await retryAllFailed().finally(() => ingestPanelRef.value?.setRetryingAll(false))
   const submitted = r?.submitted ?? 0
   const missing = r?.source_missing ?? 0
   const errors = r?.errors ?? 0
@@ -776,6 +778,20 @@ async function saveConfig() {
   saving.value = true
   saveMsg.value = ''
   saveOk.value = false
+  // The form edits a subset of the config. Everything it does not show has to
+  // go back exactly as loaded: `enabled: true` was hard-coded for all three
+  // profiles, so saving from the UI silently re-enabled a disabled profile,
+  // and the audio policy's sample rate, channels, layout and preserve flag
+  // were overwritten with constants. `audio_policy` is replaced as a whole on
+  // the server, so it is sent as the loaded policy with the edited fields on
+  // top.
+  const loaded = config.value
+  const loadedAudio = loaded?.audio_policy
+  // One "HD" rate field drives A and B. Leave B alone unless it was edited, so
+  // a B that was tuned separately in config.toml keeps its own values.
+  const hdRateEdited = !loaded
+    || editMaxrateAB.value !== loaded.profiles.a.maxrate
+    || editBufsizeAB.value !== loaded.profiles.a.bufsize
   try {
     await putConfig({
       paths: { watch_folder: editWatchFolder.value, target_folder: editTargetFolder.value },
@@ -788,20 +804,23 @@ async function saveConfig() {
         tune: editTune.value,
       },
       audio_policy: {
+        sample_rate_hz: 48000,
+        channels: 2,
+        preserve_original: false,
+        ...loadedAudio,
         mode: editAudioMode.value,
         codec: editAudioCodec.value,
         bitrate: editAudioBitrate.value,
-        sample_rate_hz: 48000,
-        channels: 2,
         target_lufs: editAudioTargetLufs.value,
         true_peak_dbtp: editAudioTruePeak.value,
         lra_target: editAudioLra.value,
         dual_mono: editAudioDualMono.value,
-        preserve_original: false,
       },
-      profile_a: { enabled: true, crf: editCrfA.value, maxrate: editMaxrateAB.value, bufsize: editBufsizeAB.value },
-      profile_b: { enabled: true, crf: editCrfB.value, maxrate: editMaxrateAB.value, bufsize: editBufsizeAB.value },
-      profile_c: { enabled: true, crf: editCrfC.value, maxrate: editMaxrateC.value, bufsize: editBufsizeC.value },
+      profile_a: { crf: editCrfA.value, maxrate: editMaxrateAB.value, bufsize: editBufsizeAB.value },
+      profile_b: hdRateEdited
+        ? { crf: editCrfB.value, maxrate: editMaxrateAB.value, bufsize: editBufsizeAB.value }
+        : { crf: editCrfB.value },
+      profile_c: { crf: editCrfC.value, maxrate: editMaxrateC.value, bufsize: editBufsizeC.value },
       ingestion: {
         settle_secs: Number(editSettleSecs.value) || 5,
         poll_secs: Number(editPollSecs.value) || 10,
@@ -876,6 +895,14 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
+/** A refused download used to be ignored: the button did nothing, silently. */
+async function onDownload() {
+  const r = await downloadFFmpeg()
+  if (!r?.success) {
+    ingestPanelRef.value?.showRetryMsg('Could not start the FFmpeg download (one may already be running)', false)
+  }
+}
+
 function onBeforeUnload(e: BeforeUnloadEvent) {
   if (!configDirty.value) return
   e.preventDefault()
@@ -915,7 +942,13 @@ onUnmounted(() => {
 // scrollTop = scrollHeight on every update yanked anyone reading an error back
 // to the bottom every 2 s (UX-05).
 watch(logLines, async (lines, previous) => {
-  const added = Math.max(0, lines.length - (previous?.length ?? 0))
+  // Counted by sequence number, not length: once the ring is full at 500 lines
+  // every poll trims as many as it adds, so the length difference was always 0.
+  const lastSeq = lines[lines.length - 1]?.seq ?? 0
+  const prevSeq = previous?.[previous.length - 1]?.seq ?? 0
+  const added = prevSeq && lastSeq > prevSeq
+    ? lines.filter((l) => l.seq > prevSeq).length
+    : Math.max(0, lines.length - (previous?.length ?? 0))
   if (logPaused.value || !stickToBottom.value) {
     newLineCount.value += added
     return
