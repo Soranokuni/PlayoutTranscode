@@ -836,7 +836,7 @@ pub fn trigger_download(handle: &ServiceHandle) -> bool {
     }
     *status = Some("downloading".to_string());
     drop(status);
-    handle.add_log("info", "Starting FFmpeg download (full build)...");
+    handle.add_log("info", "Starting FFmpeg download (pinned 9.0.2 essentials build)");
 
     let h = handle.clone();
     std::thread::spawn(move || {

@@ -129,7 +129,7 @@ The CasparCG channel is 1080i50, so the profile is chosen by how much motion the
 All three report **`fps_num/fps_den = 25/1`** (B: 25 interlaced frames = 50 fields). No source rate is preserved; that is deliberate, since everything plays on one 1080i50 channel.
 
 ### Common Stream Properties (All Profiles)
-- **Video Codec**: `libx264` High@4.2 4:2:0 8-bit, CRF + VBV cap, closed GOP of 50 frames (2 s), no scene-cut keyframes. Defaults: `preset = "slow"`, CRF 22 / 21 / 18, caps 20M/30M, 20M/30M, 5M/6M (about 1.27x the size of the V1 defaults for +0.8 dB SSIM).
+- **Video Codec**: `libx264` High@4.2 4:2:0 8-bit, CRF + VBV cap, closed GOP of 50 frames (2 s), no scene-cut keyframes. Defaults: `preset = "medium"`, CRF 22 / 21 / 18, caps 20M/30M, 20M/30M, 5M/6M (about 1.3x the size of the V1 defaults for +0.76 dB SSIM, 1.17x the encode time).
 - **Geometry**: display aspect from SAR/DAR, fitted into 1920x1080 with lanczos: 4:3 SD -> 1440x1080 pillarbox, anamorphic 16:9 SD and HDV -> full 1920x1080. 608-line IMX and 1088-line sources are cropped to their active picture first.
 - **Colour**: converted to BT.709 limited range from the source matrix (untagged SD is taken as BT.601, untagged HD as BT.709) and tagged bt709 on every profile. HDR (PQ / HLG) is tone-mapped with `zscale` + `tonemap=hable` when the ffmpeg build has libzimg; otherwise it is encoded untone-mapped and QC warns `hdr_not_tonemapped`.
 - **Audio Codec**: AAC / PCM stereo at **48,000 Hz** (EBU R128 by default)
@@ -247,8 +247,8 @@ allowed_origins = []
 api_token = ""
 
 [encoding]
-# x264 preset. "slow" is the measured default (see Broadcast Encoding Profiles).
-preset = "slow"
+# x264 preset. "medium" is the measured default (see Broadcast Encoding Profiles).
+preset = "medium"
 # 0 = derive from cpu_cores and ingestion.max_concurrency.
 ffmpeg_threads = 0
 # 0 = all logical cores.
@@ -322,12 +322,13 @@ retain_days = 14
 # the HTTP server binds. False skips it; the toolchain is still verified before
 # the first encode, so nothing ever runs unverified either way.
 verify_on_startup = true
-# Expected SHA-256 of the FFmpeg release archive. The in-app download is
-# DISABLED until this is set - an unpinned executable download is not
-# acceptable on a broadcast host. Install manually if you prefer.
-# The download is pinned to gyan.dev FFmpeg 9.0.2 essentials (x86_64; has
-# libzimg for HDR tone mapping, no libsoxr). Its published digest is
-# 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+# The in-app download fetches gyan.dev FFmpeg 9.0.2 essentials (x86_64; has
+# libx264 and libzimg for HDR tone mapping, no libsoxr) and refuses any archive
+# whose SHA-256 is not the one compiled into this build
+# (60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba). It
+# retries a failed transfer, and only replaces bin/ once the new ffmpeg has
+# run and offered libx264. Empty = use that built-in digest; set a value to pin
+# independently. Install manually if you prefer.
 download_sha256 = ""
 
 [validation_policy]

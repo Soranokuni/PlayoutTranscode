@@ -71,7 +71,7 @@ Route definitions: `src/server.rs:52-84`. `PUT /trim` and `PUT /rating` (correct
 {
   "paths":    { "watch_folder": "D:/media/in", "target_folder": "D:/media/out" },
   "server":   { "web_port": 4353, "bind_address": "127.0.0.1" },
-  "encoding": { "preset": "slow", "ffmpeg_threads": 0, "cpu_cores": 0,
+  "encoding": { "preset": "medium", "ffmpeg_threads": 0, "cpu_cores": 0,
                 "audio_codec": "aac", "audio_bitrate": "320k", "tune": "film",
                 "probesize": "500M", "analyzeduration": "500M",
                 "effective_threads_per_encode": 1, "effective_total_threads": 2 },

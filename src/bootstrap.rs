@@ -360,35 +360,53 @@ pub fn ensure_toolchain() -> Result<ToolPaths, String> {
 const FFMPEG_DOWNLOAD_URL: &str =
     "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip";
 
-/// SHA-256 GitHub publishes for [`FFMPEG_DOWNLOAD_URL`]. The operator still
-/// has to state it in `toolchain_policy.download_sha256` (F-04); it is here
-/// so the refusal can say which value matches the pinned archive.
+/// SHA-256 GitHub publishes for [`FFMPEG_DOWNLOAD_URL`], compiled in.
+///
+/// This is the pin F-04 asks for. It used to have to be copied into
+/// `toolchain_policy.download_sha256` by hand before the Download button
+/// would do anything, so on a fresh install the button failed with a
+/// config-file instruction. The digest travels with the binary instead: the
+/// archive is trusted exactly as far as the service executable that names
+/// it, and a mismatch is still a hard refusal. Setting `download_sha256`
+/// overrides it, for an operator who wants to pin independently.
 pub const FFMPEG_DOWNLOAD_SHA256: &str =
     "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba";
 
+/// Fetch attempts before the download is reported as failed. A dropped
+/// connection on a ~90 MB archive is the common failure, not a bad file.
+const DOWNLOAD_ATTEMPTS: u32 = 3;
+
+/// The digest the downloaded archive must have.
+pub fn expected_download_digest(policy: &ToolchainPolicy) -> Result<String, String> {
+    let configured = policy.download_sha256.trim().to_lowercase();
+    if configured.is_empty() {
+        return Ok(FFMPEG_DOWNLOAD_SHA256.to_string());
+    }
+    if configured.len() != 64 || !configured.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(
+            "toolchain_policy.download_sha256 must be 64 hex characters, or empty to use \
+             the digest this build is pinned to"
+                .into(),
+        );
+    }
+    Ok(configured)
+}
+
+/// Download, verify, stage and install the pinned FFmpeg build.
+///
+/// Every step that can fail leaves `bin/` exactly as it was: the archive is
+/// verified before anything is extracted, it is extracted into a staging
+/// directory, the staged `ffmpeg`/`ffprobe` must run and must offer libx264
+/// before they replace anything, and only then are they moved into place.
+/// A half-extracted `bin/` used to be possible, and an ffmpeg without
+/// libx264 was only discovered by the first encode failing.
 pub fn download_ffmpeg() -> Result<ToolPaths, String> {
     let policy = current_policy();
-    let expected = policy.download_sha256.trim().to_lowercase();
-
-    // An unpinned executable download that the service then runs as a
-    // privileged account is not acceptable on a broadcast host (F-04). The
-    // operator must state the digest they expect, or install manually.
-    if expected.is_empty() {
-        return Err(format!(
-            "toolchain_policy.download_sha256 is not set. Automatic FFmpeg download is \
-             disabled without a pinned digest: set the expected SHA-256 of the release \
-             archive in config.toml ({} for {}), or install FFmpeg manually into the \
-             bin directory.",
-            FFMPEG_DOWNLOAD_SHA256, FFMPEG_DOWNLOAD_URL
-        ));
-    }
-    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("toolchain_policy.download_sha256 must be 64 hex characters".into());
-    }
+    let expected = expected_download_digest(&policy)?;
 
     let bin = bin_dir();
     if let Err(e) = fs::create_dir_all(&bin) {
-        return Err(format!("Failed to create bin directory: {}", e));
+        return Err(format!("Failed to create bin directory {}: {}", bin.display(), e));
     }
 
     tracing::info!(
@@ -398,70 +416,58 @@ pub fn download_ffmpeg() -> Result<ToolPaths, String> {
     );
     let zip_path = bin.join("ffmpeg-temp.zip");
 
-    {
-        // A default reqwest client times out at 30 s, which fails on any slow
-        // link for a ~90 MB archive (F-24). Stream to disk rather than holding
-        // the whole archive in RAM.
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(900))
-            .build()
-            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
-        let mut resp = client
-            .get(FFMPEG_DOWNLOAD_URL)
-            .send()
-            .map_err(|e| format!("FFmpeg download failed: {}", e))?;
-        if !resp.status().is_success() {
-            return Err(format!("FFmpeg download returned HTTP {}", resp.status()));
+    // Fetch and verify, retried together: a transfer cut short is as likely to
+    // surface as a digest mismatch as it is as an I/O error.
+    let mut last_error = String::new();
+    let mut verified = false;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        match fetch_to(&zip_path) {
+            Ok(()) => match file_sha256(&zip_path) {
+                Some(actual) if actual == expected => {
+                    tracing::info!("FFmpeg archive digest verified: {}", actual);
+                    verified = true;
+                    break;
+                }
+                Some(actual) => {
+                    last_error = format!(
+                        "FFmpeg archive digest mismatch: expected {}, got {}. The download was discarded.",
+                        expected, actual
+                    );
+                }
+                None => last_error = "Failed to hash the downloaded archive".into(),
+            },
+            Err(e) => last_error = e,
         }
-        let mut out = fs::File::create(&zip_path)
-            .map_err(|e| format!("Failed to create FFmpeg zip: {}", e))?;
-        std::io::copy(&mut resp, &mut out)
-            .map_err(|e| format!("FFmpeg download read failed: {}", e))?;
-    }
-
-    let actual = file_sha256(&zip_path)
-        .ok_or_else(|| "Failed to hash the downloaded archive".to_string())?;
-    if actual != expected {
         let _ = fs::remove_file(&zip_path);
+        if attempt < DOWNLOAD_ATTEMPTS {
+            tracing::warn!(
+                "FFmpeg download attempt {}/{} failed: {}; retrying",
+                attempt,
+                DOWNLOAD_ATTEMPTS,
+                last_error
+            );
+            std::thread::sleep(std::time::Duration::from_secs(5 * attempt as u64));
+        }
+    }
+    if !verified {
         return Err(format!(
-            "FFmpeg archive digest mismatch: expected {}, got {}. The download was discarded.",
-            expected, actual
+            "{} (after {} attempts). You can also install FFmpeg manually: put ffmpeg.exe \
+             and ffprobe.exe in {}.",
+            last_error,
+            DOWNLOAD_ATTEMPTS,
+            bin.display()
         ));
     }
-    tracing::info!("FFmpeg archive digest verified: {}", actual);
 
-    tracing::info!("Extracting FFmpeg...");
-    {
-        let file =
-            fs::File::open(&zip_path).map_err(|e| format!("Failed to open FFmpeg zip: {}", e))?;
-        let mut archive =
-            zip::ZipArchive::new(file).map_err(|e| format!("Failed to read FFmpeg zip: {}", e))?;
-
-        for i in 0..archive.len() {
-            let mut entry = archive
-                .by_index(i)
-                .map_err(|e| format!("Zip entry {}: {}", i, e))?;
-            if entry.is_dir() {
-                continue;
-            }
-            let name = entry.name().to_string();
-            let Some(dest) = extraction_target(&bin, &name) else {
-                continue;
-            };
-            let mut out_file = fs::File::create(&dest)
-                .map_err(|e| format!("Failed to create {}: {}", dest.display(), e))?;
-            if let Err(e) = std::io::copy(&mut entry, &mut out_file) {
-                let _ = fs::remove_file(&zip_path);
-                return Err(format!("Failed to extract {}: {}", name, e));
-            }
-        }
-    }
-
+    let staging = bin.join(format!(".staging-{}", uuid::Uuid::new_v4()));
+    let result = extract_and_install(&zip_path, &staging, &bin);
     let _ = fs::remove_file(&zip_path);
+    let _ = fs::remove_dir_all(&staging);
+    result?;
 
     let (tools, status) = audit_toolchain();
     if !status.ffmpeg_found || !status.ffprobe_found {
-        return Err("FFmpeg download succeeded but binaries not found after extraction".into());
+        return Err("FFmpeg was installed but the service still cannot find it".into());
     }
 
     tracing::info!(
@@ -472,6 +478,99 @@ pub fn download_ffmpeg() -> Result<ToolPaths, String> {
     );
 
     Ok(tools)
+}
+
+fn fetch_to(zip_path: &Path) -> Result<(), String> {
+    // A default reqwest client times out at 30 s, which fails on any slow link
+    // for a ~90 MB archive (F-24). Stream to disk rather than holding the whole
+    // archive in RAM.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let mut resp = client
+        .get(FFMPEG_DOWNLOAD_URL)
+        .send()
+        .map_err(|e| format!("FFmpeg download failed: {}", e))?;
+    if !resp.status().is_success() {
+        return Err(format!("FFmpeg download returned HTTP {}", resp.status()));
+    }
+    let mut out =
+        fs::File::create(zip_path).map_err(|e| format!("Failed to create FFmpeg zip: {}", e))?;
+    std::io::copy(&mut resp, &mut out).map_err(|e| format!("FFmpeg download read failed: {}", e))?;
+    Ok(())
+}
+
+/// Extract the toolchain into `staging`, prove it works, then move it into
+/// `bin`.
+fn extract_and_install(zip_path: &Path, staging: &Path, bin: &Path) -> Result<(), String> {
+    tracing::info!("Extracting FFmpeg...");
+    fs::create_dir_all(staging)
+        .map_err(|e| format!("Failed to create {}: {}", staging.display(), e))?;
+    let file = fs::File::open(zip_path).map_err(|e| format!("Failed to open FFmpeg zip: {}", e))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read FFmpeg zip: {}", e))?;
+    let mut extracted = Vec::new();
+    for i in 0..archive.len() {
+        let mut entry = archive
+            .by_index(i)
+            .map_err(|e| format!("Zip entry {}: {}", i, e))?;
+        if entry.is_dir() {
+            continue;
+        }
+        let name = entry.name().to_string();
+        let Some(dest) = extraction_target(staging, &name) else {
+            continue;
+        };
+        let mut out_file = fs::File::create(&dest)
+            .map_err(|e| format!("Failed to create {}: {}", dest.display(), e))?;
+        std::io::copy(&mut entry, &mut out_file)
+            .map_err(|e| format!("Failed to extract {}: {}", name, e))?;
+        extracted.push(dest);
+    }
+
+    let ffmpeg = staging.join(executable_name("ffmpeg"));
+    let ffprobe = staging.join(executable_name("ffprobe"));
+    if !ffmpeg.is_file() || !ffprobe.is_file() {
+        return Err("The FFmpeg archive did not contain ffmpeg and ffprobe".into());
+    }
+    if run_version(&ffmpeg).is_none() || run_version(&ffprobe).is_none() {
+        return Err("The downloaded ffmpeg/ffprobe do not run on this host".into());
+    }
+    if !offers_libx264(&ffmpeg) {
+        return Err("The downloaded ffmpeg has no libx264 encoder".into());
+    }
+
+    for staged in extracted {
+        let Some(name) = staged.file_name() else { continue };
+        let dest = bin.join(name);
+        // Windows refuses to rename over a file that is open, so move the old
+        // binary aside first; a running encode keeps its handle on it.
+        if dest.exists() {
+            let aside = bin.join(format!("{}.old", name.to_string_lossy()));
+            let _ = fs::remove_file(&aside);
+            fs::rename(&dest, &aside).map_err(|e| {
+                format!(
+                    "Could not replace {} ({}). Stop the service's encodes and try again.",
+                    dest.display(),
+                    e
+                )
+            })?;
+        }
+        fs::rename(&staged, &dest)
+            .map_err(|e| format!("Failed to install {}: {}", dest.display(), e))?;
+    }
+    Ok(())
+}
+
+fn offers_libx264(ffmpeg: &Path) -> bool {
+    let mut cmd = Command::new(ffmpeg);
+    cmd.args(["-hide_banner", "-encoders"]);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    crate::child::output_with_timeout(&mut cmd, std::time::Duration::from_secs(30))
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains("libx264"))
+        .unwrap_or(false)
 }
 
 /// Decide where a zip entry is written, or `None` to skip it.
@@ -707,24 +806,49 @@ mod toolchain_tests {
         assert!(extraction_target(bin, "ffmpeg-7.0/doc/ffmpeg.html").is_none());
     }
 
+    /// The Download button works on a fresh install: an empty
+    /// `download_sha256` means the digest compiled into this build, never
+    /// "unpinned". A configured value must still be well-formed.
     #[test]
-    fn download_refuses_without_a_pinned_digest() {
-        set_toolchain_policy(ToolchainPolicy::default());
-        let err = download_ffmpeg().expect_err("must refuse an unpinned download");
-        assert!(
-            err.contains("download_sha256"),
-            "unexpected error: {}",
-            err
+    fn the_download_digest_defaults_to_the_built_in_pin() {
+        assert_eq!(
+            expected_download_digest(&ToolchainPolicy::default()).unwrap(),
+            FFMPEG_DOWNLOAD_SHA256
         );
-
-        set_toolchain_policy(ToolchainPolicy {
+        let own = "a".repeat(64);
+        assert_eq!(
+            expected_download_digest(&ToolchainPolicy {
+                download_sha256: own.to_uppercase(),
+                ..Default::default()
+            })
+            .unwrap(),
+            own
+        );
+        let err = expected_download_digest(&ToolchainPolicy {
             download_sha256: "not-a-digest".into(),
             ..Default::default()
-        });
-        let err = download_ffmpeg().expect_err("must refuse a malformed digest");
+        })
+        .unwrap_err();
         assert!(err.contains("64 hex"), "unexpected error: {}", err);
+    }
 
-        set_toolchain_policy(ToolchainPolicy::default());
+    #[test]
+    fn a_staged_archive_without_the_tools_installs_nothing() {
+        let dir = tmp("stage");
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let zip_path = dir.join("empty.zip");
+        {
+            let f = fs::File::create(&zip_path).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("ffmpeg-9/README.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            std::io::Write::write_all(&mut z, b"no tools here").unwrap();
+            z.finish().unwrap();
+        }
+        let err = extract_and_install(&zip_path, &dir.join("staging"), &bin).unwrap_err();
+        assert!(err.contains("did not contain"), "{}", err);
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 0, "bin must be untouched");
     }
 
     #[test]

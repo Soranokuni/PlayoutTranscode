@@ -8,7 +8,7 @@
     "bind_address": "127.0.0.1"
   },
   "encoding": {
-    "preset": "slow",
+    "preset": "medium",
     "ffmpeg_threads": 0,
     "cpu_cores": 0,
     "audio_codec": "aac",

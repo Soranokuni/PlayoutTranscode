@@ -2148,9 +2148,18 @@ fn process_file_inner(
                 normalization_mode: match audio_policy.mode {
                     config::AudioMode::EbuR128 => "ebu_r128".to_string(),
                     config::AudioMode::AtscA85 => "atsc_a85".to_string(),
-                    _ => "legacy".to_string(),
+                    // Measured, not normalised: say which, instead of the
+                    // "legacy" both used to be recorded as.
+                    config::AudioMode::PassthroughValidate => "passthrough_validate".to_string(),
+                    config::AudioMode::AnalyzeOnly => "analyze_only".to_string(),
+                    config::AudioMode::LegacyV1Encode => "legacy".to_string(),
                 },
-                linear_applied: ml.is_linear,
+                // Only a mode that applies loudnorm can have applied it linearly.
+                linear_applied: ml.is_linear
+                    && matches!(
+                        audio_policy.mode,
+                        config::AudioMode::EbuR128 | config::AudioMode::AtscA85
+                    ),
             });
 
             let validation_report = identity::ValidationReport {

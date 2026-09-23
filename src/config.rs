@@ -363,14 +363,15 @@ pub struct EncodingConfig {
     pub analyzeduration: String,
 }
 
-/// `slow` since slice 6a. Measured on five station clips (1080p50 sport and
-/// commercials, UHD 30p, XDCAM 1080i50, 50p -> 1080i50) against lossless
-/// references, together with CRF -2 per profile: 1.27x the bytes of the V1
-/// defaults (medium, CRF 24/23/20) for +0.81 dB SSIM and +1.07 dB XPSNR,
-/// at 1.55x the encode time. `medium` at the same CRF spent 1.30x the bytes
-/// for slightly less (+0.76 / +1.04 dB).
+/// `medium`, chosen in slice 6a over `slow`. Measured on five station clips
+/// (1080p50 sport and commercials, UHD 30p, XDCAM 1080i50, 50p -> 1080i50)
+/// against lossless references, together with CRF -2 per profile: 1.30x the
+/// bytes of the V1 defaults (medium, CRF 24/23/20) for +0.76 dB SSIM and
+/// +1.04 dB XPSNR at 1.17x the encode time. `slow` bought +0.05 dB more at
+/// 1.27x the bytes but 1.55x the encode time -- not worth a third more wall
+/// clock per ingest.
 fn default_preset() -> String {
-    "slow".into()
+    "medium".into()
 }
 fn default_threads() -> usize {
     0
@@ -449,7 +450,7 @@ impl Default for ProfileConfig {
     }
 }
 
-/// Slice 6a defaults: CRF 2 lower than V1 (24/23/20) with the `slow` preset,
+/// Slice 6a defaults: CRF 2 lower than V1 (24/23/20) with the `medium` preset,
 /// ~1.2-1.3x V1's file size (see `default_preset`). The HD caps go from
 /// 15M/16M to 20M/30M: the 16 Mbit buffer was barely one second at the cap,
 /// so hard cuts were starved to hold it, and 20 Mb/s is still a third of

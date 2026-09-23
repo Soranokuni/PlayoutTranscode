@@ -1357,7 +1357,9 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             "target_folder": config.paths.target_folder,
             "max_concurrency": config.ingestion.max_concurrency,
             "preset": config.encoding.preset,
-            "audio_mode": config.audio_policy.map(|p| format!("{:?}", p.mode)).unwrap_or_else(|| "legacy".into()),
+            // The *effective* mode: with no `[audio_policy]` section that is
+            // EBU R128 now, not the "legacy" this used to report.
+            "audio_mode": format!("{:?}", config.effective_audio_policy().mode),
         }
     }))
 }

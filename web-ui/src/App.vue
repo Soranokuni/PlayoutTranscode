@@ -231,7 +231,7 @@
             <div class="form-row">
               <label for="f-loudness-mode">Loudness Mode</label>
               <select id="f-loudness-mode" v-model="editAudioMode">
-                <option value="legacy_v1_encode">Legacy (Preserve / Pass-through)</option>
+                <option value="legacy_v1_encode">Legacy (no loudness normalisation)</option>
                 <option value="ebu_r128">EBU R128 (-23 LUFS / -1 dBTP / 7 LRA)</option>
                 <option value="atsc_a85">ATSC A/85 (-24 LUFS / -2 dBTP / 7 LRA)</option>
                 <option value="passthrough_validate">Passthrough &amp; Validate Only</option>
@@ -401,7 +401,7 @@ const activeTab = ref('dashboard')
 
 const {
   jobs, assets, watchfolder, stats, config, toolchain,
-  serviceRunning, serviceStatus, downloading, logs, logLines, linkState, uptimeMs,
+  serviceRunning, serviceStatus, downloading, downloadResult, logs, logLines, linkState, uptimeMs,
   fetchConfig, putConfig, startService, stopService, waitForStopped, downloadFFmpeg,
   setLogPolling, clearLogs, retryJob, cancelJob, retryAllFailed, dismissJob, dismissFinishedJobs,
   trashAsset, purgeAsset, clearAssetVerdict,
@@ -444,11 +444,11 @@ const editPreset = ref('medium')
 const editTune = ref('film')
 const editAudioCodec = ref('aac')
 const editAudioBitrate = ref('320k')
-const editCrfA = ref(24)
-const editCrfB = ref(23)
-const editCrfC = ref(20)
-const editMaxrateAB = ref('15M')
-const editBufsizeAB = ref('16M')
+const editCrfA = ref(22)
+const editCrfB = ref(21)
+const editCrfC = ref(18)
+const editMaxrateAB = ref('20M')
+const editBufsizeAB = ref('30M')
 const editMaxrateC = ref('5M')
 const editBufsizeC = ref('6M')
 const editConcurrency = ref(2)
@@ -463,7 +463,7 @@ const editMaxAttempts = ref(2)
 const editRetryDelayMs = ref(2000)
 const editCleanSourceAfterSuccess = ref(false)
 
-const editAudioMode = ref<'legacy_v1_encode' | 'ebu_r128' | 'atsc_a85' | 'passthrough_validate' | 'analyze_only'>('legacy_v1_encode')
+const editAudioMode = ref<'legacy_v1_encode' | 'ebu_r128' | 'atsc_a85' | 'passthrough_validate' | 'analyze_only'>('ebu_r128')
 const editAudioTargetLufs = ref<number | undefined>(undefined)
 const editAudioTruePeak = ref<number | undefined>(undefined)
 const editAudioLra = ref<number | undefined>(undefined)
@@ -703,8 +703,8 @@ function populateFromConfig(cfg: ConfigPayload) {
   editCrfA.value = cfg.profiles.a.crf
   editCrfB.value = cfg.profiles.b.crf
   editCrfC.value = cfg.profiles.c.crf
-  editMaxrateAB.value = cfg.profiles.a.maxrate || '15M'
-  editBufsizeAB.value = cfg.profiles.a.bufsize || '16M'
+  editMaxrateAB.value = cfg.profiles.a.maxrate || '20M'
+  editBufsizeAB.value = cfg.profiles.a.bufsize || '30M'
   editMaxrateC.value = cfg.profiles.c.maxrate || '5M'
   editBufsizeC.value = cfg.profiles.c.bufsize || '6M'
   editConcurrency.value = cfg.ingestion.max_concurrency
@@ -719,7 +719,7 @@ function populateFromConfig(cfg: ConfigPayload) {
   editRetryDelayMs.value = cfg.ingestion.retry_delay_ms ?? 2000
   editCleanSourceAfterSuccess.value = cfg.ingestion.clean_source_after_success ?? false
   if (cfg.audio_policy) {
-    editAudioMode.value = cfg.audio_policy.mode || 'legacy_v1_encode'
+    editAudioMode.value = cfg.audio_policy.mode || 'ebu_r128'
     editAudioTargetLufs.value = cfg.audio_policy.target_lufs
     editAudioTruePeak.value = cfg.audio_policy.true_peak_dbtp
     editAudioLra.value = cfg.audio_policy.lra_target
@@ -894,6 +894,10 @@ function onGlobalKeydown(e: KeyboardEvent) {
     void saveConfig()
   }
 }
+
+watch(downloadResult, (r) => {
+  if (r) ingestPanelRef.value?.showRetryMsg(r.text, r.ok)
+})
 
 /** A refused download used to be ignored: the button did nothing, silently. */
 async function onDownload() {

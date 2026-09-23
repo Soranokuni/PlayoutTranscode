@@ -195,6 +195,8 @@ export function useEventStream() {
   const serviceStatus = ref<ServiceStatusPayload | null>(null)
   const serviceRunning = ref(false)
   const downloading = ref(false)
+  /** How the last FFmpeg download ended, for the operator. */
+  const downloadResult = ref<{ ok: boolean; text: string } | null>(null)
   const logLines = shallowRef<LogLine[]>([])
   const uptimeMs = ref(0)
   const linkState = ref<LinkState>('reconnecting')
@@ -1031,6 +1033,13 @@ export function useEventStream() {
       const ds = await apiGet<{ status: string }>('/download/status')
       downloading.value = ds?.status === 'downloading'
       if (!downloading.value) {
+        // The outcome used to be dropped: a failed download just stopped
+        // spinning, and the reason was only in the log.
+        if (ds?.status === 'ok') {
+          downloadResult.value = { ok: true, text: 'FFmpeg downloaded and verified' }
+        } else if (ds?.status?.startsWith('error:')) {
+          downloadResult.value = { ok: false, text: ds.status.slice('error:'.length).trim() }
+        }
         window.clearInterval(downloadTimer)
         downloadTimer = 0
         // A finished download changes the toolchain.
@@ -1154,6 +1163,7 @@ export function useEventStream() {
     serviceStatus,
     serviceRunning,
     downloading,
+    downloadResult,
     logs,
     logLines,
     linkState,
