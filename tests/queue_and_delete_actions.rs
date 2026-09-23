@@ -289,6 +289,8 @@ async fn clearing_a_verdict_lets_the_service_reconsider_the_media() {
             .unwrap()
             .is_some()
     );
+    let held = |d: serde_json::Value| d["metrics"]["permanently_failed_assets"].clone();
+    assert_eq!(held(s.get_json("/api/v2/diagnostics").await), 1);
 
     let r = s
         .client()
@@ -307,6 +309,8 @@ async fn clearing_a_verdict_lets_the_service_reconsider_the_media() {
             .is_none(),
         "clearing the verdict must actually release the media"
     );
+    // W-5. And diagnostics stops counting it as held back.
+    assert_eq!(held(s.get_json("/api/v2/diagnostics").await), 0);
 
     // Clearing twice is honest about having done nothing the second time.
     let again = s
@@ -316,4 +320,30 @@ async fn clearing_a_verdict_lets_the_service_reconsider_the_media() {
         .await
         .unwrap();
     assert_eq!(again.json::<serde_json::Value>().await.unwrap()["cleared"], false);
+}
+
+/// W-5. A `ready` asset with no keyframe evidence stays `ready` -- demoting on
+/// an environmental scan failure would pull it off air -- but it is counted.
+#[tokio::test]
+async fn diagnostics_counts_ready_assets_with_no_keyframe_evidence() {
+    let s = spawn_test_server().await;
+    sqlx::query(
+        "INSERT INTO media_assets
+           (uuid, fingerprint, current_path, duration_ms, status, mezzanine_ok,
+            keyframe_offsets_json)
+         VALUES
+           ('77777777-7777-4777-8777-777777777771', 1, 'D:/m/a.mp4', 400, 'ready', 1, '[]'),
+           ('77777777-7777-4777-8777-777777777772', 2, 'D:/m/b.mp4', 400, 'ready', 1, '[0]'),
+           ('77777777-7777-4777-8777-777777777773', 3, 'D:/m/c.mp4', 400, 'error', 0, '[]')",
+    )
+    .execute(&*s.pool)
+    .await
+    .unwrap();
+
+    let diag = s.get_json("/api/v2/diagnostics").await;
+    assert_eq!(
+        diag["metrics"]["unverified_keyframe_assets"], 1,
+        "only the ready one with an empty list: {}",
+        diag["metrics"]
+    );
 }
