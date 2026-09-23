@@ -83,7 +83,7 @@ fn test_golden_config_contract() {
     assert!(json["paths"]["watch_folder"].is_string());
     assert!(json["paths"]["target_folder"].is_string());
     assert_eq!(json["server"]["web_port"].as_i64().unwrap(), 4353);
-    assert_eq!(json["encoding"]["preset"].as_str().unwrap(), "medium");
+    assert_eq!(json["encoding"]["preset"].as_str().unwrap(), "slow");
     assert_eq!(json["encoding"]["audio_codec"].as_str().unwrap(), "aac");
     assert_eq!(json["encoding"]["audio_bitrate"].as_str().unwrap(), "320k");
     assert_eq!(json["profiles"]["a"]["enabled"].as_bool().unwrap(), true);

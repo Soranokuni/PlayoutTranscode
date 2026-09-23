@@ -348,7 +348,21 @@ pub fn ensure_toolchain() -> Result<ToolPaths, String> {
 
 /// Where the release archive is fetched from when the operator asks for an
 /// automatic install.
-const FFMPEG_DOWNLOAD_URL: &str = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
+///
+/// A versioned asset, not `ffmpeg-release-essentials.zip` (slice 5 #14):
+/// that URL moves with every gyan.dev release, so an operator's pinned
+/// `download_sha256` broke on the next release and "the same install" meant
+/// a different ffmpeg on every host. 9.0.2 essentials carries libx264,
+/// libzimg (zscale, for HDR tone mapping) and libvmaf; it has no libsoxr,
+/// which the argument builder detects and falls back from.
+const FFMPEG_DOWNLOAD_URL: &str =
+    "https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip";
+
+/// SHA-256 GitHub publishes for [`FFMPEG_DOWNLOAD_URL`]. The operator still
+/// has to state it in `toolchain_policy.download_sha256` (F-04); it is here
+/// so the refusal can say which value matches the pinned archive.
+pub const FFMPEG_DOWNLOAD_SHA256: &str =
+    "60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba";
 
 pub fn download_ffmpeg() -> Result<ToolPaths, String> {
     let policy = current_policy();
@@ -358,12 +372,13 @@ pub fn download_ffmpeg() -> Result<ToolPaths, String> {
     // privileged account is not acceptable on a broadcast host (F-04). The
     // operator must state the digest they expect, or install manually.
     if expected.is_empty() {
-        return Err(
+        return Err(format!(
             "toolchain_policy.download_sha256 is not set. Automatic FFmpeg download is \
              disabled without a pinned digest: set the expected SHA-256 of the release \
-             archive in config.toml, or install FFmpeg manually into the bin directory."
-                .into(),
-        );
+             archive in config.toml ({} for {}), or install FFmpeg manually into the \
+             bin directory.",
+            FFMPEG_DOWNLOAD_SHA256, FFMPEG_DOWNLOAD_URL
+        ));
     }
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("toolchain_policy.download_sha256 must be 64 hex characters".into());

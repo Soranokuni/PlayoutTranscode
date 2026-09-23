@@ -363,8 +363,14 @@ pub struct EncodingConfig {
     pub analyzeduration: String,
 }
 
+/// `slow` since slice 6a. Measured on five station clips (1080p50 sport and
+/// commercials, UHD 30p, XDCAM 1080i50, 50p -> 1080i50) against lossless
+/// references, together with CRF -2 per profile: 1.27x the bytes of the V1
+/// defaults (medium, CRF 24/23/20) for +0.81 dB SSIM and +1.07 dB XPSNR,
+/// at 1.55x the encode time. `medium` at the same CRF spent 1.30x the bytes
+/// for slightly less (+0.76 / +1.04 dB).
 fn default_preset() -> String {
-    "medium".into()
+    "slow".into()
 }
 fn default_threads() -> usize {
     0
@@ -439,36 +445,37 @@ fn default_enabled() -> bool {
 
 impl Default for ProfileConfig {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            crf: 24,
-            maxrate: "15M".into(),
-            bufsize: "16M".into(),
-        }
+        Self::profile_a_default()
     }
 }
 
+/// Slice 6a defaults: CRF 2 lower than V1 (24/23/20) with the `slow` preset,
+/// ~1.2-1.3x V1's file size (see `default_preset`). The HD caps go from
+/// 15M/16M to 20M/30M: the 16 Mbit buffer was barely one second at the cap,
+/// so hard cuts were starved to hold it, and 20 Mb/s is still a third of
+/// High@4.2's 62.5 Mb/s. C keeps 5M/6M: at CRF 18 an SD upconversion
+/// measured 1.17-1.31x V1 inside it.
 impl ProfileConfig {
     pub fn profile_a_default() -> Self {
         Self {
             enabled: true,
-            crf: 24,
-            maxrate: "15M".into(),
-            bufsize: "16M".into(),
+            crf: 22,
+            maxrate: "20M".into(),
+            bufsize: "30M".into(),
         }
     }
     pub fn profile_b_default() -> Self {
         Self {
             enabled: true,
-            crf: 23,
-            maxrate: "15M".into(),
-            bufsize: "16M".into(),
+            crf: 21,
+            maxrate: "20M".into(),
+            bufsize: "30M".into(),
         }
     }
     pub fn profile_c_default() -> Self {
         Self {
             enabled: true,
-            crf: 20,
+            crf: 18,
             maxrate: "5M".into(),
             bufsize: "6M".into(),
         }
@@ -598,9 +605,26 @@ pub enum AudioMode {
     AnalyzeOnly,
 }
 
+/// EBU R128 since slice 6d (-23 LUFS, -1 dBTP, two-pass, linear gain when
+/// the peak allows). An `[audio_policy]` that names `mode` keeps it, so a
+/// station that chose `legacy_v1_encode` stays on it.
 impl Default for AudioMode {
     fn default() -> Self {
-        AudioMode::LegacyV1Encode
+        AudioMode::EbuR128
+    }
+}
+
+impl AudioMode {
+    /// Runs the loudness analysis pass (and records it in the sidecar).
+    pub fn measures(self) -> bool {
+        !matches!(self, AudioMode::LegacyV1Encode)
+    }
+
+    /// Applies loudnorm. `passthrough_validate` and `analyze_only` measure
+    /// and report but leave the level alone (slice 5 #9: both used to reach
+    /// loudnorm through a `_ =>` fallback).
+    pub fn normalizes(self) -> bool {
+        matches!(self, AudioMode::EbuR128 | AudioMode::AtscA85)
     }
 }
 
@@ -624,9 +648,13 @@ pub struct AudioPolicy {
     pub true_peak_dbtp: Option<f64>,
     #[serde(default)]
     pub lra_target: Option<f64>,
+    /// With two or more mono source tracks, `false` (default) joins tracks 1
+    /// and 2 into L/R; `true` treats track 1 as the programme and plays it on
+    /// both channels (for stations whose track 2 is a second language).
     #[serde(default)]
     pub dual_mono: bool,
-    #[serde(default)]
+    /// Keep a >2-channel source's channels instead of downmixing to stereo.
+    #[serde(default, alias = "preserve_original_track")]
     pub preserve_original: bool,
 }
 
@@ -640,7 +668,7 @@ fn default_channels() -> u32 {
 impl Default for AudioPolicy {
     fn default() -> Self {
         Self {
-            mode: AudioMode::LegacyV1Encode,
+            mode: AudioMode::EbuR128,
             codec: "aac".into(),
             bitrate: "320k".into(),
             sample_rate_hz: 48000,
@@ -833,7 +861,7 @@ impl Default for AppConfig {
                 api_token: String::new(),
             },
             encoding: EncodingConfig {
-                preset: "medium".into(),
+                preset: default_preset(),
                 ffmpeg_threads: 0,
                 cpu_cores: 0,
                 audio_codec: "aac".into(),
@@ -869,16 +897,18 @@ impl AppConfig {
             }
             ap.clone()
         } else {
+            // No `[audio_policy]` section: EBU R128 (slice 6d). Was
+            // LegacyV1Encode, i.e. no loudness processing at all.
             AudioPolicy {
-                mode: AudioMode::LegacyV1Encode,
+                mode: AudioMode::EbuR128,
                 codec: self.encoding.audio_codec.clone(),
                 bitrate: self.encoding.audio_bitrate.clone(),
                 sample_rate_hz: 48000,
                 channels: 2,
                 channel_layout: None,
-                target_lufs: None,
-                true_peak_dbtp: None,
-                lra_target: None,
+                target_lufs: Some(-23.0),
+                true_peak_dbtp: Some(-1.0),
+                lra_target: Some(7.0),
                 dual_mono: false,
                 preserve_original: false,
             }
@@ -992,6 +1022,8 @@ impl AppConfig {
                     "true_peak_dbtp",
                     "lra_target",
                     "dual_mono",
+                    "preserve_original",
+                    // Accepted alias; the key the README used to document.
                     "preserve_original_track",
                 ],
             ),
@@ -1465,8 +1497,36 @@ impl AppConfig {
             }
         }
 
-        if audio_pol.channels == 0 {
-            return Err("AudioPolicy channels must be > 0".into());
+        // Output channel count when not preserving a multichannel source.
+        // Mono or stereo only: a CasparCG 1080i50 channel is stereo, and
+        // anything wider is what `preserve_original` is for.
+        if !(1..=2).contains(&audio_pol.channels) {
+            return Err(format!(
+                "AudioPolicy channels ({}) must be 1 or 2; set preserve_original = true to keep a multichannel source",
+                audio_pol.channels
+            ));
+        }
+        if let Some(layout) = audio_pol.channel_layout.as_deref().map(str::trim) {
+            let expected = match layout {
+                "mono" => Some(1),
+                "stereo" => Some(2),
+                _ => None,
+            };
+            match expected {
+                Some(n) if n != audio_pol.channels => {
+                    return Err(format!(
+                        "audio_policy.channel_layout '{}' contradicts channels = {}",
+                        layout, audio_pol.channels
+                    ));
+                }
+                None if !audio_pol.preserve_original => {
+                    return Err(format!(
+                        "audio_policy.channel_layout '{}' describes a multichannel track and needs preserve_original = true",
+                        layout
+                    ));
+                }
+                _ => {}
+            }
         }
 
         // Validate V2 ValidationPolicy
@@ -1545,13 +1605,15 @@ clean_source_after_success = true
             "Unversioned config must have None for explicit audio_policy"
         );
 
+        // Slice 6d: no [audio_policy] means EBU R128, not V1's untouched level.
         let effective_audio = cfg.effective_audio_policy();
-        assert_eq!(effective_audio.mode, AudioMode::LegacyV1Encode);
+        assert_eq!(effective_audio.mode, AudioMode::EbuR128);
         assert_eq!(effective_audio.codec, "aac");
         assert_eq!(effective_audio.bitrate, "320k");
         assert_eq!(effective_audio.sample_rate_hz, 48000);
         assert_eq!(effective_audio.channels, 2);
-        assert_eq!(effective_audio.target_lufs, None);
+        assert_eq!(effective_audio.target_lufs, Some(-23.0));
+        assert_eq!(effective_audio.true_peak_dbtp, Some(-1.0));
 
         let effective_val = cfg.effective_validation_policy();
         assert_eq!(effective_val.enforce_closed_gop, true);
@@ -2025,6 +2087,41 @@ mod validation_tests {
     }
 
     #[test]
+    fn an_explicit_legacy_mode_is_kept_and_the_old_key_still_parses() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+[paths]
+watch_folder = "C:/in"
+target_folder = "C:/out"
+
+[audio_policy]
+mode = "legacy_v1_encode"
+preserve_original_track = true
+"#,
+        )
+        .unwrap();
+        let pol = cfg.effective_audio_policy();
+        assert_eq!(pol.mode, AudioMode::LegacyV1Encode);
+        assert!(pol.preserve_original, "the alias must land on the real field");
+
+        // A section that omits `mode` gets the new default.
+        let cfg: AppConfig = toml::from_str(
+            "[paths]
+watch_folder = \"C:/in\"
+target_folder = \"C:/out\"
+[audio_policy]
+codec = \"aac\"
+",
+        )
+        .unwrap();
+        assert_eq!(cfg.effective_audio_policy().mode, AudioMode::EbuR128);
+        assert!(AudioMode::EbuR128.normalizes() && AudioMode::AtscA85.normalizes());
+        assert!(!AudioMode::PassthroughValidate.normalizes() && AudioMode::PassthroughValidate.measures());
+        assert!(!AudioMode::AnalyzeOnly.normalizes() && AudioMode::AnalyzeOnly.measures());
+        assert!(!AudioMode::LegacyV1Encode.measures());
+    }
+
+    #[test]
     fn audio_policy_strings_are_validated() {
         let dir = tmp_dir("audiopol");
 
@@ -2050,7 +2147,29 @@ mod validation_tests {
         let mut pol = cfg.effective_audio_policy();
         pol.channel_layout = Some("5.1(side)".into());
         cfg.audio_policy = Some(pol);
+        assert!(
+            cfg.validate().is_err(),
+            "a multichannel layout without preserve_original is never honoured"
+        );
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.channel_layout = Some("5.1(side)".into());
+        pol.preserve_original = true;
+        cfg.audio_policy = Some(pol);
         assert!(cfg.validate().is_ok(), "valid channel_layout");
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.channel_layout = Some("mono".into());
+        cfg.audio_policy = Some(pol);
+        assert!(cfg.validate().is_err(), "mono layout with channels = 2");
+
+        let mut cfg = good_config(&dir);
+        let mut pol = cfg.effective_audio_policy();
+        pol.channels = 6;
+        cfg.audio_policy = Some(pol);
+        assert!(cfg.validate().is_err(), "channels must be 1 or 2");
 
         let _ = fs::remove_dir_all(&dir);
     }

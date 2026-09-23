@@ -1082,6 +1082,7 @@ mod tests {
             field_order: "tt".into(),
             display_aspect_ratio: "16:9".into(),
             input_path: asset.current_path.clone(),
+            ..ProbeData::conforming_mezzanine_for_tests()
         };
 
         let result = build_sidecar_from_db_asset_with_probe(&asset, Some(&probe)).unwrap();

@@ -1289,7 +1289,7 @@ fn process_file_inner(
         &serde_json::json!({"id": job.id, "stage": "Probing", "phase": "probing"}).to_string(),
     );
 
-    let probe_data = match probe::probe_media(tools, input_path) {
+    let probe_data = match probe::probe_source(tools, input_path) {
         Ok(p) => p,
         Err(e) => {
             let _ = queue.transition(
@@ -1679,7 +1679,13 @@ fn process_file_inner(
         }
 
         if validation_ok {
-            let output_probe = final_probe.unwrap();
+            let mut output_probe = final_probe.unwrap();
+            output_probe.output_loudness = remeasure_output_loudness(
+                tools,
+                &result.output_path,
+                measured_loudness.as_ref(),
+                &audio_policy,
+            );
             let total_frames = output_probe.frame_count;
             let fps = output_probe.fps();
             let duration_ms = (output_probe.duration_secs * 1000.0).round() as i64;
@@ -2152,6 +2158,14 @@ fn compute_gop_from_fps(fps: f64) -> i64 {
     }
 }
 
+/// Every keyframe interval must be one GOP, within half a frame.
+///
+/// Only *short* intervals used to fail (slice 5 #12): a keyframe that went
+/// missing -- a 4 s or 10 s gap -- passed, although it is exactly what breaks
+/// a frame-accurate SEEK (Caspar decodes from the previous keyframe) and
+/// what the 2 s GOP in the contract promises cannot happen. A gap longer
+/// than `gop_ms + tolerance` now fails anywhere. The last interval may be
+/// short: nothing after it depends on the cadence.
 fn verify_closed_gop(keyframe_offsets: &[i64], gop_frames: i64, fps: f64) -> bool {
     if keyframe_offsets.len() < 2 {
         return true;
@@ -2162,15 +2176,49 @@ fn verify_closed_gop(keyframe_offsets: &[i64], gop_frames: i64, fps: f64) -> boo
     let frame_ms = 1000.0 / fps;
     let gop_ms = frame_ms * gop_frames as f64;
     let tolerance = frame_ms * 0.5;
+    let last = keyframe_offsets.len() - 2;
 
-    for window in keyframe_offsets.windows(2) {
+    for (i, window) in keyframe_offsets.windows(2).enumerate() {
         let diff = (window[1] - window[0]) as f64;
-        if (diff - gop_ms).abs() > tolerance && diff < gop_ms - tolerance {
+        if diff > gop_ms + tolerance {
+            return false;
+        }
+        if diff < gop_ms - tolerance && i != last {
             return false;
         }
     }
     true
 }
+
+/// Re-measure the mezzanine's loudness when the policy normalised it and the
+/// source was measurable (slice 5 #12). `None` otherwise, or when the pass
+/// itself fails -- which QC reports as unverified rather than passed.
+fn remeasure_output_loudness(
+    tools: &bootstrap::ToolPaths,
+    path: &Path,
+    measured: Option<&probe::MeasuredLoudness>,
+    policy: &config::AudioPolicy,
+) -> Option<probe::OutputLoudness> {
+    if !policy.mode.normalizes() {
+        return None;
+    }
+    let m = measured?;
+    if m.is_silent || m.is_short {
+        return None;
+    }
+    match probe::measure_output_loudness(tools, path) {
+        Ok(l) => Some(l),
+        Err(e) => {
+            tracing::warn!("Output loudness re-measure failed for {}: {}", path.display(), e);
+            None
+        }
+    }
+}
+
+/// Tolerances for the output loudness check: +/-1 LU on integrated, +0.5 dB
+/// over the true-peak target (AAC reconstruction adds a few tenths).
+const LOUDNESS_TOLERANCE_LU: f64 = 1.0;
+const TRUE_PEAK_TOLERANCE_DB: f64 = 0.5;
 
 fn verify_faststart(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
@@ -2294,7 +2342,7 @@ pub fn run_qc_evaluation(
     faststart_ok: bool,
     keyframe_scan_failed: bool,
     measured_loudness: Option<&probe::MeasuredLoudness>,
-    _audio_policy: &config::AudioPolicy,
+    audio_policy: &config::AudioPolicy,
     policy: &config::ValidationPolicy,
 ) -> identity::QcReport {
     let mut findings = Vec::new();
@@ -2465,6 +2513,135 @@ pub fn run_qc_evaluation(
                 &mut blocking_errors,
                 &mut warnings_count,
             );
+        }
+    }
+
+    // 8. Output conformance (slice 5 #12). Every one of these is fixed by the
+    //    argument builder, so a mismatch means the encode did not do what it
+    //    was told -- a mezzanine Caspar would scale, re-tag or mis-field.
+    let profile = profiles::EncodingProfile::by_id(source_probe.profile_id());
+    let mut conformance = |ok: bool, code: &str, message: &str, observed: String, expected: &str| {
+        if !ok {
+            findings.push(identity::ValidationFinding::error(
+                code,
+                message,
+                Some(observed),
+                Some(expected.to_string()),
+            ));
+            blocking_errors += 1;
+        }
+    };
+    conformance(
+        output_probe.width == profiles::TARGET_WIDTH && output_probe.height == profiles::TARGET_HEIGHT,
+        "output_geometry_mismatch",
+        "Output raster is not 1920x1080",
+        format!("{}x{}", output_probe.width, output_probe.height),
+        "1920x1080",
+    );
+    conformance(
+        output_probe.pix_fmt == "yuv420p",
+        "output_pix_fmt_mismatch",
+        "Output pixel format is not yuv420p",
+        output_probe.pix_fmt.clone(),
+        "yuv420p",
+    );
+    conformance(
+        output_probe.color_space == profile.colorspace
+            && output_probe.color_transfer == profile.color_trc
+            && output_probe.color_primaries == profile.color_primaries
+            && output_probe.color_range == "tv",
+        "output_color_tags_mismatch",
+        "Output colour tags are not BT.709 limited range",
+        format!(
+            "{}/{}/{}/{}",
+            output_probe.color_space,
+            output_probe.color_transfer,
+            output_probe.color_primaries,
+            output_probe.color_range
+        ),
+        "bt709/bt709/bt709/tv",
+    );
+    let expected_field_order = if profile.interlaced { "tt" } else { "progressive" };
+    conformance(
+        output_probe.field_order == expected_field_order,
+        "output_field_order_mismatch",
+        "Output field order does not match the profile",
+        output_probe.field_order.clone(),
+        expected_field_order,
+    );
+    let expected_channels = profiles::expected_output_audio_channels(source_probe, audio_policy);
+    conformance(
+        output_probe.audio_channels == expected_channels,
+        "output_audio_channels_mismatch",
+        "Output audio channel count does not match the audio policy",
+        output_probe.audio_channels.to_string(),
+        &expected_channels.to_string(),
+    );
+
+    // 9. HDR handling is always recorded; untone-mapped HDR is a warning.
+    if source_probe.is_hdr() {
+        let tonemapped = source_probe
+            .ffmpeg_caps
+            .map(|c| c.zscale_tonemap)
+            .unwrap_or(false);
+        if tonemapped {
+            findings.push(identity::ValidationFinding::info(
+                "hdr_tonemapped_to_sdr",
+                format!(
+                    "{} source tone-mapped to SDR BT.709 (zscale + hable)",
+                    source_probe.color_transfer
+                ),
+            ));
+        } else {
+            findings.push(identity::ValidationFinding::warning(
+                "hdr_not_tonemapped",
+                "HDR source encoded without tone mapping: this ffmpeg has no zscale/tonemap, \
+                 so highlights are clipped and colours are flat",
+                Some(source_probe.color_transfer.clone()),
+                Some("ffmpeg built with libzimg".to_string()),
+            ));
+            warnings_count += 1;
+        }
+    }
+
+    // 10. Output loudness (slice 5 #12). Only when the policy normalised and
+    //     the source was measurable; the re-measure is loudnorm's own
+    //     analysis of the encoded track.
+    if audio_policy.mode.normalizes() {
+        if let Some(ml) = measured_loudness.filter(|m| !m.is_silent && !m.is_short) {
+            match output_probe.output_loudness {
+                Some(out) => {
+                    if !out.integrated_lufs.is_finite()
+                        || (out.integrated_lufs - ml.target_i).abs() > LOUDNESS_TOLERANCE_LU
+                    {
+                        findings.push(identity::ValidationFinding::error(
+                            "output_loudness_off_target",
+                            "Output integrated loudness is outside +/-1 LU of the target",
+                            Some(format!("{:.1} LUFS", out.integrated_lufs)),
+                            Some(format!("{:.1} LUFS +/- {:.1}", ml.target_i, LOUDNESS_TOLERANCE_LU)),
+                        ));
+                        blocking_errors += 1;
+                    }
+                    if out.true_peak_dbtp > ml.target_tp + TRUE_PEAK_TOLERANCE_DB {
+                        findings.push(identity::ValidationFinding::error(
+                            "output_true_peak_exceeded",
+                            "Output true peak exceeds the target",
+                            Some(format!("{:.1} dBTP", out.true_peak_dbtp)),
+                            Some(format!("<= {:.1} dBTP", ml.target_tp + TRUE_PEAK_TOLERANCE_DB)),
+                        ));
+                        blocking_errors += 1;
+                    }
+                }
+                None => {
+                    findings.push(identity::ValidationFinding::warning(
+                        "output_loudness_unverified",
+                        "The output loudness re-measure did not run or failed",
+                        None,
+                        Some(format!("{:.1} LUFS", ml.target_i)),
+                    ));
+                    warnings_count += 1;
+                }
+            }
         }
     }
 
@@ -3198,6 +3375,149 @@ mod tests {
     }
 
     #[test]
+    fn a_missing_keyframe_is_a_gop_violation() {
+        // Slice 5 #12: only short intervals used to fail.
+        assert!(!verify_closed_gop(&[0, 2000, 6000, 8000], 50, 25.0), "4 s gap");
+        assert!(!verify_closed_gop(&[0, 2000, 4000, 14000], 50, 25.0), "gap in the last interval");
+        // Half a frame of rounding either way is fine.
+        assert!(verify_closed_gop(&[0, 2000, 4019, 6000], 50, 25.0));
+        assert!(!verify_closed_gop(&[0, 2000, 4021, 6000], 50, 25.0));
+        // The last interval may be short; nothing after it relies on cadence.
+        assert!(verify_closed_gop(&[0, 2000, 4000, 5000], 50, 25.0));
+        assert!(!verify_closed_gop(&[0, 1000, 3000, 5000], 50, 25.0), "short mid-stream");
+    }
+
+    fn qc_with(out: &probe::ProbeData, src: &probe::ProbeData) -> identity::QcReport {
+        run_qc_evaluation(
+            out,
+            src,
+            true,
+            true,
+            false,
+            None,
+            &config::AudioPolicy::default(),
+            &config::ValidationPolicy::default(),
+        )
+    }
+
+    #[test]
+    fn output_conformance_is_checked_against_the_profile() {
+        let src = probe::ProbeData::conforming_mezzanine_for_tests();
+        let good = probe::ProbeData::conforming_mezzanine_for_tests();
+        assert!(qc_with(&good, &src).passed);
+
+        let cases: Vec<(&str, Box<dyn Fn(&mut probe::ProbeData)>)> = vec![
+            ("output_geometry_mismatch", Box::new(|p| p.width = 1440)),
+            ("output_pix_fmt_mismatch", Box::new(|p| p.pix_fmt = "yuv422p".into())),
+            ("output_color_tags_mismatch", Box::new(|p| p.color_primaries = "smpte170m".into())),
+            ("output_color_tags_mismatch", Box::new(|p| p.color_range = "pc".into())),
+            ("output_field_order_mismatch", Box::new(|p| p.field_order = "tt".into())),
+            ("output_audio_channels_mismatch", Box::new(|p| p.audio_channels = 1)),
+        ];
+        for (code, mutate) in cases {
+            let mut out = good.clone();
+            mutate(&mut out);
+            let report = qc_with(&out, &src);
+            assert!(!report.passed, "{code}");
+            assert!(report.findings.iter().any(|f| f.code == code), "{code}: {:?}", report.findings);
+        }
+
+        // A 1080i50 source routes to B, whose output must be TFF.
+        let mut src_i = src.clone();
+        src_i.field_order = "tt".into();
+        let mut out_i = good.clone();
+        out_i.field_order = "tt".into();
+        assert!(qc_with(&out_i, &src_i).passed);
+        assert!(!qc_with(&good, &src_i).passed, "progressive out of an interlaced profile");
+    }
+
+    #[test]
+    fn output_loudness_is_re_measured_against_the_target() {
+        let src = probe::ProbeData::conforming_mezzanine_for_tests();
+        let measured = probe::MeasuredLoudness {
+            input_i: -18.0,
+            input_tp: -3.0,
+            input_lra: 6.0,
+            input_thresh: -28.0,
+            target_offset: 0.0,
+            is_linear: true,
+            target_i: -23.0,
+            target_tp: -1.0,
+            target_lra: 7.0,
+            is_silent: false,
+            is_short: false,
+        };
+        let policy = config::AudioPolicy::default(); // EBU R128 since slice 6d
+        let run = |out: &probe::ProbeData| {
+            run_qc_evaluation(
+                out,
+                &src,
+                true,
+                true,
+                false,
+                Some(&measured),
+                &policy,
+                &config::ValidationPolicy::default(),
+            )
+        };
+        let with = |i: f64, tp: f64| {
+            let mut out = probe::ProbeData::conforming_mezzanine_for_tests();
+            out.output_loudness = Some(probe::OutputLoudness {
+                integrated_lufs: i,
+                true_peak_dbtp: tp,
+            });
+            out
+        };
+        assert!(run(&with(-23.4, -1.2)).passed);
+        assert!(run(&with(-22.1, -0.6)).passed, "inside +/-1 LU and +0.5 dB");
+        let off = run(&with(-21.5, -1.5));
+        assert!(off.findings.iter().any(|f| f.code == "output_loudness_off_target"));
+        assert!(!off.passed);
+        let hot = run(&with(-23.0, -0.2));
+        assert!(hot.findings.iter().any(|f| f.code == "output_true_peak_exceeded"));
+
+        // Not re-measured: recorded, not silently passed.
+        let unverified = run(&probe::ProbeData::conforming_mezzanine_for_tests());
+        assert!(unverified.findings.iter().any(|f| f.code == "output_loudness_unverified"));
+
+        // A measure-only policy does not judge the level.
+        let analyze = config::AudioPolicy {
+            mode: config::AudioMode::AnalyzeOnly,
+            ..Default::default()
+        };
+        let report = run_qc_evaluation(
+            &with(-12.0, 0.0),
+            &src,
+            true,
+            true,
+            false,
+            Some(&measured),
+            &analyze,
+            &config::ValidationPolicy::default(),
+        );
+        assert!(report.passed);
+    }
+
+    #[test]
+    fn untone_mapped_hdr_is_a_warning_and_tone_mapped_hdr_is_recorded() {
+        let out = probe::ProbeData::conforming_mezzanine_for_tests();
+        let mut src = probe::ProbeData::conforming_mezzanine_for_tests();
+        src.color_transfer = "smpte2084".into();
+        src.ffmpeg_caps = Some(probe::FfmpegCaps::default());
+        let report = qc_with(&out, &src);
+        assert!(report.findings.iter().any(|f| f.code == "hdr_not_tonemapped"));
+        assert!(report.passed, "a warning, not a block");
+
+        src.ffmpeg_caps = Some(probe::FfmpegCaps {
+            zscale_tonemap: true,
+            soxr: false,
+        });
+        let report = qc_with(&out, &src);
+        assert!(report.findings.iter().any(|f| f.code == "hdr_tonemapped_to_sdr"));
+        assert_eq!(report.warnings_count, 0);
+    }
+
+    #[test]
     fn test_compute_gop_from_fps() {
         assert_eq!(compute_gop_from_fps(25.0), 50);
         assert_eq!(compute_gop_from_fps(29.97), 60);
@@ -3549,6 +3869,7 @@ mod tests {
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
             input_path: "input.mp4".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         }
     }
 
@@ -3975,6 +4296,7 @@ mod tests {
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
             input_path: "input.mp4".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
 
         let dummy_policy = config::AudioPolicy::default();
@@ -4031,6 +4353,7 @@ mod tests {
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
             input_path: "input.mp4".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
 
         let sidecar = identity::SidecarPayload::new(
@@ -4076,6 +4399,7 @@ mod tests {
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
             input_path: "input.mp4".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
 
         let loudness = identity::LoudnessInfo {
@@ -4262,6 +4586,7 @@ mod tests {
             audio_channels: 2,
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
 
         let val_report = identity::ValidationReport {
@@ -4324,6 +4649,7 @@ mod tests {
             audio_channels: 2,
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
         let policy = config::AudioPolicy::default();
 
@@ -4357,6 +4683,7 @@ mod tests {
             audio_channels: 2,
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
         let mut dummy_output = dummy_source.clone();
         dummy_output.duration_secs = 0.0; // Zero duration error
@@ -4685,6 +5012,7 @@ mod tests {
             field_order: "progressive".into(),
             display_aspect_ratio: "16:9".into(),
             input_path: "source.ts".into(),
+            ..probe::ProbeData::conforming_mezzanine_for_tests()
         };
 
         // 1000ms difference (e.g. PTS lead-in skew) within 1200ms tolerance -> Success

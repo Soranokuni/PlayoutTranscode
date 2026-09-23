@@ -142,14 +142,9 @@ pub fn transcode_file(
         config,
         &input_path.to_string_lossy(),
         &output_path.to_string_lossy(),
-        source_probe.fps_num,
-        source_probe.fps_den,
+        source_probe,
         audio_policy,
         measured_loudness,
-        source_probe.audio_channels,
-        source_probe.audio_sample_rate,
-        source_probe.height,
-        source_probe.is_interlaced(),
     ) {
         Ok(a) => a,
         Err(e) => {

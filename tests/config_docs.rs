@@ -67,7 +67,7 @@ fn the_documented_values_survive_a_round_trip() {
     assert_eq!(parsed.server.web_port, 4353);
     assert_eq!(parsed.ingestion.max_concurrency, 2);
     assert_eq!(parsed.logging.retain_days, 14);
-    assert_eq!(parsed.profile_a.maxrate, "15M");
+    assert_eq!(parsed.profile_a.maxrate, "20M");
 
     // The optional policy sections have to actually land, not be swallowed.
     let validation = parsed
@@ -296,7 +296,7 @@ fn section_defaults_match_their_field_defaults() {
     // And they are the real values, not empty strings that happen to match.
     assert_eq!(absent.server.web_port, 4353);
     assert_eq!(absent.server.bind_address, "127.0.0.1");
-    assert_eq!(absent.encoding.preset, "medium");
+    assert_eq!(absent.encoding.preset, "slow");
     assert_eq!(absent.encoding.audio_bitrate, "320k");
 }
 

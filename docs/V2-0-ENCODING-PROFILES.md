@@ -1,5 +1,55 @@
 # V2-0 Encoding Profiles — Frozen V1 FFmpeg Generation and Output Behavior
 
+> **Superseded for current behaviour by §0 below (slices 5 and 6).** §1–§8 are
+> kept as the record of what V1 did. The wire contract is unchanged: every
+> profile still reports `fps_num/fps_den = 25/1`, `duration_ms` still comes
+> from ffprobe of the output, trim semantics and paths are untouched.
+
+## 0. Current profiles (slices 5–6)
+
+**Routing** (`ProbeData::profile_id`, `src/probe.rs`). The scan is decided by
+an `idet` pass over up to 600 real frames (started 20% into files over 60 s),
+overruling the container flag when the counts are clear and consistent: PsF
+flagged `tt` is progressive, unflagged interlace is interlaced. The *motion
+rate* is the field rate of interlaced material and the frame rate
+(`avg_frame_rate` preferred) of progressive.
+
+| Motion rate | Height | Profile | Output |
+|---|---|---|---|
+| >= 40/s (1080i50, 1080p50, 720p50, 576i50, 59.94i/p) | any | **B** | 1080i50 TFF |
+| < 40/s (25p, 24p, 29.97p, 30p, VFR ~24) | >= 700 | **A** | 1080p25 |
+| < 40/s | < 700 | **C** | 1080p25 |
+
+**Picture paths** (`profiles::plan_video`):
+- A / C: `[bwdif=mode=send_frame]` (only if the source is interlaced) → `fps=25/1` → scale → pad.
+- B, 1080-line interlaced at 25 frames with no vertical resize: `fps=25/1` → `setfield` (+ `fieldorder=tff` for BFF) → `scale=...:interl=1` → pad. Fields are never deinterlaced.
+- B, everything else: `[bwdif=mode=send_field]` → `fps=50/1` → progressive scale to 4:2:2 → pad → `interlace=scan=tff:lowpass=complex` → field-aware 4:2:0 (`scale=interl=1`). 59.94 material is decimated to 50.
+- Every chain ends with `setparams` tagging BT.709 limited on the frames themselves.
+
+**Geometry**: DAR = width × SAR / height (container DAR if SAR is absent), snapped to 4:3 / 16:9 within 3%, fitted into 1920x1080 with `flags=lanczos+accurate_rnd+full_chroma_int`, centred even pad, `setsar=1`. 720x576 4:3 → 1440x1080; anamorphic 16:9 SD and HDV 1440x1080 → 1920x1080. 720x608 (D10/IMX) is cropped to 576 active lines keeping its DAR; 1088-line sources to 1080 keeping their SAR.
+
+**Colour**: scale `in_color_matrix` from the source tag (`bt709`; `smpte170m`/`bt470bg` → 601; `bt2020*`), untagged SD = 601, untagged HD = 709; `in_range` from the tag (or `yuvj*`), else limited; out BT.709 limited. All three profiles tag `bt709` primaries/transfer/matrix (C used to tag `smpte170m`). HDR (`smpte2084`, `arib-std-b67`) is tone-mapped with `zscale` + `tonemap=hable:desat=0` when the build has them; otherwise it is matrix-converted only.
+
+**Encoder** (defaults, measured in slice 6a): libx264 High@4.2 yuv420p, `preset=slow`, `tune=film`, CRF 22 / 21 / 18, maxrate/bufsize 20M/30M, 20M/30M, 5M/6M, `keyint=min-keyint=50`, `open-gop=0`, `scenecut=0`; B adds `interlaced=1:tff=1:pic-struct=1`, `-flags +ilme+ildct -field_order tt`. Input `-fflags +genpts+discardcorrupt`; `-filter_threads` = the per-encode thread share. `-video_track_timescale` is a multiple of the frame-rate numerator (1000 for 25/1).
+
+**Audio**: two or more mono source tracks are joined (tracks 1+2 → L/R) unless `dual_mono`; known multichannel layouts get a BS.775 matrix downmix, unknown/discrete ones take channels 1/2; no channel count fails. Every path starts with `aresample=[resampler=soxr:]osr=48000:async=1:min_hard_comp=0.1:first_pts=0` (soxr only when the build has libsoxr; `-async 1` is gone). Default policy EBU R128 (-23 LUFS / -1 dBTP) two-pass; linear whenever the projected true peak allows. `passthrough_validate` / `analyze_only` measure but never apply loudnorm.
+
+**Additional QC findings** (`processor::run_qc_evaluation`), blocking unless noted:
+
+| code | condition |
+|---|---|
+| `closed_gop_violation` | any keyframe interval longer than one GOP + ½ frame (previously only shorter ones failed); the last interval may be short |
+| `output_geometry_mismatch` | output is not 1920x1080 |
+| `output_pix_fmt_mismatch` | output is not yuv420p |
+| `output_color_tags_mismatch` | output not tagged bt709/bt709/bt709, range tv |
+| `output_field_order_mismatch` | B output not `tt`, A/C output not `progressive` |
+| `output_audio_channels_mismatch` | channel count differs from the policy's |
+| `output_loudness_off_target` | normalising policy, re-measured output > ±1 LU from target |
+| `output_true_peak_exceeded` | re-measured true peak > target + 0.5 dB |
+| `output_loudness_unverified` | warning: the re-measure did not run |
+| `hdr_not_tonemapped` | warning: HDR source, no zscale/tonemap in this ffmpeg |
+| `hdr_tonemapped_to_sdr` | info |
+
 Baseline: commit `f1b86cc5428b02b3cb24762598b0a4909e5d599d` (`main`).
 Reference code: `src/profiles.rs`, `src/encoder.rs`, `src/processor.rs`, `src/probe.rs`, `src/config.rs`.
 

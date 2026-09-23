@@ -73,7 +73,7 @@ jobs:
       - name: Count clippy warnings
         shell: bash
         env:
-          MAX_WARNINGS: 62
+          MAX_WARNINGS: 54
         run: |
           cargo clippy --all-targets --locked 2>&1 | tee clippy.log
           count=$(grep -c '^warning' clippy.log || true)

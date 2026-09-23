@@ -91,18 +91,25 @@ PlayoutTranscode provides professional, broadcast-standard audio normalization t
   - Integrated Loudness: **`-24.0 LUFS`** (configurable)
   - Maximum True Peak: **`-2.0 dBTP`**
   - Loudness Range (LRA): **`11.0 LU`**
-- **Legacy / Custom Mode**: Resamples to 48 kHz stereo with configurable bitrates (`aac`, `pcm_s16le`, `libmp3lame`).
+- **Legacy / Custom Mode** (`legacy_v1_encode`): no loudness processing; resampled to 48 kHz stereo with configurable bitrates (`aac`, `pcm_s16le`, `libmp3lame`). Kept only where a config names it explicitly.
+- **Measure only** (`passthrough_validate`, `analyze_only`): the source is measured and the result recorded in the sidecar, but the level is not changed.
+
+**Default: EBU R128** (-23 LUFS, -1 dBTP). With no `[audio_policy]` section, or one that omits `mode`, the service normalises; before this change it applied no loudness processing at all.
 
 ### 2. Two-Pass Measurement & Correction
 - **Pass 1 (Analysis)**: `RealLoudnessMeasurer` (`probe.rs`) runs FFmpeg with the `loudnorm` filter in JSON output mode, extracting exact `input_i`, `input_tp`, `input_lra`, and `input_thresh`.
-- **Pass 2 (Correction)**: `profiles.rs` injects the measured values into the encoding filterchain (`measured_I`, `measured_TP`, `measured_LRA`, `measured_thresh`, `offset`, `linear`) to perform linear gain adjustment without dynamic pumping or distortion.
+- **Pass 2 (Correction)**: `profiles.rs` injects the measured values into the encoding filterchain (`measured_I`, `measured_TP`, `measured_LRA`, `measured_thresh`, `offset`, `linear`). Linear (one static gain, no pumping) is requested whenever that gain keeps the projected true peak under target; otherwise loudnorm runs dynamically.
+- **QC re-measure**: the encoded track is measured again; more than +/-1 LU off target, or a true peak more than 0.5 dB over it, fails QC (`output_loudness_off_target`, `output_true_peak_exceeded`).
+- **Timing**: every path (AAC, PCM, MP3) resamples with `aresample=async=1:min_hard_comp=0.1:first_pts=0` to 48 kHz -- libsoxr when the ffmpeg build has it, swr otherwise.
 
 ### 3. Channel Mapping & ITU-R BS.775 Downmix
+- **Several mono tracks (MXF / XDCAM)**: tracks 1 and 2 are joined into L/R. `dual_mono = true` instead plays track 1 on both channels.
 - **Mono (1.0) $\rightarrow$ Dual Mono / Stereo**: `pan=stereo|c0=c0|c1=c0`
-- **5.1 Surround (6.0) $\rightarrow$ Stereo Downmix**:
+- **Known multichannel layouts** (3.0, quad, 5.0, 5.1, 6.1, 7.1, ...): matrix downmix, centre and surrounds at -3 dB, LFE dropped, normalised so neither side clips. 5.1:
   ```text
   pan=stereo|FL=0.4142*c0+0.2929*c2+0.2929*c4|FR=0.4142*c1+0.2929*c2+0.2929*c5
   ```
+- **Unknown / discrete layouts** (any channel count): channels 1 and 2 are the programme, `pan=stereo|c0=c0|c1=c1`. No channel count fails a job.
 - **Passthrough Mode**: Set `preserve_original = true` to preserve source multi-channel audio tracks.
 
 ---
@@ -111,15 +118,22 @@ PlayoutTranscode provides professional, broadcast-standard audio normalization t
 
 PlayoutTranscode provides three standard broadcast profiles configurable in `config.toml`:
 
-| Profile | Target Resolution | Scan Type | Color Matrix | FFmpeg Flags | Typical Use Case |
-|---|---|---|---|---|---|
-| **Profile A** | 1920x1080 | Progressive (CFR) | BT.709 | `-c:v libx264 -pix_fmt yuv420p -movflags +faststart` | HD progressive transmission & digital master |
-| **Profile B** | 1920x1080 | Interlaced (TFF) | BT.709 | `-c:v libx264 -flags +ilme+ildct -top 1 -pix_fmt yuv420p` | HD 1080i broadcast playout |
-| **Profile C** | 1920x1080 (pillarbox) | Progressive (CFR) | SMPTE 170M | `-vf "scale=1440:1080,pad=1920:1080:(ow-iw)/2:(oh-ih)/2"` | SD 4:3 archive upconversion |
+The CasparCG channel is 1080i50, so the profile is chosen by how much motion the source carries (field rate for interlaced, frame rate for progressive -- after an `idet` pass over real frames, not the container flag alone):
+
+| Profile | Chosen for | Output | Picture path |
+|---|---|---|---|
+| **Profile A** | HD progressive <= 30 fps (25p, 24p, 29.97p, UHD 30p) | 1080p25, BT.709 | drop/dup to 25p, DAR-fitted |
+| **Profile B** | anything at ~50 motion samples/s: 1080i50, 1080p50, 720p50, 576i50, 59.94i/p | 1080i50 TFF, BT.709 | 1080i50: fields kept as shot (BFF re-ordered). Others: `bwdif` one frame per field, `fps=50`, scale, `interlace=scan=tff:lowpass=complex` |
+| **Profile C** | SD progressive <= 30 fps | 1080p25, BT.709 | upconverted, pillarboxed per DAR |
+
+All three report **`fps_num/fps_den = 25/1`** (B: 25 interlaced frames = 50 fields). No source rate is preserved; that is deliberate, since everything plays on one 1080i50 channel.
 
 ### Common Stream Properties (All Profiles)
-- **Video Codec**: `libx264` (CRF-based, closed GOP: 50 frames @ 25fps / 60 frames @ 29.97fps)
-- **Audio Codec**: AAC / PCM stereo at **48,000 Hz** (EBU R128 / ATSC A/85 normalized)
+- **Video Codec**: `libx264` High@4.2 4:2:0 8-bit, CRF + VBV cap, closed GOP of 50 frames (2 s), no scene-cut keyframes. Defaults: `preset = "slow"`, CRF 22 / 21 / 18, caps 20M/30M, 20M/30M, 5M/6M (about 1.27x the size of the V1 defaults for +0.8 dB SSIM).
+- **Geometry**: display aspect from SAR/DAR, fitted into 1920x1080 with lanczos: 4:3 SD -> 1440x1080 pillarbox, anamorphic 16:9 SD and HDV -> full 1920x1080. 608-line IMX and 1088-line sources are cropped to their active picture first.
+- **Colour**: converted to BT.709 limited range from the source matrix (untagged SD is taken as BT.601, untagged HD as BT.709) and tagged bt709 on every profile. HDR (PQ / HLG) is tone-mapped with `zscale` + `tonemap=hable` when the ffmpeg build has libzimg; otherwise it is encoded untone-mapped and QC warns `hdr_not_tonemapped`.
+- **Audio Codec**: AAC / PCM stereo at **48,000 Hz** (EBU R128 by default)
+- **QC** also fails a mezzanine that is not 1920x1080 yuv420p, not tagged BT.709 limited, has the wrong field order for its profile, the wrong channel count, or a keyframe gap longer than one GOP.
 - **Container**: MP4 with faststart enabled (`moov` atom at file beginning)
 
 ---
@@ -233,7 +247,8 @@ allowed_origins = []
 api_token = ""
 
 [encoding]
-preset = "medium"
+# x264 preset. "slow" is the measured default (see Broadcast Encoding Profiles).
+preset = "slow"
 # 0 = derive from cpu_cores and ingestion.max_concurrency.
 ffmpeg_threads = 0
 # 0 = all logical cores.
@@ -246,21 +261,23 @@ analyzeduration = "500M"
 
 # One section per broadcast profile. The profile is chosen automatically from
 # the source probe; these set its rate control.
+# A = HD progressive -> 1080p25. B = 1080i50 out (1080i50, 50p, 576i, 59.94).
+# C = SD progressive -> 1080p25.
 [profile_a]
 enabled = true
-crf = 24
-maxrate = "15M"
-bufsize = "16M"
+crf = 22
+maxrate = "20M"
+bufsize = "30M"
 
 [profile_b]
 enabled = true
-crf = 23
-maxrate = "15M"
-bufsize = "16M"
+crf = 21
+maxrate = "20M"
+bufsize = "30M"
 
 [profile_c]
 enabled = true
-crf = 20
+crf = 18
 maxrate = "5M"
 bufsize = "6M"
 
@@ -308,6 +325,9 @@ verify_on_startup = true
 # Expected SHA-256 of the FFmpeg release archive. The in-app download is
 # DISABLED until this is set - an unpinned executable download is not
 # acceptable on a broadcast host. Install manually if you prefer.
+# The download is pinned to gyan.dev FFmpeg 9.0.2 essentials (x86_64; has
+# libzimg for HDR tone mapping, no libsoxr). Its published digest is
+# 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
 download_sha256 = ""
 
 [validation_policy]
@@ -337,17 +357,28 @@ retry_delay_ms = 2000
 auto_retry_on_start = true
 
 [audio_policy]
-# Options: "ebu_r128", "atsc_a85", "legacy_v1_encode", "passthrough_validate"
+# Options: "ebu_r128" (default, also when this section or `mode` is absent),
+# "atsc_a85", "passthrough_validate" / "analyze_only" (measure, do not
+# change the level), "legacy_v1_encode" (no loudness processing).
 mode = "ebu_r128"
 codec = "aac"
 bitrate = "320k"
+# Output sample rate. QC's enforce_48k_audio flags anything but 48000.
 sample_rate_hz = 48000
+# 1 or 2. Ignored for a >2-channel source when preserve_original is true.
 channels = 2
+# Optional: "mono" / "stereo" (must agree with channels), or a multichannel
+# layout ("5.1", "5.1(side)", "7.1") to tag a preserved track with.
+# channel_layout = "stereo"
 target_lufs = -23.0
 true_peak_dbtp = -1.0
 lra_target = 7.0
+# Several mono source tracks: false joins tracks 1+2 into L/R, true plays
+# track 1 on both channels.
 dual_mono = false
-preserve_original_track = false
+# Keep a >2-channel source's channels instead of downmixing to stereo.
+# (Also accepted under its old name, preserve_original_track.)
+preserve_original = false
 ```
 
 ### Logs
