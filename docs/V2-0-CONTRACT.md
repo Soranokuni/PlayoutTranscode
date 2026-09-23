@@ -245,7 +245,9 @@ CREATE INDEX IF NOT EXISTS idx_media_assets_fingerprint ON media_assets(fingerpr
   - `missing` — a `ready` asset whose mezzanine is no longer on disk. Set and
     cleared by a reconcile pass at startup and every 120 s, in both directions:
     a file that comes back (a remounted share) returns to `ready`. Counted on
-    `/api/v2/diagnostics` as `metrics.missing_assets`.
+    `/api/v2/diagnostics` as `metrics.missing_assets`. Alongside it,
+    `metrics.unverified_keyframe_assets` counts `ready` assets published before
+    T-7 whose keyframe list is still empty; they stay `ready` (W-5).
 
     Clients must treat `missing` as not airable. It exists because the registry
     could previously say `ready` about a file that was not there, and the first
@@ -303,7 +305,8 @@ CREATE INDEX IF NOT EXISTS idx_media_assets_fingerprint ON media_assets(fingerpr
   current key onto them.
 
   Held-back assets are counted on `/api/v2/diagnostics` as
-  `metrics.permanently_failed_assets`, and the startup log says how many were
+  `metrics.permanently_failed_assets` (operator-cleared verdicts are not
+  counted: they are no longer held back), and the startup log says how many were
   not queued and what to change to have them re-examined.
 - Purge (`purge_asset_completely`, `src/db.rs:487-514`): deletes the row; deletes the physical file **only when no remaining row references the path** — subclips sharing the mezzanine are preserved.
 - Folder color upsert: `ON CONFLICT(virtual_folder) DO UPDATE` (`src/db.rs:625-639`).

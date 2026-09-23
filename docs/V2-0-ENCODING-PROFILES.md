@@ -120,7 +120,7 @@ No loudness processing, no channel-layout preservation, no passthrough, no mono/
 | `audio_sample_rate_not_48k: got N Hz` | output audio sample rate ≠ 48000 | no — warning only |
 | `closed_gop_violation` | keyframe spacing not uniform at ≤ 2 s interval (tolerance half frame; fewer than 2 keyframes passes) | no — warning only |
 | `missing_faststart` | "moov" atom not found in first 64 KiB | no — warning only |
-| `trim_in_not_keyframe_aligned` (subclip API only, `src/server.rs:917-930`) | subclip trim_in not within half a frame of a keyframe | n/a — sets subclip `mezzanine_ok=false` |
+| `trim_in_not_keyframe_aligned` (subclip API, `db::subclip_keyframe_warnings`; re-judged by the keyframe backfill, W-5) | subclip trim_in not within half a frame of a parent keyframe | no — advisory; the sub-clip inherits the parent's `mezzanine_ok` |
 
 **Observed publication semantics:** in the current code these checks only produce warnings. `db::mark_ready` is called regardless with the `mezzanine_ok` flag, so an asset can be published with `status="ready"` and `mezzanine_ok=false`. Hard failures that route to `status="error"` + output deletion are: probe failure, encode failure, missing/zero-byte output, and duration mismatch beyond tolerance (`src/processor.rs:358-371`). V2 (AGENTS.md "Bold Rule") intends stricter ready semantics; that is a future, deliberate change — not V2-0.
 

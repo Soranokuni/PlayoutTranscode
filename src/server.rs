@@ -1233,9 +1233,29 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
     // Media the service has stopped retrying because the same bytes under the
     // same settings already failed. Visible so that "nothing is happening to my
     // file" has an answer that is not "the watcher is broken".
+    //
+    // W-5. An operator-cleared verdict is not held back -- it keeps a non-NULL
+    // marker only so it stays out of the legacy lookup -- so it is not counted.
+    // Same definition as `db::is_retry_suppressed`, the badge's source.
     let permanently_failed_assets = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM media_assets
-         WHERE status = 'error' AND qc_verdict_key IS NOT NULL AND deleted_at IS NULL",
+         WHERE status = 'error' AND qc_verdict_key IS NOT NULL AND qc_verdict_key <> ?1
+           AND deleted_at IS NULL",
+    )
+    .bind(db::QC_VERDICT_CLEARED)
+    .fetch_one(&*state.pool)
+    .await
+    .unwrap_or(-1);
+
+    // W-5. `ready` assets with no keyframe evidence: published before T-7 made
+    // an empty scan blocking, and the backfill's re-scan has not succeeded
+    // since. Reported, not demoted -- `keyframe_scan_failed` is environmental,
+    // and a startup ffprobe hiccup must not pull assets that are already in
+    // rundowns off air. Non-zero is a reason to look, not an outage.
+    let unverified_keyframe_assets = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM media_assets
+         WHERE status = 'ready' AND deleted_at IS NULL
+           AND keyframe_offsets_json IN ('[]', '')",
     )
     .fetch_one(&*state.pool)
     .await
@@ -1268,6 +1288,7 @@ async fn get_diagnostics(State(state): State<ServerState>) -> impl IntoResponse 
             // -1 means the count could not be read, not "none missing".
             "missing_assets": missing_assets,
             "permanently_failed_assets": permanently_failed_assets,
+            "unverified_keyframe_assets": unverified_keyframe_assets,
             "pending_jobs": all_jobs.iter().filter(|j| j.state == JobState::Pending).count(),
             "active_jobs": all_jobs.iter().filter(|j| j.state == JobState::Processing).count(),
             "completed_jobs": all_jobs.iter().filter(|j| j.state == JobState::Completed).count(),
@@ -2587,51 +2608,6 @@ async fn put_tp(
     }
 }
 
-/// Does a sub-clip's IN point land on one of its parent's keyframes?
-///
-/// Returns the warnings to record against the new row -- empty when it does, or
-/// when there is nothing to check against.
-///
-/// Two things this must not do:
-///
-/// * **Warn on the strength of a keyframe list that does not exist.** The guard
-///   used to be `!parent.keyframe_offsets_json.is_empty()`, which tests the
-///   *string*, and the column's default is the two characters `[]`. So for a
-///   parent whose keyframe scan produced nothing -- there is one such asset in
-///   the registry today, `mezzanine_ok = 1` and all -- the guard passed, the
-///   parsed list was empty, `any()` found nothing, and every sub-clip of it was
-///   stamped not-keyframe-aligned on no evidence at all (T-7). An unverified
-///   parent earns silence, not a verdict; the `keyframe_scan_failed` finding is
-///   where that fact now lives.
-/// * **Snap the IN point.** It does not, and the reliability audit was wrong to
-///   say it did. CasparCG's FFmpeg producer seeks to the preceding keyframe and
-///   decodes forward, so a non-keyframe IN is frame-accurate anyway; raising it
-///   would silently cut programme. The warning is advisory and that is all.
-fn subclip_keyframe_warnings(
-    parent_mezzanine_ok: bool,
-    parent_offsets: &[i64],
-    parent_fps: f64,
-    trim_in_ms: i64,
-) -> Vec<String> {
-    if !parent_mezzanine_ok || parent_offsets.is_empty() {
-        return Vec::new();
-    }
-    let frame_ms = if parent_fps > 0.0 {
-        1000.0 / parent_fps
-    } else {
-        40.0
-    };
-    let tolerance = frame_ms * 0.5;
-    let aligned = parent_offsets
-        .iter()
-        .any(|&kf| (kf - trim_in_ms).abs() as f64 <= tolerance);
-    if aligned {
-        Vec::new()
-    } else {
-        vec!["trim_in_not_keyframe_aligned".to_string()]
-    }
-}
-
 async fn post_subclip(
     State(state): State<ServerState>,
     AssetId(uuid): AssetId,
@@ -2711,7 +2687,7 @@ async fn post_subclip(
         parent.fps
     };
     let sub_mezzanine_ok = parent.mezzanine_ok;
-    let sub_warnings = subclip_keyframe_warnings(
+    let sub_warnings = db::subclip_keyframe_warnings(
         parent.mezzanine_ok,
         &parent_offsets,
         parent_fps,
@@ -3993,14 +3969,14 @@ mod tests {
         let offsets = [0_i64, 2000, 4000, 6000];
 
         // 0 is the most common sub-clip IN there is, and it is a keyframe.
-        assert!(subclip_keyframe_warnings(true, &offsets, 25.0, 0).is_empty());
-        assert!(subclip_keyframe_warnings(true, &offsets, 25.0, 4000).is_empty());
+        assert!(db::subclip_keyframe_warnings(true, &offsets, 25.0, 0).is_empty());
+        assert!(db::subclip_keyframe_warnings(true, &offsets, 25.0, 4000).is_empty());
         // Within half a frame either side.
-        assert!(subclip_keyframe_warnings(true, &offsets, 25.0, 2015).is_empty());
+        assert!(db::subclip_keyframe_warnings(true, &offsets, 25.0, 2015).is_empty());
 
         // And a genuinely off-keyframe IN still says so.
         assert_eq!(
-            subclip_keyframe_warnings(true, &offsets, 25.0, 3000),
+            db::subclip_keyframe_warnings(true, &offsets, 25.0, 3000),
             vec!["trim_in_not_keyframe_aligned".to_string()]
         );
     }
@@ -4013,7 +3989,7 @@ mod tests {
     fn the_pre_backfill_offsets_are_what_made_the_warning_wrong() {
         let corrupt = [2000_i64, 4000, 6000];
         assert_eq!(
-            subclip_keyframe_warnings(true, &corrupt, 25.0, 0),
+            db::subclip_keyframe_warnings(true, &corrupt, 25.0, 0),
             vec!["trim_in_not_keyframe_aligned".to_string()],
             "documents the old behaviour this fix and its backfill exist to undo"
         );
@@ -4025,8 +4001,8 @@ mod tests {
     /// such a parent.
     #[test]
     fn a_parent_with_no_keyframes_does_not_warn_about_alignment() {
-        assert!(subclip_keyframe_warnings(true, &[], 25.0, 3000).is_empty());
+        assert!(db::subclip_keyframe_warnings(true, &[], 25.0, 3000).is_empty());
         // Nor does an unverified parent.
-        assert!(subclip_keyframe_warnings(false, &[0, 2000], 25.0, 3000).is_empty());
+        assert!(db::subclip_keyframe_warnings(false, &[0, 2000], 25.0, 3000).is_empty());
     }
 }

@@ -1061,6 +1061,18 @@ produced no offsets passed the GOP test by default and the asset was published
 flagged as verified. A failed scan is now a blocking `keyframe_scan_failed`
 finding, so such an asset is `error`, not `ready`.
 
+Assets published **before** this change are not demoted: the keyframe backfill
+re-scans them at startup and fills in the list. One whose re-scan keeps failing
+stays `ready` with an empty list, and is counted on `/api/v2/diagnostics` as
+`metrics.unverified_keyframe_assets` (W-5; `-1` means the count could not be
+read). They are not pulled because `keyframe_scan_failed` is environmental — a
+busy or missing ffprobe at startup — and demoting on it would take assets
+already in rundowns off air. Non-zero is a reason to look, not an outage.
+
+Re-running the backfill also re-judges `trim_in_not_keyframe_aligned` on every
+sub-clip of a corrected file, so a warning computed from the old offsets does
+not outlive them.
+
 A related bug in the opposite direction: the sub-clip alignment check guarded on
 `!keyframe_offsets_json.is_empty()`, which tests the **string**, and the column's
 default is the two characters `[]`. So for a parent with no keyframes the guard

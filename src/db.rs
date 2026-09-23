@@ -1369,13 +1369,69 @@ pub async fn keyframe_rescan_targets(
     Ok(targets)
 }
 
+/// Does a sub-clip's IN point land on one of its parent's keyframes?
+///
+/// Returns the warnings to record against the new row -- empty when it does, or
+/// when there is nothing to check against.
+///
+/// Two things this must not do:
+///
+/// * **Warn on the strength of a keyframe list that does not exist.** The guard
+///   used to be `!parent.keyframe_offsets_json.is_empty()`, which tests the
+///   *string*, and the column's default is the two characters `[]`. So for a
+///   parent whose keyframe scan produced nothing -- there is one such asset in
+///   the registry today, `mezzanine_ok = 1` and all -- the guard passed, the
+///   parsed list was empty, `any()` found nothing, and every sub-clip of it was
+///   stamped not-keyframe-aligned on no evidence at all (T-7). An unverified
+///   parent earns silence, not a verdict; the `keyframe_scan_failed` finding is
+///   where that fact now lives.
+/// * **Snap the IN point.** It does not, and the reliability audit was wrong to
+///   say it did. CasparCG's FFmpeg producer seeks to the preceding keyframe and
+///   decodes forward, so a non-keyframe IN is frame-accurate anyway; raising it
+///   would silently cut programme. The warning is advisory and that is all.
+pub fn subclip_keyframe_warnings(
+    parent_mezzanine_ok: bool,
+    parent_offsets: &[i64],
+    parent_fps: f64,
+    trim_in_ms: i64,
+) -> Vec<String> {
+    if !parent_mezzanine_ok || parent_offsets.is_empty() {
+        return Vec::new();
+    }
+    let frame_ms = if parent_fps > 0.0 {
+        1000.0 / parent_fps
+    } else {
+        40.0
+    };
+    let tolerance = frame_ms * 0.5;
+    let aligned = parent_offsets
+        .iter()
+        .any(|&kf| (kf - trim_in_ms).abs() as f64 <= tolerance);
+    if aligned {
+        Vec::new()
+    } else {
+        vec!["trim_in_not_keyframe_aligned".to_string()]
+    }
+}
+
 /// Write corrected keyframes onto every row that plays one file.
+///
+/// W-5. The sub-clips on that file are re-judged against the corrected list
+/// in the same transaction. `trim_in_not_keyframe_aligned` was computed from
+/// the broken offsets when the sub-clip was cut, so rewriting the offsets
+/// without it left a warning that could be wrong in either direction: stale
+/// on an IN that is in fact on a keyframe, or missing on one cut from a
+/// parent whose list was empty (T-7, which earns silence rather than a
+/// verdict). Selected by parent or by the warning itself, so a legacy
+/// sub-clip that T-2b could not adopt is still covered.
 pub async fn apply_keyframe_rescan(
     pool: &SqlitePool,
     current_path: &str,
     keyframe_safe_start_ms: i64,
     keyframe_offsets_json: &str,
 ) -> Result<u64, sqlx::Error> {
+    const CODE: &str = "trim_in_not_keyframe_aligned";
+    let mut tx = pool.begin().await?;
     let result = sqlx::query(
         "UPDATE media_assets SET keyframe_safe_start_ms = ?1, keyframe_offsets_json = ?2
          WHERE current_path = ?3 AND deleted_at IS NULL",
@@ -1383,8 +1439,47 @@ pub async fn apply_keyframe_rescan(
     .bind(keyframe_safe_start_ms)
     .bind(keyframe_offsets_json)
     .bind(current_path)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+
+    let offsets: Vec<i64> = serde_json::from_str(keyframe_offsets_json).unwrap_or_default();
+    let subclips: Vec<(String, i64, bool, i64, i64, f64, String)> = sqlx::query_as(
+        "SELECT uuid, trim_in_ms, mezzanine_ok, fps_num, fps_den, fps, warnings
+         FROM media_assets
+         WHERE current_path = ?1 AND deleted_at IS NULL
+           AND (parent_uuid IS NOT NULL OR warnings LIKE '%' || ?2 || '%')",
+    )
+    .bind(current_path)
+    .bind(CODE)
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut rejudged = 0;
+    for (uuid, trim_in_ms, mezzanine_ok, fps_num, fps_den, fps, warnings) in subclips {
+        let before: Vec<String> = serde_json::from_str(&warnings).unwrap_or_default();
+        let fps = if fps_den > 0 {
+            fps_num as f64 / fps_den as f64
+        } else {
+            fps
+        };
+        let mut after: Vec<String> = before.iter().filter(|w| *w != CODE).cloned().collect();
+        after.extend(subclip_keyframe_warnings(mezzanine_ok, &offsets, fps, trim_in_ms));
+        if after != before {
+            sqlx::query("UPDATE media_assets SET warnings = ?1 WHERE uuid = ?2")
+                .bind(serde_json::to_string(&after).unwrap_or_else(|_| "[]".to_string()))
+                .bind(&uuid)
+                .execute(&mut *tx)
+                .await?;
+            rejudged += 1;
+        }
+    }
+    tx.commit().await?;
+    if rejudged > 0 {
+        tracing::info!(
+            "Keyframe backfill: re-judged keyframe alignment on {} sub-clip(s) of {}",
+            rejudged,
+            current_path
+        );
+    }
     Ok(result.rows_affected())
 }
 
@@ -5310,6 +5405,51 @@ mod tests {
 
         // Idempotent: the next start is a no-op, not a second failure.
         run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W-5. Correcting a file's keyframes re-judges its sub-clips' alignment
+    /// warning, in both directions, and leaves every other warning alone.
+    #[tokio::test]
+    async fn a_keyframe_rescan_rejudges_subclip_alignment() {
+        let (pool, dir) = setup_test_pool().await;
+        sqlx::query(
+            "INSERT INTO media_assets
+               (uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms,
+                trim_out_ms, status, mezzanine_ok, fps_num, fps_den, fps,
+                keyframe_offsets_json, warnings, parent_uuid)
+             VALUES
+               ('parent', 1, 'aa', 'D:/m/a.mp4', 8000, 0, 8000, 'ready', 1, 25, 1, 25.0,
+                '[2000,4000,6000]', '[\"fps_converted\"]', NULL),
+               -- Cut at 0 against the broken list: flagged, but 0 is a keyframe.
+               ('stale', 1, NULL, 'D:/m/a.mp4', 8000, 0, 3000, 'ready', 1, 25, 1, 25.0,
+                '[2000,4000,6000]', '[\"fps_converted\",\"trim_in_not_keyframe_aligned\"]',
+                'parent'),
+               -- Really off a keyframe, and never flagged.
+               ('unflagged', 1, NULL, 'D:/m/a.mp4', 8000, 3000, 5000, 'ready', 1, 25, 1, 25.0,
+                '[]', '[]', 'parent'),
+               -- A legacy sub-clip T-2b could not adopt: found by its warning.
+               ('orphan', 1, NULL, 'D:/m/a.mp4', 8000, 4010, 6000, 'ready', 1, 25, 1, 25.0,
+                '[2000,4000,6000]', '[\"trim_in_not_keyframe_aligned\"]', NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let n = apply_keyframe_rescan(&pool, "D:/m/a.mp4", 0, "[0,2000,4000,6000]")
+            .await
+            .unwrap();
+        assert_eq!(n, 4);
+
+        let w = |uuid: &'static str| {
+            let pool = pool.clone();
+            async move { find_by_uuid(&pool, uuid).await.unwrap().unwrap().warnings }
+        };
+        assert_eq!(w("stale").await, r#"["fps_converted"]"#, "stale warning cleared, the rest kept");
+        assert_eq!(w("unflagged").await, r#"["trim_in_not_keyframe_aligned"]"#);
+        assert_eq!(w("orphan").await, "[]", "4010 ms is within half a frame of 4000");
+        assert_eq!(w("parent").await, r#"["fps_converted"]"#, "a full-length row is not judged");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
