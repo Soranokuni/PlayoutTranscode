@@ -503,6 +503,38 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
         }
     }
 
+    // T-5. `status = 'ready'` with `mezzanine_ok = 0` is a contradiction the
+    // contract never defined, and its three readers each resolved it
+    // differently: PlayOut's v2 library mapping said `error`, its v1 and batch
+    // paths said `ready`, and this service's own dedupe said "not usable" and
+    // re-transcoded forever. The same asset was red on one half of the
+    // operator's screen and green on the other.
+    //
+    // A QC-failed mezzanine is `error`. That is what PlayOut's v2 mapping
+    // already assumes, so nothing downstream has to change, and it gives the
+    // dedupe a signal it reads correctly.
+    //
+    // W-1. This must run before the sub-clip adoption below. `init_pool` has
+    // already installed the `ready => mezzanine_ok` triggers, and a sub-clip cut
+    // from a QC-failed parent inherited `ready / mezzanine_ok = 0`. Adopting it
+    // first is an UPDATE on a row the trigger rejects: the migration aborts,
+    // `app.rs` refuses to start, and the demote that would have fixed the row
+    // never runs -- so every restart fails the same way.
+    {
+        let demoted = sqlx::query(
+            "UPDATE media_assets SET status = 'error' WHERE status = 'ready' AND mezzanine_ok = 0",
+        )
+        .execute(pool)
+        .await?;
+        if demoted.rows_affected() > 0 {
+            tracing::warn!(
+                "Demoted {} asset(s) that were 'ready' with a failed mezzanine to 'error' \
+                 (T-5); they were never safe to air",
+                demoted.rows_affected()
+            );
+        }
+    }
+
     // T-2b. Adopt the sub-clips that predate `parent_uuid`.
     //
     // A sub-clip is recognisable by its trim window and by sharing a
@@ -533,31 +565,6 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
             tracing::info!(
                 "Adopted {} pre-existing sub-clip row(s) onto parent_uuid",
                 adopted.rows_affected()
-            );
-        }
-    }
-
-    // T-5. `status = 'ready'` with `mezzanine_ok = 0` is a contradiction the
-    // contract never defined, and its three readers each resolved it
-    // differently: PlayOut's v2 library mapping said `error`, its v1 and batch
-    // paths said `ready`, and this service's own dedupe said "not usable" and
-    // re-transcoded forever. The same asset was red on one half of the
-    // operator's screen and green on the other.
-    //
-    // A QC-failed mezzanine is `error`. That is what PlayOut's v2 mapping
-    // already assumes, so nothing downstream has to change, and it gives the
-    // dedupe a signal it reads correctly.
-    {
-        let demoted = sqlx::query(
-            "UPDATE media_assets SET status = 'error' WHERE status = 'ready' AND mezzanine_ok = 0",
-        )
-        .execute(pool)
-        .await?;
-        if demoted.rows_affected() > 0 {
-            tracing::warn!(
-                "Demoted {} asset(s) that were 'ready' with a failed mezzanine to 'error' \
-                 (T-5); they were never safe to air",
-                demoted.rows_affected()
             );
         }
     }
@@ -595,6 +602,20 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
         .max_connections(5)
         .connect_with(options)
         .await?;
+    let pool = init_schema(pool).await?;
+
+    tracing::info!(
+        "Database initialized at {} (WAL mode, media_assets ready)",
+        db_path.display()
+    );
+
+    Ok(pool)
+}
+
+/// The additive half of [`init_pool`], on a pool that is already connected.
+/// Split out so the migration tests can build the real schema -- triggers
+/// included -- on an in-memory database.
+async fn init_schema(pool: SqlitePool) -> Result<SqlitePool, sqlx::Error> {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS media_assets (
             uuid         TEXT PRIMARY KEY,
@@ -843,11 +864,6 @@ pub async fn init_pool(db_path: &Path) -> Result<SqlitePool, sqlx::Error> {
     ] {
         let _ = sqlx::query(idx).execute(&pool).await;
     }
-
-    tracing::info!(
-        "Database initialized at {} (WAL mode, media_assets ready)",
-        db_path.display()
-    );
 
     Ok(pool)
 }
@@ -5082,6 +5098,60 @@ mod tests {
             find_by_uuid(&pool, "legacy").await.unwrap().unwrap().status,
             "error"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// W-1. A sub-clip cut from a QC-failed parent before T-5 inherited
+    /// `ready / mezzanine_ok = 0`. With the triggers installed, adopting it onto
+    /// `parent_uuid` before demoting it aborted the migration -- on every
+    /// start, because the demote never got to run.
+    #[tokio::test]
+    async fn subclip_of_a_qc_failed_parent_does_not_block_the_migration() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let pool = init_schema(pool).await.unwrap();
+
+        // The registry as a pre-T-5 version left it on disk: written past the
+        // triggers, which the new version then installs on open.
+        for t in [
+            "trg_media_assets_ready_requires_mezzanine_insert",
+            "trg_media_assets_ready_requires_mezzanine_update",
+        ] {
+            sqlx::query(&format!("DROP TRIGGER {t}"))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO media_assets
+               (uuid, fingerprint, source_sha256, current_path, duration_ms,
+                trim_in_ms, trim_out_ms, status, mezzanine_ok)
+             VALUES
+               ('parent', 1, 'aa', 'D:/media/a.mp4', 60000, 0, 60000, 'ready', 0),
+               ('sub',    1, NULL, 'D:/media/a.mp4', 60000, 10117, 23814, 'ready', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pool = init_schema(pool).await.unwrap();
+
+        // A path whose backup folder is scratch: the pre-migration snapshot fires.
+        let dir = std::env::temp_dir().join(format!("pt_test_w1_{}", uuid::Uuid::new_v4()));
+        run_data_migrations(&pool, &dir.join("test.db"))
+            .await
+            .expect("the migration must not trip the ready => mezzanine_ok trigger");
+
+        let sub = find_by_uuid(&pool, "sub").await.unwrap().unwrap();
+        assert_eq!(sub.status, "error");
+        assert_eq!(sub.parent_uuid.as_deref(), Some("parent"), "and it is still adopted");
+        assert_eq!(find_by_uuid(&pool, "parent").await.unwrap().unwrap().status, "error");
+
+        // Idempotent: the next start is a no-op, not a second failure.
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
 
         let _ = std::fs::remove_dir_all(&dir);
     }
