@@ -55,7 +55,9 @@ pub fn interrupt_scope(check: InterruptCheck) -> InterruptScope {
     InterruptScope { previous }
 }
 
-fn interrupted() -> bool {
+/// Has this thread's job been cancelled or its run stopped? For loops that
+/// do their own work rather than wait on a child.
+pub fn interrupted() -> bool {
     INTERRUPT.with(|slot| slot.borrow().as_ref().map(|f| f()).unwrap_or(false))
 }
 

@@ -648,9 +648,13 @@ pub fn start_processing_loop(
                         // A file the watcher offered may already have a pending
                         // record -- one recovered at startup, or one a retry
                         // re-queued. Adopt it rather than creating a duplicate.
-                        let existing = jobs
-                            .find_pending_by_input_path(&path.to_string_lossy())
-                            .map(|j| j.id);
+                        let existing = jobs.find_pending_by_input_path(&path.to_string_lossy());
+                        // Already shown as waiting for a slot, with a task
+                        // behind it: a second dispatch would process it twice.
+                        if existing.as_ref().is_some_and(|j| j.waiting_for_slot) {
+                            continue;
+                        }
+                        let existing = existing.map(|j| j.id);
                         dispatch_one(&tools, &cfg, &jobs, &target, &sem, &pool, &active_pids, path, existing, &gate, generation);
                     }
                     Some(retry) = retry_rx.recv() => {
@@ -742,12 +746,37 @@ fn dispatch_one(
     let p = pool.clone();
     let apids = active_pids.clone();
     let gate = gate.clone();
-    let existing = existing_job_id.and_then(|id| jobs.get(&id));
+    let mut existing = existing_job_id.and_then(|id| jobs.get(&id));
+
+    // Handoff #5. A fresh file only got a job record once its task held a
+    // slot, so everything queued behind a running encode was invisible and
+    // could not be cancelled. It is shown now, as soon as it has to wait; the
+    // processor adopts the record like any other.
+    let ready_permit = s.clone().try_acquire_owned().ok();
+    let mut forget_on_exit = None;
+    if ready_permit.is_none() && existing.is_none() {
+        let job = crate::jobs::JobRecord::new(&path.to_string_lossy(), "pending");
+        let id = job.id.clone();
+        jobs.push_waiting(job);
+        existing = jobs.get(&id);
+        forget_on_exit = Some(ForgetWaiting {
+            queue: jobs.clone(),
+            id,
+        });
+    }
 
     tokio::spawn(async move {
+        // Dropped on every way out of this task, including the runtime
+        // dropping it mid-wait at a stop: a record still only waiting then
+        // goes, instead of sitting Queued until the process restarts.
+        let _forget_on_exit = forget_on_exit;
         // Wait for an available concurrency slot without blocking the main event loop
-        let Ok(permit) = s.acquire_owned().await else {
-            return;
+        let permit = match ready_permit {
+            Some(p) => p,
+            None => match s.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return,
+            },
         };
 
         // If the service stopped -- or stopped and started again -- while this
@@ -781,6 +810,19 @@ fn dispatch_one(
         })
         .await;
     });
+}
+
+/// Takes a waiting-for-a-slot record off the queue when its dispatch task
+/// ends without the processor having adopted it.
+struct ForgetWaiting {
+    queue: JobQueue,
+    id: String,
+}
+
+impl Drop for ForgetWaiting {
+    fn drop(&mut self) {
+        self.queue.forget_waiting(&self.id);
+    }
 }
 
 /// Ask the processing loop to stop, and reap it.

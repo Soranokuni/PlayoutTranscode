@@ -86,6 +86,10 @@ export const ERROR_CATEGORIES: Record<string, ErrorCategoryInfo> = {
     label: 'Cancelled',
     hint: 'An operator cancelled this job. Nothing was published.',
   },
+  held_after_cancel: {
+    label: 'Cancelled earlier',
+    hint: 'You cancelled this file, so it was not ingested again at start-up. Ingest it now, or leave it; you will not be asked again for this file.',
+  },
   // Legacy: the server has not produced this since Skipped became a phase
   // (T2-6), but old rows in the registry still carry it.
   duplicate_skipped: {

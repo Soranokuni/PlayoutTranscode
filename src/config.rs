@@ -454,8 +454,9 @@ impl Default for ProfileConfig {
 /// ~1.2-1.3x V1's file size (see `default_preset`). The HD caps go from
 /// 15M/16M to 20M/30M: the 16 Mbit buffer was barely one second at the cap,
 /// so hard cuts were starved to hold it, and 20 Mb/s is still a third of
-/// High@4.2's 62.5 Mb/s. C keeps 5M/6M: at CRF 18 an SD upconversion
-/// measured 1.17-1.31x V1 inside it.
+/// High@4.2's 62.5 Mb/s. C goes from 5M/6M to 8M/12M: at CRF 18 the 5M cap
+/// bound on busy SD (1.17-1.31x V1 measured against it), and the output is a
+/// 1920x1080 raster, not SD. 12M keeps the same 1.5 s buffer as A and B.
 impl ProfileConfig {
     pub fn profile_a_default() -> Self {
         Self {
@@ -477,8 +478,8 @@ impl ProfileConfig {
         Self {
             enabled: true,
             crf: 18,
-            maxrate: "5M".into(),
-            bufsize: "6M".into(),
+            maxrate: "8M".into(),
+            bufsize: "12M".into(),
         }
     }
 }
