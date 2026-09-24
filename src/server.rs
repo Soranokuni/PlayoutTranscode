@@ -300,7 +300,17 @@ fn asset_mutation_scope(method: &axum::http::Method, path: &str) -> Option<Optio
         .strip_prefix("/api/v2")
         .or_else(|| path.strip_prefix("/api"))?;
     let mut parts = rest.trim_start_matches('/').split('/');
-    match parts.next()? {
+    let mut section = parts.next()?;
+    // The DB viewer's alias (`/db/assets/{uuid}/regenerate-sidecar`) changes
+    // the same rows and went unannounced (handoff #10). `/db/backup` is not
+    // under `assets` and stays silent.
+    if section == "db" {
+        section = parts.next()?;
+        if section != "assets" {
+            return None;
+        }
+    }
+    match section {
         "assets" => match parts.next() {
             // `/assets/batch` edits many rows at once.
             Some("batch") | None => Some(None),
@@ -2194,6 +2204,11 @@ async fn post_retry_job(
     if let Err(e) = state.jobs.requeue_for_retry(&id, "Re-queued (manual retry)") {
         return retry_refused(e);
     }
+    // A retry is the answer to a held cancel: forget it, or the processor
+    // would hold the file again.
+    if let Err(e) = db::clear_cancelled_source(&state.pool, &job.input_path).await {
+        tracing::warn!("Could not clear the cancel of {}: {}", job.input_path, e);
+    }
     // Pass the job id so the dispatcher adopts this record rather than
     // creating a second one and leaving this one Pending forever (F-13).
     match state.service_handle.submit_retry(validated, Some(id.clone())) {
@@ -2201,6 +2216,30 @@ async fn post_retry_job(
         Err(e) => {
             state.jobs.revert_retry(&id, &e);
             (StatusCode::CONFLICT, Json(serde_json::json!({"error": e}))).into_response()
+        }
+    }
+}
+
+/// Record `path` (as the watcher spells it) with its current size and mtime.
+/// A source that cannot be stat'ed is gone, and there is nothing to hold.
+async fn remember_cancelled_source(pool: &SqlitePool, path: String) {
+    let stat_path = path.clone();
+    let stat = tokio::task::spawn_blocking(move || {
+        let meta = std::fs::metadata(&stat_path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs();
+        Some((meta.len(), mtime))
+    })
+    .await
+    .ok()
+    .flatten();
+    if let Some((size, mtime)) = stat {
+        if let Err(e) = db::record_cancelled_source(pool, &path, size, mtime).await {
+            tracing::warn!("Could not remember the cancel of {}: {}", path, e);
         }
     }
 }
@@ -2229,7 +2268,15 @@ async fn post_cancel_job(
 ) -> impl IntoResponse {
     use crate::jobs::CancelError;
     match state.jobs.request_cancel(&id) {
-        Ok(()) => Json(serde_json::json!({ "success": true })).into_response(),
+        Ok(()) => {
+            // Handoff #1: an operator's cancel is remembered for this exact
+            // file, so the next start asks before encoding it again. Only
+            // here -- a service stop is not a cancel.
+            if let Some(job) = state.jobs.get(&id) {
+                remember_cancelled_source(&state.pool, job.input_path).await;
+            }
+            Json(serde_json::json!({ "success": true })).into_response()
+        }
         Err(CancelError::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": format!("Job {} not found", id) })),
@@ -3819,6 +3866,31 @@ mod tests {
         for (m, p) in safe {
             assert!(!is_destructive(&m, p), "{} {} should not be destructive", m, p);
         }
+    }
+
+    #[test]
+    fn the_db_viewer_alias_announces_its_asset_mutation() {
+        use axum::http::Method;
+        let u = "3f2504e0-4f89-41d3-9a0c-0305e82c3301";
+        for p in [
+            format!("/api/v2/db/assets/{u}/regenerate-sidecar"),
+            format!("/api/db/assets/{u}/regenerate-sidecar"),
+            format!("/api/v2/assets/{u}/regenerate-sidecar"),
+        ] {
+            assert_eq!(
+                asset_mutation_scope(&Method::POST, &p),
+                Some(Some(u.to_string())),
+                "{p}"
+            );
+        }
+        assert_eq!(
+            asset_mutation_scope(&Method::POST, "/api/v2/db/backup"),
+            None
+        );
+        assert_eq!(
+            asset_mutation_scope(&Method::GET, &format!("/api/v2/db/assets/{u}")),
+            None
+        );
     }
 
     #[test]

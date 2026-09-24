@@ -256,6 +256,10 @@ pub struct JobRecord {
     pub encode_speed: String,
     pub current_time_ms: i64,
     pub duration_ms: i64,
+    /// Shown only because it waits for a concurrency slot; see
+    /// [`JobQueue::push_waiting`]. Never persisted or serialised.
+    #[serde(skip)]
+    pub waiting_for_slot: bool,
 }
 
 impl JobRecord {
@@ -292,6 +296,7 @@ impl JobRecord {
             encode_speed: String::new(),
             current_time_ms: 0,
             duration_ms: 0,
+            waiting_for_slot: false,
         }
     }
 
@@ -661,7 +666,10 @@ impl JobQueue {
         job.finished_at = None;
         job.cancel_requested = false;
         job.progress = 0.0;
-        job.attempt = job.attempt.saturating_add(1);
+        // A fresh budget of automatic attempts (handoff #8). Incrementing
+        // here while the processor counted each run from 1 is what showed
+        // `#3/2`.
+        job.attempt = 1;
         let job_clone = job.clone();
         drop(jobs);
         self.announce(&job_clone);
@@ -702,7 +710,6 @@ impl JobQueue {
         let reason = reason.to_string();
         let _ = self.transition(id, JobPhase::Failed, Some("Failed".into()), |j| {
             j.error = Some(reason);
-            j.attempt = j.attempt.saturating_sub(1);
         });
     }
 
@@ -876,6 +883,51 @@ impl JobQueue {
             .map(|(_, id)| id.to_string())
             .collect();
         jobs.retain(|j| !drop.contains(&j.id));
+    }
+
+    /// Drop finished records that finished before `cutoff` (RFC 3339), the
+    /// in-memory half of the job-history retention. Returns the removed ids.
+    pub fn prune_finished_before(&self, cutoff: &str) -> Vec<String> {
+        let mut jobs = self.jobs.write();
+        let mut removed = Vec::new();
+        jobs.retain(|j| {
+            let old = j.phase.is_terminal()
+                && j.finished_at.as_deref().unwrap_or(j.created_at.as_str()) < cutoff;
+            if old {
+                removed.push(j.id.clone());
+            }
+            !old
+        });
+        removed
+    }
+
+    /// Take a record that exists only to show a file waiting for a
+    /// concurrency slot off the queue, when it turns out there is nothing to
+    /// show (a re-offered duplicate) or the run it waited in has ended.
+    /// Anything the processor has since adopted is left alone.
+    pub fn forget_waiting(&self, id: &str) {
+        let removed = {
+            let mut jobs = self.jobs.write();
+            let before = jobs.len();
+            jobs.retain(|j| !(j.id == id && j.waiting_for_slot && j.phase == JobPhase::Queued));
+            jobs.len() != before
+        };
+        if removed {
+            self.broadcast("job_removed", &serde_json::json!({ "ids": [id] }).to_string());
+        }
+    }
+
+    /// Show a file that is waiting for a concurrency slot (handoff #5).
+    ///
+    /// Announced but not persisted: until the processor adopts it the record
+    /// says nothing a restart needs, because the watcher offers the file again
+    /// anyway. Persisting it would put a row per retained watch-folder file
+    /// into `transcode_jobs` at every start.
+    pub fn push_waiting(&self, mut job: JobRecord) {
+        job.waiting_for_slot = true;
+        job.current_stage = "Waiting for a free slot".into();
+        self.jobs.write().push(job.clone());
+        self.announce(&job);
     }
 
     /// Is anyone subscribed to the SSE stream right now?
@@ -1625,6 +1677,68 @@ mod tests {
             q.requeue_for_retry(&id, "retry").unwrap_err(),
             RetryError::NotRetryable(JobPhase::Queued)
         );
+    }
+
+    #[test]
+    fn a_manual_retry_starts_a_fresh_attempt_budget() {
+        let q = queue();
+        let mut phases = RUNNING.to_vec();
+        phases.push(JobPhase::Failed);
+        let mut job = job_in(&phases);
+        (job.attempt, job.max_attempts) = (2, 2);
+        let id = job.id.clone();
+        q.push(job);
+        assert_eq!(
+            q.requeue_for_retry(&id, "retry").unwrap().attempt,
+            1,
+            "no #3/2"
+        );
+    }
+
+    #[test]
+    fn history_older_than_the_cutoff_goes_and_live_jobs_stay() {
+        let q = queue();
+        let mut old = terminal_job("old.mxf", JobPhase::Completed);
+        old.finished_at = Some("2026-01-01T00:00:00+00:00".into());
+        let mut live = JobRecord::new("live.mxf", "ProfileA");
+        live.created_at = "2026-01-01T00:00:00+00:00".into();
+        let recent = terminal_job("new.mxf", JobPhase::Completed);
+        let (old_id, live_id, recent_id) = (old.id.clone(), live.id.clone(), recent.id.clone());
+        for j in [old, live, recent] {
+            q.push(j);
+        }
+        assert_eq!(
+            q.prune_finished_before("2026-06-01T00:00:00+00:00"),
+            vec![old_id]
+        );
+        assert!(q.get(&live_id).is_some() && q.get(&recent_id).is_some());
+    }
+
+    #[test]
+    fn a_waiting_record_is_forgotten_only_while_it_still_waits() {
+        let q = queue();
+        q.push_waiting(JobRecord::new("a.mxf", "pending"));
+        q.push_waiting(JobRecord::new("b.mxf", "pending"));
+        let ids: Vec<String> = q.all().into_iter().map(|j| j.id).collect();
+        // `b` was adopted by the processor.
+        q.transition(&ids[1], JobPhase::Probing, None, |j| {
+            j.waiting_for_slot = false
+        })
+        .unwrap();
+        q.forget_waiting(&ids[0]);
+        q.forget_waiting(&ids[1]);
+        assert!(q.get(&ids[0]).is_none());
+        assert!(q.get(&ids[1]).is_some());
+        // A waiting record is cancellable like any queued one.
+        q.push_waiting(JobRecord::new("c.mxf", "pending"));
+        let c = q
+            .all()
+            .into_iter()
+            .find(|j| j.input_path == "c.mxf")
+            .unwrap();
+        q.request_cancel(&c.id).unwrap();
+        q.forget_waiting(&c.id);
+        assert_eq!(q.get(&c.id).unwrap().phase, JobPhase::Cancelled);
     }
 
     #[test]

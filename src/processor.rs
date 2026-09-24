@@ -964,6 +964,9 @@ fn record_ingest_failure(
     let _ = handle.block_on(db::mark_error(pool, uuid));
 }
 
+/// `error_category` of the record a cancelled source gets on its next offer.
+pub const HELD_AFTER_CANCEL: &str = "held_after_cancel";
+
 /// How long a running encode may go without its media time advancing (PL-03).
 const ENCODE_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// The same, before the first progress report: ffmpeg is still probing an
@@ -1000,6 +1003,7 @@ fn process_file_inner(
         let cat = category.map(|c| c.to_string());
         let stage = phase.as_str().to_string();
         let apply = move |job: &mut jobs::JobRecord| {
+            job.waiting_for_slot = false;
             job.error = Some(msg);
             job.error_category = cat;
             job.finished_at = Some(chrono::Utc::now().to_rfc3339());
@@ -1056,8 +1060,19 @@ fn process_file_inner(
     // start put a fresh "skipped" row per retained source into the queue and
     // the job table each time (PL-05). `hash_cached` is only true when this
     // path, size, mtime and sampled fingerprint were hashed before.
+    //
+    // A record that only showed the file waiting for a slot (handoff #5) is
+    // still a fresh offer: it is taken away again rather than turned into
+    // the skip row PL-05 exists to avoid.
+    let fresh_offer = existing_job.as_ref().is_none_or(|j| j.waiting_for_slot);
+    let forget_waiting = || {
+        if let Some(p) = existing_job.as_ref().filter(|j| j.waiting_for_slot) {
+            queue.forget_waiting(&p.id);
+        }
+    };
     let skip_or_ignore = |hash_cached: bool, asset_uuid: &str, message: &str| {
-        if hash_cached && existing_job.is_none() {
+        if hash_cached && fresh_offer {
+            forget_waiting();
             tracing::debug!(
                 "{} re-offered, already handled as {}: {}",
                 input_path.display(),
@@ -1124,6 +1139,61 @@ fn process_file_inner(
         .map(|d| d.as_secs());
 
     let handle = tokio::runtime::Handle::current();
+
+    // Handoff #1. A cancel used to mean nothing across a restart: the source
+    // stays in the watch folder, the next start offered it again, and it was
+    // encoded. The first offer after an operator's cancel now asks instead --
+    // a held record with Retry -- and later offers stay quiet. Checked before
+    // any hashing: path, size and mtime are all it takes.
+    if let (Some(size), Some(mtime)) = (initial_source_size, initial_source_mtime) {
+        let path = input_path.to_string_lossy();
+        match handle.block_on(db::check_cancel_hold(pool, &path, size, mtime)) {
+            Ok(db::CancelHold::None) => {}
+            Ok(db::CancelHold::AlreadyAsked) if fresh_offer => {
+                forget_waiting();
+                tracing::debug!(
+                    "{} was cancelled by the operator and already offered for retry; not ingesting",
+                    input_path.display()
+                );
+                return;
+            }
+            Ok(_) => {
+                tracing::info!(
+                    "{} was cancelled by the operator; holding it for a retry decision",
+                    input_path.display()
+                );
+                terminate_early(
+                    jobs::JobPhase::Skipped,
+                    Some(HELD_AFTER_CANCEL),
+                    "You cancelled this file earlier, so it was not ingested again. \
+                     Retry to ingest it now.",
+                    None,
+                );
+                return;
+            }
+            Err(e) => tracing::warn!(
+                "Cancel-hold lookup failed for {}: {} -- ingesting as usual",
+                input_path.display(),
+                e
+            ),
+        }
+    }
+
+    // Handoff #6. The full SHA-256 below is a Rust read loop, not a child
+    // process, so neither a stop nor a cancel reached it: a stop during the
+    // hash of a 40 GB source on a share read to the end. The loop polls this.
+    let _hash_interrupt = {
+        let q = queue.clone();
+        let id = existing_job.as_ref().map(|j| j.id.clone());
+        let running = still_running.clone();
+        crate::child::interrupt_scope(std::sync::Arc::new(move || {
+            !running()
+                || id.as_ref().is_some_and(|id| {
+                    q.get(id)
+                        .is_some_and(|j| j.cancel_requested || j.phase == jobs::JobPhase::Cancelled)
+                })
+        }))
+    };
 
     let fingerprint = match fingerprint::compute_sampled_fingerprint(input_path) {
         Ok(fp) => fp,
@@ -1322,6 +1392,16 @@ fn process_file_inner(
     // Computed here if the dedup path never needed it, so every new row
     // carries one and the next ingest has something to confirm against.
     let source_sha256 = full_hash_of_source();
+    if crate::child::interrupted() {
+        // Nothing has been created yet. A cancel already closed a queued
+        // record, a stop leaves it for the next start's offer, and a record
+        // that was only waiting for a slot is taken away by its dispatcher.
+        tracing::info!(
+            "Hashing {} was interrupted by a cancel or the service stopping",
+            input_path.display()
+        );
+        return;
+    }
 
     let metadata_uuid = Uuid::new_v4().to_string();
     let video_dir = target_root.join("videos");
@@ -1377,6 +1457,7 @@ fn process_file_inner(
                 jobs::JobPhase::Probing,
                 Some("Probing".to_string()),
                 |j| {
+                    j.waiting_for_slot = false;
                     j.uuid = Some(uuid);
                     j.fingerprint = Some(fingerprint);
                     j.error = None;
@@ -1673,7 +1754,11 @@ fn process_file_inner(
         return;
     }
 
-    let mut attempt = 1;
+    // Resume the count a crash-recovered record carries (handoff #8):
+    // `recover_stale_jobs` charges the crashed run an attempt, and restarting
+    // at 1 here meant a job that kept taking the service down was re-queued
+    // for ever and never reached "attempts exhausted".
+    let mut attempt = (job.attempt as usize).clamp(1, max_attempts);
     let mut last_error;
 
     while attempt <= max_attempts {
@@ -4101,6 +4186,78 @@ mod tests {
         assert_eq!(after.state, jobs::JobState::Failed);
         assert_eq!(after.error_category.as_deref(), Some("fingerprint_failure"));
         assert_eq!(after.attempt, 2, "the attempt count was reset");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Handoff #1: the first offer of a file the operator cancelled asks
+    /// (one held record, no encode); later offers stay quiet, and a record
+    /// that only showed it waiting for a slot is taken away again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cancelled_source_is_held_once_then_left_quiet() {
+        let (queue, pool, cfg, root) = adoption_fixture("held").await;
+        let src = std::path::Path::new(&cfg.paths.watch_folder).join("cancelled.mov");
+        std::fs::write(&src, b"not media").expect("write fixture");
+        let meta = std::fs::metadata(&src).unwrap();
+        let mtime = meta
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let path = src.to_string_lossy().into_owned();
+        crate::db::record_cancelled_source(&pool, &path, meta.len(), mtime)
+            .await
+            .unwrap();
+        // On a blocking thread, as the dispatcher runs it: the hold lookup
+        // is the first `block_on` an offer reaches.
+        let offer = |existing: Option<jobs::JobRecord>| {
+            let (q, p, c, s) = (queue.clone(), pool.clone(), cfg.clone(), src.clone());
+            tokio::task::spawn_blocking(move || {
+                process_file_sync(
+                    &q,
+                    &bootstrap::ToolPaths {
+                        ffmpeg: std::path::PathBuf::new(),
+                        ffprobe: std::path::PathBuf::new(),
+                    },
+                    std::path::Path::new(&c.paths.target_folder),
+                    &s,
+                    &c,
+                    &p,
+                    crate::service_handle::ActivePids::default(),
+                    existing,
+                )
+            })
+        };
+
+        offer(None).await.unwrap();
+        let all = queue.all();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].phase, jobs::JobPhase::Skipped);
+        assert_eq!(all[0].error_category.as_deref(), Some(HELD_AFTER_CANCEL));
+        assert!(all[0].uuid.is_none(), "no registry row was created");
+
+        // The next start: nothing new, and a waiting record goes away.
+        queue.push_waiting(jobs::JobRecord::new(&path, "pending"));
+        let waiting = queue
+            .all()
+            .into_iter()
+            .find(|j| j.waiting_for_slot)
+            .unwrap();
+        offer(Some(waiting.clone())).await.unwrap();
+        assert!(queue.get(&waiting.id).is_none());
+        assert_eq!(queue.all().len(), 1);
+
+        // Retry clears the mark; a changed file drops it on its own.
+        crate::db::clear_cancelled_source(&pool, &path)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::db::check_cancel_hold(&pool, &path, meta.len(), mtime)
+                .await
+                .unwrap(),
+            crate::db::CancelHold::None
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

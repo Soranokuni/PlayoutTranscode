@@ -745,6 +745,25 @@ async fn init_schema(pool: SqlitePool) -> Result<SqlitePool, sqlx::Error> {
     .execute(&pool)
     .await?;
 
+    // A source the operator cancelled, keyed by what would change if the file
+    // did. The source stays in the watch folder, so the next start used to
+    // offer it again and encode it -- the cancel meant nothing across a
+    // restart. Now the next offer asks instead (one held job record), and the
+    // offers after that stay quiet until the operator answers or the file
+    // changes. Written only by the cancel endpoint: a service stop is not a
+    // cancel.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS cancelled_sources (
+            path         TEXT PRIMARY KEY NOT NULL,
+            size_bytes   INTEGER NOT NULL,
+            mtime_secs   INTEGER NOT NULL,
+            cancelled_at TEXT NOT NULL,
+            asked_at     TEXT
+        )",
+    )
+    .execute(&pool)
+    .await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS transcode_jobs (
             id TEXT PRIMARY KEY NOT NULL,
@@ -2152,7 +2171,20 @@ pub async fn purge_single_asset_with_context(
             remaining_refs
         ));
     } else if should_remove_file {
-        match validate_purge_path(&path, managed_target_dir, watch_dir) {
+        // Off the runtime (handoff #9): three `canonicalize` calls, and on an
+        // unreachable SMB target each blocks for the network timeout. Every
+        // purge -- single, folder, recycle bin, auto -- comes through here.
+        let (p, target, watch) = (
+            path.clone(),
+            managed_target_dir.map(Path::to_path_buf),
+            watch_dir.map(Path::to_path_buf),
+        );
+        let validated = tokio::task::spawn_blocking(move || {
+            validate_purge_path(&p, target.as_deref(), watch.as_deref())
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("path validation task failed: {}", e)));
+        match validated {
             Ok(media_path) => {
                 if !crate::watcher::is_temp_file_name(&media_path) {
                     match tokio::fs::remove_file(&media_path).await {
@@ -2182,7 +2214,11 @@ pub async fn purge_single_asset_with_context(
 
                     // Also cleanup legacy adjacent sidecar if distinct from sidecar_path
                     let legacy_sidecar = media_path.with_extension("uuid.json");
-                    if legacy_sidecar != sidecar_path && legacy_sidecar.exists() {
+                    if legacy_sidecar != sidecar_path
+                        && tokio::fs::try_exists(&legacy_sidecar)
+                            .await
+                            .unwrap_or(false)
+                    {
                         if tokio::fs::remove_file(&legacy_sidecar).await.is_ok() {
                             sidecar_removed = true;
                         }
@@ -2779,6 +2815,7 @@ impl DurableJobRow {
             encode_speed: self.encode_speed,
             current_time_ms: self.current_time_ms,
             duration_ms: self.duration_ms,
+            waiting_for_slot: false,
         }
     }
 }
@@ -3109,6 +3146,103 @@ pub async fn store_source_sha256(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// What a watch-folder offer of a cancelled source should do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelHold {
+    /// Not cancelled, or cancelled as a file that has since changed.
+    None,
+    /// Cancelled, and this is the first offer since: ask the operator.
+    Ask,
+    /// Cancelled and already asked: stay quiet.
+    AlreadyAsked,
+}
+
+/// Remember that the operator cancelled the ingest of this exact file.
+pub async fn record_cancelled_source(
+    pool: &SqlitePool,
+    path: &str,
+    size_bytes: u64,
+    mtime_secs: u64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO cancelled_sources (path, size_bytes, mtime_secs, cancelled_at, asked_at)
+         VALUES (?1, ?2, ?3, ?4, NULL)
+         ON CONFLICT(path) DO UPDATE SET
+            size_bytes = excluded.size_bytes, mtime_secs = excluded.mtime_secs,
+            cancelled_at = excluded.cancelled_at, asked_at = NULL",
+    )
+    .bind(path)
+    .bind(size_bytes as i64)
+    .bind(mtime_secs as i64)
+    .bind(chrono::Utc::now().to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Look up an offered file against the cancelled set, marking it asked.
+///
+/// A mark for the same path with a different size or mtime is a different
+/// file and is dropped: a replaced source ingests normally.
+pub async fn check_cancel_hold(
+    pool: &SqlitePool,
+    path: &str,
+    size_bytes: u64,
+    mtime_secs: u64,
+) -> Result<CancelHold, sqlx::Error> {
+    let row: Option<(i64, i64, Option<String>)> = sqlx::query_as(
+        "SELECT size_bytes, mtime_secs, asked_at FROM cancelled_sources WHERE path = ?1",
+    )
+    .bind(path)
+    .fetch_optional(pool)
+    .await?;
+    let Some((size, mtime, asked_at)) = row else {
+        return Ok(CancelHold::None);
+    };
+    if size != size_bytes as i64 || mtime != mtime_secs as i64 {
+        clear_cancelled_source(pool, path).await?;
+        return Ok(CancelHold::None);
+    }
+    if asked_at.is_some() {
+        return Ok(CancelHold::AlreadyAsked);
+    }
+    sqlx::query("UPDATE cancelled_sources SET asked_at = ?1 WHERE path = ?2")
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(path)
+        .execute(pool)
+        .await?;
+    Ok(CancelHold::Ask)
+}
+
+/// The operator said yes: forget the cancel.
+pub async fn clear_cancelled_source(pool: &SqlitePool, path: &str) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query("DELETE FROM cancelled_sources WHERE path = ?1")
+        .bind(path)
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
+}
+
+/// How long finished job records are kept. The history is for "what happened
+/// to the file I dropped this week"; an older ingest is still in the asset
+/// registry (DB viewer -> Assets), which is where it is looked up. The table
+/// used to grow by a row per ingest for ever.
+pub const JOB_HISTORY_RETENTION_DAYS: i64 = 5;
+
+/// Delete finished job rows older than `cutoff` (RFC 3339). Pending and
+/// processing rows are never touched, whatever their age.
+pub async fn prune_job_history(pool: &SqlitePool, cutoff: &str) -> Result<u64, sqlx::Error> {
+    let r = sqlx::query(
+        "DELETE FROM transcode_jobs
+          WHERE state NOT IN ('Pending', 'Processing')
+            AND COALESCE(finished_at, created_at) < ?1",
+    )
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+    Ok(r.rows_affected())
 }
 
 /// What the in-memory queue is seeded with at startup (PL-04): every job that
@@ -4406,6 +4540,77 @@ mod tests {
         // An empty batch is a no-op, not an empty transaction.
         persist_jobs(&pool, &[]).await.unwrap();
 
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn a_cancel_hold_asks_once_and_a_changed_file_releases_it() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let p = "D:/watch/show.mxf";
+        assert_eq!(
+            check_cancel_hold(&pool, p, 10, 100).await.unwrap(),
+            CancelHold::None
+        );
+
+        record_cancelled_source(&pool, p, 10, 100).await.unwrap();
+        assert_eq!(
+            check_cancel_hold(&pool, p, 10, 100).await.unwrap(),
+            CancelHold::Ask
+        );
+        assert_eq!(
+            check_cancel_hold(&pool, p, 10, 100).await.unwrap(),
+            CancelHold::AlreadyAsked
+        );
+
+        // Cancelled again later: asks again.
+        record_cancelled_source(&pool, p, 10, 100).await.unwrap();
+        assert_eq!(
+            check_cancel_hold(&pool, p, 10, 100).await.unwrap(),
+            CancelHold::Ask
+        );
+
+        // Replaced by a different file at the same path: ingests, mark gone.
+        assert_eq!(
+            check_cancel_hold(&pool, p, 11, 100).await.unwrap(),
+            CancelHold::None
+        );
+        assert_eq!(
+            check_cancel_hold(&pool, p, 10, 100).await.unwrap(),
+            CancelHold::None
+        );
+        let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn job_history_prune_keeps_live_and_recent_jobs() {
+        let (pool, temp_dir) = setup_test_pool().await;
+        let old = (chrono::Utc::now() - chrono::Duration::days(6)).to_rfc3339();
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(JOB_HISTORY_RETENTION_DAYS)).to_rfc3339();
+
+        let mut finished_old = crate::jobs::JobRecord::new("D:/w/a.mov", "ProfileA");
+        finished_old.state = crate::jobs::JobState::Completed;
+        finished_old.phase = crate::jobs::JobPhase::Completed;
+        finished_old.finished_at = Some(old.clone());
+        let mut pending_old = crate::jobs::JobRecord::new("D:/w/b.mov", "ProfileA");
+        pending_old.created_at = old.clone();
+        let mut finished_new = crate::jobs::JobRecord::new("D:/w/c.mov", "ProfileA");
+        finished_new.state = crate::jobs::JobState::Failed;
+        finished_new.phase = crate::jobs::JobPhase::Failed;
+        finished_new.finished_at = Some(chrono::Utc::now().to_rfc3339());
+        for j in [&finished_old, &pending_old, &finished_new] {
+            insert_durable_job(&pool, j).await.unwrap();
+        }
+
+        assert_eq!(prune_job_history(&pool, &cutoff).await.unwrap(), 1);
+        let left: Vec<String> = load_all_durable_jobs(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|j| j.id)
+            .collect();
+        assert!(!left.contains(&finished_old.id));
+        assert!(left.contains(&pending_old.id) && left.contains(&finished_new.id));
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 

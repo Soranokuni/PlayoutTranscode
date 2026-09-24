@@ -388,6 +388,36 @@ pub async fn run_service(
         }
     });
 
+    // Job history retention: finished records older than five days go, from
+    // memory and from `transcode_jobs`. First tick at startup, then hourly.
+    let history_pool = pool.clone();
+    let history_queue = job_queue.clone();
+    let history_task = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
+        loop {
+            ticker.tick().await;
+            let cutoff = (chrono::Utc::now()
+                - chrono::Duration::days(db::JOB_HISTORY_RETENTION_DAYS))
+            .to_rfc3339();
+            let ids = history_queue.prune_finished_before(&cutoff);
+            if !ids.is_empty() {
+                history_queue.broadcast(
+                    "job_removed",
+                    &serde_json::json!({ "ids": ids }).to_string(),
+                );
+            }
+            match db::prune_job_history(&history_pool, &cutoff).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(
+                    "Job history: removed {} record(s) older than {} days",
+                    n,
+                    db::JOB_HISTORY_RETENTION_DAYS
+                ),
+                Err(e) => tracing::error!("Job history prune failed: {}", e),
+            }
+        }
+    });
+
     // `&mut` so the handle survives the select: on the stop paths the server is
     // still draining and has to be awaited below.
     let mut server_already_exited = false;
@@ -459,6 +489,7 @@ pub async fn run_service(
     }
     backup_task.abort();
     reconcile_task.abort();
+    history_task.abort();
 
     pool.close().await;
     tracing::info!("Shutdown complete");

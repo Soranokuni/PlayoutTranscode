@@ -353,6 +353,7 @@ Four of these are new. Map them to operator-facing wording:
 | `publish_failure` | The encoded file could not be moved into the target folder | "Could not publish the encoded file" |
 | `retryable_error` | Transient; the job will be attempted again | "Retrying" |
 | `cancelled` | An operator cancelled the job; nothing was published | "Cancelled" |
+| `held_after_cancel` | Phase `skipped` (state `Completed`). The file was offered again after an operator cancelled it, so it was **not** ingested; `POST /api/jobs/{id}/retry` ingests it. Asked once per cancel: later offers of the unchanged file create no record | "Cancelled earlier — retry to ingest" |
 | `duplicate_skipped` | **Legacy — see 5.3.** No longer produced | — |
 
 The web UI renders this same table from `web-ui/src/lib/errorCategories.ts`.
@@ -1151,3 +1152,11 @@ change when the verdict is cleared.
 
 **One new SSE event:** `job_removed`, carrying `{ "ids": [...] }`. An unknown
 event is already a no-op for you, so nothing breaks either way.
+
+**Job list changes (no contract change).** `GET /api/jobs` now also lists a
+file that is waiting for a concurrency slot (`phase: "queued"`,
+`current_stage: "Waiting for a free slot"`); it can be cancelled like any
+queued job, and if it turns out to need no work (a re-offered duplicate) it is
+removed with `job_removed`. Finished job records are kept for **5 days**
+(memory and `transcode_jobs`); older ones are removed hourly, announced with
+`job_removed`. Assets are unaffected: an older ingest is still in the registry.

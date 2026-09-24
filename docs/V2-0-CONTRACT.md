@@ -77,7 +77,7 @@ Route definitions: `src/server.rs:52-84`. `PUT /trim` and `PUT /rating` (correct
                 "effective_threads_per_encode": 1, "effective_total_threads": 2 },
   "profiles": { "a": { "enabled": true, "crf": 22, "maxrate": "20M", "bufsize": "30M" },
                 "b": { "enabled": true, "crf": 21, "maxrate": "20M", "bufsize": "30M" },
-                "c": { "enabled": true, "crf": 18, "maxrate": "5M",  "bufsize": "6M" } },
+                "c": { "enabled": true, "crf": 18, "maxrate": "8M",  "bufsize": "12M" } },
   "ingestion": { "settle_secs": 5, "poll_secs": 10, "max_concurrency": 2,
                  "stable_polls_min": 2, "retry_policy": "once",
                  "auto_retry_on_start": true, "max_attempts": 2,

@@ -107,7 +107,7 @@ impl BroadcastVideoProfile {
         Self::describe(
             ProfileId::ProfileA,
             "playoutvue-h264-1080p25",
-            "HD progressive <= 30 fps, normalised to 1080p25 BT.709, DAR-fitted (Profile A)",
+            "HD progressive 25 fps, 1080p25 BT.709, DAR-fitted (Profile A)",
         )
     }
 
@@ -116,7 +116,8 @@ impl BroadcastVideoProfile {
             ProfileId::ProfileB,
             "playoutvue-h264-1080i50",
             "1080i50 TFF BT.709: 1080i50 kept field for field; 50p, 576i and 59.94 \
-             sources converted to 50 fields/s (Profile B)",
+             sources converted to 50 fields/s; 23.976/24/29.97/30p spread over 50 \
+             fields by pulldown (Profile B)",
         )
     }
 
@@ -124,7 +125,7 @@ impl BroadcastVideoProfile {
         Self::describe(
             ProfileId::ProfileC,
             "playoutvue-h264-1080p25-sd-pal",
-            "SD progressive <= 30 fps upconverted to 1080p25 BT.709, pillarboxed per DAR (Profile C)",
+            "SD progressive 25 fps upconverted to 1080p25 BT.709, pillarboxed per DAR (Profile C)",
         )
     }
 }
@@ -220,7 +221,13 @@ pub enum VideoPath {
     /// through: [bwdif one frame per field] -> fps=50 -> scale progressive
     /// 4:2:2 -> `interlace` TFF -> field-aware 4:2:0.
     FieldRateInterlace,
-    /// B handed a <= 30 fps progressive source (routing never does this):
+    /// B from progressive material at a rate other than 25 (23.976, 24,
+    /// 29.97, 30): scale at the source rate -> fps=50 repeats each frame for
+    /// two or three fields (one or two for 30p) -> `interlace` TFF with no
+    /// low-pass -> field-aware 4:2:0. Pulldown, not interpolation: the
+    /// judder of dropping or repeating a whole 25p frame becomes one field.
+    FieldCadence,
+    /// B handed a 25 fps progressive source (routing never does this):
     /// frames flagged TFF, i.e. progressive segmented frame.
     SegmentedFrame,
 }
@@ -428,6 +435,14 @@ fn tonemap_chain(src: &ProbeData) -> String {
     )
 }
 
+/// Woven 4:2:2 -> 4:2:0, chroma subsampled per field.
+fn field_chroma_420() -> String {
+    format!(
+        "scale=interl=1:flags={}:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv,format=yuv420p",
+        SCALE_FLAGS
+    )
+}
+
 fn parity(scan: ScanType) -> &'static str {
     match scan {
         ScanType::Tff => "tff",
@@ -456,6 +471,8 @@ pub fn plan_video(profile: &EncodingProfile, src: &ProbeData) -> VideoPlan {
 
     let path = if !profile.interlaced {
         VideoPath::Progressive
+    } else if src.wants_field_cadence() {
+        VideoPath::FieldCadence
     } else if src.wants_interlaced_output() {
         let frame_rate = src.frame_rate();
         if interlaced_src
@@ -533,11 +550,22 @@ pub fn plan_video(profile: &EncodingProfile, src: &ProbeData) -> VideoPlan {
             // puts each field's chroma on the wrong lines.
             f.push(scale_and_pad(&geometry, false, color, Some("yuv422p")));
             f.push("interlace=scan=tff:lowpass=complex".to_string());
-            f.push(format!(
-                "scale=interl=1:flags={}:in_color_matrix=bt709:out_color_matrix=bt709:in_range=tv:out_range=tv",
-                SCALE_FLAGS
-            ));
-            f.push("format=yuv420p".to_string());
+            f.push(field_chroma_420());
+        }
+        VideoPath::FieldCadence => {
+            // Tone map and scale at the source rate, before the repeats:
+            // fps=50 then only duplicates frame references (4.6 s -> 4.0 s
+            // for 20 s of 1080p23.976 against scaling at 50).
+            if tonemap == Tonemap::Applied {
+                f.push(tonemap_chain(src));
+            }
+            f.push(scale_and_pad(&geometry, false, color, Some("yuv422p")));
+            f.push(format!("fps={}/1", FIELD_RATE));
+            // No low-pass: most woven frames are two fields of one source
+            // frame, i.e. a progressive picture, and filtering them would
+            // make this path softer than 25p for nothing.
+            f.push("interlace=scan=tff:lowpass=off".to_string());
+            f.push(field_chroma_420());
         }
     }
     // Tag the frames themselves. The encoder takes colour properties from
@@ -1563,6 +1591,58 @@ mod tests {
             let args = args_for(ProfileId::ProfileA, &src, &ebu());
             assert!(!args.contains(&"-field_order".to_string()));
         }
+    }
+
+    /// Judder: 23.976 / 24 / 29.97 / 30p decimated to 25p repeated or dropped
+    /// whole frames. They now route to B and are spread over 50 fields.
+    #[test]
+    fn film_and_30p_rates_route_to_b_with_pulldown() {
+        for (w, h) in [(1920, 1080), (1280, 720), (720, 480)] {
+            for fps in [(24000, 1001), (24, 1), (30000, 1001), (30, 1)] {
+                let src = source(w, h, fps, "progressive");
+                assert!(src.wants_field_cadence(), "{w}x{h} {fps:?}");
+                assert_eq!(src.profile_id(), ProfileId::ProfileB, "{w}x{h} {fps:?}");
+                let plan = plan_video(EncodingProfile::by_id(ProfileId::ProfileB), &src);
+                assert_eq!(plan.path, VideoPath::FieldCadence);
+                let vf = &plan.filter;
+                // Scaled once at the source rate, then repeated.
+                assert!(vf.starts_with("scale=w="), "{vf}");
+                assert!(!vf.contains("bwdif") && !vf.contains("fps=25"), "{vf}");
+                let fps50 = vf.find("fps=50/1").expect(vf);
+                let weave = vf.find("interlace=scan=tff:lowpass=off").expect(vf);
+                assert!(
+                    vf.find("format=yuv422p").unwrap() < fps50 && fps50 < weave,
+                    "{vf}"
+                );
+                assert!(vf[weave..].contains("scale=interl=1"), "{vf}");
+                let args = args_for(ProfileId::ProfileB, &src, &ebu());
+                assert_eq!(value_of(&args, "-r"), "25/1");
+                assert!(value_of(&args, "-x264-params").contains("interlaced=1:tff=1"));
+            }
+        }
+    }
+
+    #[test]
+    fn only_25p_and_interlace_stay_off_the_cadence_path() {
+        let p25 = source(1920, 1080, (25, 1), "progressive");
+        assert!(!p25.wants_field_cadence());
+        assert_eq!(p25.profile_id(), ProfileId::ProfileA);
+        assert_eq!(
+            source(720, 576, (25, 1), "progressive").profile_id(),
+            ProfileId::ProfileC
+        );
+        // 50p and 59.94 already have the motion: FieldRateInterlace, not pulldown.
+        for fps in [(50, 1), (60000, 1001)] {
+            let src = source(1920, 1080, fps, "progressive");
+            assert!(!src.wants_field_cadence());
+            let plan = plan_video(EncodingProfile::by_id(ProfileId::ProfileB), &src);
+            assert_eq!(plan.path, VideoPath::FieldRateInterlace);
+        }
+        // 29.97i is fields, not frames.
+        let i2997 = source(720, 480, (30000, 1001), "bb");
+        assert!(!i2997.wants_field_cadence());
+        let plan = plan_video(EncodingProfile::by_id(ProfileId::ProfileB), &i2997);
+        assert_eq!(plan.path, VideoPath::FieldRateInterlace);
     }
 
     #[test]

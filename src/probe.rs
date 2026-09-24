@@ -207,7 +207,20 @@ impl ProbeData {
     /// samples a second (50i, 50p, 59.94i/p) keeps its motion as 50 fields a
     /// second rather than being decimated to 25p (slice 6c).
     pub fn wants_interlaced_output(&self) -> bool {
-        self.motion_rate() >= 40.0
+        self.motion_rate() >= 40.0 || self.wants_field_cadence()
+    }
+
+    /// Progressive at a rate that is not 25 (23.976, 24, 29.97, 30, VFR
+    /// captures). Decimated to 25p, every such source juddered: 24p repeats a
+    /// whole frame once a second (a 40 ms hitch), 29.97p drops every sixth.
+    /// Spread over 50 fields instead -- 2:2:...:2:3 for 24p, 2:2:1 for 30p --
+    /// the hitch is one field (20 ms). Standard euro pulldown; no motion
+    /// interpolation, so no artefacts and no big encode cost (measured 1.33x
+    /// the 25p encode time, +3% size, 1080p23.976 at preset medium).
+    pub fn wants_field_cadence(&self) -> bool {
+        !self.is_interlaced()
+            && (self.frame_rate() - crate::profiles::TARGET_FPS_NUM as f64).abs() >= 0.5
+            && self.frame_rate() < 40.0
     }
 
     pub fn is_hdr(&self) -> bool {
@@ -245,10 +258,11 @@ impl ProbeData {
     /// Profile routing (slice 6c).
     ///
     /// - B: anything that should reach air as true 1080i50 -- 1080i50 passed
-    ///   through field for field, and 50p / 576i / 59.94 converted to 50
-    ///   fields a second.
-    /// - A: progressive HD at <= 30 fps, normalised to 25p.
-    /// - C: progressive SD at <= 30 fps, normalised to 25p.
+    ///   through field for field, 50p / 576i / 59.94 converted to 50 fields a
+    ///   second, and progressive 23.976 / 24 / 29.97 / 30 spread over 50
+    ///   fields by pulldown ([`Self::wants_field_cadence`]).
+    /// - A: progressive HD at 25 fps.
+    /// - C: progressive SD at 25 fps.
     ///
     /// All three report 25/1 frames a second, as B always has.
     pub fn profile_id(&self) -> ProfileId {
@@ -1291,11 +1305,30 @@ mod tests {
         let p480i = make_probe(720, 480, (30000, 1001), "tt");
         assert_eq!(p480i.profile_id(), ProfileId::ProfileB);
 
-        // <= 30 fps progressive stays progressive 25p.
-        for fps in [(24000, 1001), (24, 1), (25, 1), (30000, 1001), (30, 1)] {
-            assert_eq!(make_probe(1920, 1080, fps, "progressive").profile_id(), ProfileId::ProfileA);
-            assert_eq!(make_probe(720, 576, fps, "progressive").profile_id(), ProfileId::ProfileC);
+        // Only 25p stays progressive 25p. Film and 30p rates are spread over
+        // 50 fields by pulldown instead of juddering through fps=25.
+        assert_eq!(
+            make_probe(1920, 1080, (25, 1), "progressive").profile_id(),
+            ProfileId::ProfileA
+        );
+        assert_eq!(
+            make_probe(720, 576, (25, 1), "progressive").profile_id(),
+            ProfileId::ProfileC
+        );
+        for fps in [(24000, 1001), (24, 1), (30000, 1001), (30, 1)] {
+            assert_eq!(
+                make_probe(1920, 1080, fps, "progressive").profile_id(),
+                ProfileId::ProfileB
+            );
+            assert_eq!(
+                make_probe(720, 576, fps, "progressive").profile_id(),
+                ProfileId::ProfileB
+            );
         }
+        // A VFR capture averaging 25.2 is 25p, not a pulldown candidate.
+        let mut vfr = make_probe(1920, 1080, (48, 1), "progressive");
+        (vfr.avg_fps_num, vfr.avg_fps_den) = (252, 10);
+        assert_eq!(vfr.profile_id(), ProfileId::ProfileA);
     }
 
     #[test]
@@ -1349,7 +1382,9 @@ mod tests {
         p.avg_fps_num = 3959400;
         p.avg_fps_den = 162101;
         assert!((p.frame_rate() - 24.43).abs() < 0.01);
-        assert_eq!(p.profile_id(), ProfileId::ProfileA);
+        // Film-rate, so pulldown to 50 fields -- not 48p's 50p conversion.
+        assert!(p.wants_field_cadence());
+        assert_eq!(p.profile_id(), ProfileId::ProfileB);
     }
 
     #[test]

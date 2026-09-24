@@ -2,7 +2,7 @@
   <section class="panel">
     <div class="panel-header">
       <span class="panel-title">ACTIVE INGEST QUEUE</span>
-      <span class="panel-badge">{{ processing.length + queued.length + failed.length }}</span>
+      <span class="panel-badge">{{ processing.length + queued.length + failed.length + held.length }}</span>
       <button
         v-if="failed.length"
         class="btn btn-retry-all"
@@ -31,7 +31,7 @@
       >{{ retryMsg }}</span>
     </div>
 
-    <div v-if="!processing.length && !queued.length && !failed.length" class="empty">
+    <div v-if="!processing.length && !queued.length && !failed.length && !held.length" class="empty">
       No active or failed ingests.
     </div>
 
@@ -152,39 +152,80 @@
     </div>
 
     <!--
+      Files the operator cancelled, offered again by a restart. They were not
+      encoded; the service asks once. "Leave it" dismisses the question and the
+      file stays out until it changes.
+    -->
+    <div v-if="held.length" class="held" role="region" aria-label="Cancelled files waiting for a decision">
+      <div class="held-head">
+        <span class="held-title">Cancelled earlier — ingest now?</span>
+        <span class="held-sub">Still in the watch folder. You cancelled {{ held.length === 1 ? 'it' : 'them' }}, so nothing was encoded at start-up.</span>
+      </div>
+      <div v-for="job in held" :key="job.id" class="held-row">
+        <span class="queue-filename" :title="job.input_path">{{ shortFileName(job.input_path) }}</span>
+        <span v-if="job.finished_at" class="recent-note mono">{{ stamp(job.finished_at) }}</span>
+        <div class="error-actions">
+          <button
+            class="btn btn-mini"
+            :disabled="busy.has(job.id)"
+            :aria-label="`Ingest ${shortFileName(job.input_path)} now`"
+            @click="run(job.id, () => retry(job.id))"
+          >
+            <span v-if="busy.has(job.id)">…</span>
+            <span v-else>Ingest</span>
+          </button>
+          <button
+            class="btn btn-mini btn-leave"
+            :disabled="busy.has(job.id)"
+            :aria-label="`Leave ${shortFileName(job.input_path)} out`"
+            title="Do not ingest this file. You will not be asked again unless it changes."
+            @click="run(job.id, () => dismiss(job.id))"
+          >Leave it</button>
+        </div>
+      </div>
+    </div>
+
+    <!--
       A job that finished used to vanish, and a duplicate that was skipped
       (state Completed, phase skipped) never appeared anywhere but as a number
-      in the stats. An operator who dropped a file and saw nothing could not
-      tell "done" from "ignored" (UX-04). Cancelled jobs are listed too: they
-      fell out of every bucket, so a cancel looked like nothing had happened.
+      in the stats (UX-04). Kept for five days, a page at a time; anything
+      older is in the registry, found by searching the clip in the DB viewer.
     -->
-    <details v-if="recent.length" class="recent">
+    <details v-if="history.length" class="recent">
       <summary class="recent-summary">
-        Recent ({{ recent.length }})
+        History · last 5 days ({{ history.length }})
       </summary>
       <div class="recent-list">
-        <div v-for="job in recent" :key="job.id" class="recent-row">
+        <div v-for="job in historyPage" :key="job.id" class="recent-row">
           <span class="recent-badge" :class="recentKind(job)">
             {{ recentLabel(job) }}
           </span>
-          <span class="queue-filename">{{ shortFileName(job.input_path) }}</span>
+          <span class="queue-filename" :title="job.input_path">{{ shortFileName(job.input_path) }}</span>
           <span v-if="job.phase === 'skipped' && job.uuid" class="recent-note">
             duplicate of {{ job.uuid.slice(0, 8) }}
           </span>
           <span v-if="job.duration_secs" class="recent-note mono">
             {{ job.duration_secs.toFixed(1) }}s
           </span>
-          <span v-if="job.finished_at" class="recent-note mono">{{ clockTime(job.finished_at) }}</span>
+          <span v-if="job.finished_at" class="recent-note mono recent-when">{{ stamp(job.finished_at) }}</span>
           <button
             class="btn btn-mini btn-dismiss recent-dismiss"
             :disabled="busy.has(job.id)"
-            :aria-label="`Remove ${shortFileName(job.input_path)} from the recent list`"
+            :aria-label="`Remove ${shortFileName(job.input_path)} from the history`"
             title="Remove this record from the list. Assets and media files are not touched."
             @click="run(job.id, () => dismiss(job.id))"
           >
             <span aria-hidden="true">✕</span>
           </button>
         </div>
+      </div>
+      <div class="history-foot">
+        <div v-if="pageCount > 1" class="pager">
+          <button class="btn btn-mini btn-page" :disabled="currentPage === 0" @click="page = currentPage - 1">‹ Newer</button>
+          <span class="pager-info mono">{{ currentPage + 1 }} / {{ pageCount }}</span>
+          <button class="btn btn-mini btn-page" :disabled="currentPage >= pageCount - 1" @click="page = currentPage + 1">Older ›</button>
+        </div>
+        <span class="history-note">Older ingests: search the clip in Database → Assets.</span>
       </div>
     </details>
   </section>
@@ -233,27 +274,39 @@ const buckets = computed(() => {
   const processing: JobRecord[] = []
   const queued: JobRecord[] = []
   const failed: JobRecord[] = []
+  const held: JobRecord[] = []
   const finished: JobRecord[] = []
   for (const job of props.jobs.values()) {
     if (job.state === 'Processing') processing.push(job)
     else if (job.state === 'Pending') queued.push(job)
     else if (job.state === 'Failed') failed.push(job)
+    else if (job.phase === 'skipped' && job.error_category === 'held_after_cancel') held.push(job)
     else finished.push(job)
   }
   queued.sort((a, b) => a.created_at.localeCompare(b.created_at))
-  return { processing, queued, failed, finished }
+  held.sort((a, b) => (a.input_path || '').localeCompare(b.input_path || ''))
+  return { processing, queued, failed, held, finished }
 })
 
 const processing = computed(() => buckets.value.processing)
 const queued = computed(() => buckets.value.queued)
 const failed = computed(() => buckets.value.failed)
+const held = computed(() => buckets.value.held)
 
-const RECENT_LIMIT = 20
-const recent = computed(() =>
+/** The server keeps five days of finished jobs; this pages through them. */
+const PAGE_SIZE = 12
+const history = computed(() =>
   buckets.value.finished
     .slice()
-    .sort((a, b) => (b.finished_at || '').localeCompare(a.finished_at || ''))
-    .slice(0, RECENT_LIMIT),
+    .sort((a, b) => (b.finished_at || '').localeCompare(a.finished_at || '')),
+)
+const page = ref(0)
+const pageCount = computed(() => Math.max(1, Math.ceil(history.value.length / PAGE_SIZE)))
+// Clamped rather than reset: a job finishing (or being pruned) must not throw
+// the operator back to page 1 while they read page 3.
+const currentPage = computed(() => Math.min(page.value, pageCount.value - 1))
+const historyPage = computed(() =>
+  history.value.slice(currentPage.value * PAGE_SIZE, (currentPage.value + 1) * PAGE_SIZE),
 )
 
 function recentKind(job: JobRecord): string {
@@ -266,11 +319,14 @@ function recentLabel(job: JobRecord): string {
   return job.phase === 'skipped' ? '⊘ skipped' : '✓ completed'
 }
 
-function clockTime(iso: string): string {
+/** Time today; weekday and time for the other four days of history. */
+function stamp(iso: string): string {
   const d = new Date(iso)
-  return Number.isNaN(d.getTime())
-    ? ''
-    : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+  if (Number.isNaN(d.getTime())) return ''
+  const time = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return d.toDateString() === new Date().toDateString()
+    ? time
+    : `${d.toLocaleDateString([], { weekday: 'short' })} ${time}`
 }
 
 /** Ids with a request in flight: one slot per row, so rows don't fight. */
@@ -530,9 +586,79 @@ defineExpose({ showRetryMsg, setRetryingAll })
 }
 
 .recent-dismiss {
-  margin-left: auto;
   padding: 0 6px;
   min-width: 0;
+}
+.recent-when {
+  margin-left: auto;
+}
+.history-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 8px;
+}
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn-page,
+.btn-leave {
+  border-color: var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+}
+.btn-page:hover:not(:disabled),
+.btn-leave:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+.pager-info {
+  font-size: 11px;
+  color: var(--text-secondary);
+  min-width: 42px;
+  text-align: center;
+}
+.history-note {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.held {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(255,170,40,0.35);
+  background: rgba(255,170,40,0.06);
+  border-radius: 6px;
+}
+.held-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 8px;
+}
+.held-title {
+  font-size: 12px;
+  font-weight: 800;
+  color: var(--accent-amber);
+}
+.held-sub {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+.held-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 0;
+  border-top: 1px solid rgba(255,170,40,0.12);
+}
+.held-row .error-actions {
+  display: flex;
+  gap: 6px;
 }
 
 .queue-phase.queued {

@@ -26,6 +26,8 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
 const CHUNK_SIZE: usize = 64 * 1024;
+/// 1024 chunks of 64 KiB: the full hash looks for a stop every 64 MiB.
+const INTERRUPT_CHECK_CHUNKS: u64 = 1024;
 
 /// A cheap, indexed prefilter: size plus three 64 KiB samples.
 ///
@@ -86,7 +88,15 @@ pub fn compute_full_sha256(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| format!("Full hash open failed: {}", e))?;
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; CHUNK_SIZE];
+    let mut chunks: u64 = 0;
     loop {
+        // Every 64 MiB (handoff #6): a stop or a cancel used to wait out the
+        // whole file, 40 GB on a share. The check is a queue lookup, noise
+        // next to 64 MiB of I/O.
+        if chunks.is_multiple_of(INTERRUPT_CHECK_CHUNKS) && crate::child::interrupted() {
+            return Err(format!("Full hash {}", crate::child::INTERRUPTED));
+        }
+        chunks += 1;
         let read = file
             .read(&mut buffer)
             .map_err(|e| format!("Full hash read failed: {}", e))?;
@@ -106,6 +116,19 @@ pub fn compute_full_sha256(path: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn an_interrupted_full_hash_stops_instead_of_reading_to_the_end() {
+        let path = std::env::temp_dir().join(format!("fp_interrupt_{}.bin", std::process::id()));
+        std::fs::write(&path, vec![0u8; 1024]).unwrap();
+        {
+            let _scope = crate::child::interrupt_scope(std::sync::Arc::new(|| true));
+            let err = compute_full_sha256(&path).unwrap_err();
+            assert!(err.contains(crate::child::INTERRUPTED), "{err}");
+        }
+        assert!(compute_full_sha256(&path).is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[test]
     fn test_fingerprint_stability() {

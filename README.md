@@ -122,14 +122,14 @@ The CasparCG channel is 1080i50, so the profile is chosen by how much motion the
 
 | Profile | Chosen for | Output | Picture path |
 |---|---|---|---|
-| **Profile A** | HD progressive <= 30 fps (25p, 24p, 29.97p, UHD 30p) | 1080p25, BT.709 | drop/dup to 25p, DAR-fitted |
-| **Profile B** | anything at ~50 motion samples/s: 1080i50, 1080p50, 720p50, 576i50, 59.94i/p | 1080i50 TFF, BT.709 | 1080i50: fields kept as shot (BFF re-ordered). Others: `bwdif` one frame per field, `fps=50`, scale, `interlace=scan=tff:lowpass=complex` |
-| **Profile C** | SD progressive <= 30 fps | 1080p25, BT.709 | upconverted, pillarboxed per DAR |
+| **Profile A** | HD progressive 25p (UHD 25p included) | 1080p25, BT.709 | DAR-fitted |
+| **Profile B** | anything at ~50 motion samples/s: 1080i50, 1080p50, 720p50, 576i50, 59.94i/p; and progressive 23.976 / 24 / 29.97 / 30 at any size | 1080i50 TFF, BT.709 | 1080i50: fields kept as shot (BFF re-ordered). 50-motion sources: `bwdif` one frame per field, `fps=50`, scale, `interlace=scan=tff:lowpass=complex`. Film / 30p: scale, `fps=50` (pulldown: each frame held 2-3 fields), `interlace=scan=tff:lowpass=off` |
+| **Profile C** | SD progressive 25p | 1080p25, BT.709 | upconverted, pillarboxed per DAR |
 
-All three report **`fps_num/fps_den = 25/1`** (B: 25 interlaced frames = 50 fields). No source rate is preserved; that is deliberate, since everything plays on one 1080i50 channel.
+All three report **`fps_num/fps_den = 25/1`** (B: 25 interlaced frames = 50 fields). No source rate is preserved; that is deliberate, since everything plays on one 1080i50 channel. Film and 30p rates go out as 50i pulldown rather than 25p because decimating them to 25p repeats or drops a whole frame (a 40 ms hitch once a second for 24p, every sixth frame for 29.97p); spread over 50 fields the hitch is one field. It is repetition, not motion interpolation: no artefacts, and about 1.33x the 25p encode time.
 
 ### Common Stream Properties (All Profiles)
-- **Video Codec**: `libx264` High@4.2 4:2:0 8-bit, CRF + VBV cap, closed GOP of 50 frames (2 s), no scene-cut keyframes. Defaults: `preset = "medium"`, CRF 22 / 21 / 18, caps 20M/30M, 20M/30M, 5M/6M (about 1.3x the size of the V1 defaults for +0.76 dB SSIM, 1.17x the encode time).
+- **Video Codec**: `libx264` High@4.2 4:2:0 8-bit, CRF + VBV cap, closed GOP of 50 frames (2 s), no scene-cut keyframes. Defaults: `preset = "medium"`, CRF 22 / 21 / 18, caps 20M/30M, 20M/30M, 8M/12M (about 1.3x the size of the V1 defaults for +0.76 dB SSIM, 1.17x the encode time).
 - **Geometry**: display aspect from SAR/DAR, fitted into 1920x1080 with lanczos: 4:3 SD -> 1440x1080 pillarbox, anamorphic 16:9 SD and HDV -> full 1920x1080. 608-line IMX and 1088-line sources are cropped to their active picture first.
 - **Colour**: converted to BT.709 limited range from the source matrix (untagged SD is taken as BT.601, untagged HD as BT.709) and tagged bt709 on every profile. HDR (PQ / HLG) is tone-mapped with `zscale` + `tonemap=hable` when the ffmpeg build has libzimg; otherwise it is encoded untone-mapped and QC warns `hdr_not_tonemapped`.
 - **Audio Codec**: AAC / PCM stereo at **48,000 Hz** (EBU R128 by default)
@@ -166,7 +166,7 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 - `POST /api/recycle-bin/auto-purge`: Trigger background cleanup of expired trash items.
 
 ### Job Engine & Real-Time Monitoring
-- `GET /api/jobs`: List transcode job history.
+- `GET /api/jobs`: List live jobs and the last 5 days of job history (older records are pruned hourly; the assets themselves stay in the registry).
 - `GET /api/jobs/active`: List currently running transcode jobs.
 - `GET /api/jobs/pending`: List queued jobs waiting for execution.
 - `GET /api/jobs/failed`: List failed jobs with error logs.
@@ -278,8 +278,8 @@ bufsize = "30M"
 [profile_c]
 enabled = true
 crf = 18
-maxrate = "5M"
-bufsize = "6M"
+maxrate = "8M"
+bufsize = "12M"
 
 [ingestion]
 # Seconds a file must sit unchanged before it is considered complete.

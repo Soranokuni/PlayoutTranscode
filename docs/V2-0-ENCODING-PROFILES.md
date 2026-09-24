@@ -17,12 +17,14 @@ rate* is the field rate of interlaced material and the frame rate
 | Motion rate | Height | Profile | Output |
 |---|---|---|---|
 | >= 40/s (1080i50, 1080p50, 720p50, 576i50, 59.94i/p) | any | **B** | 1080i50 TFF |
-| < 40/s (25p, 24p, 29.97p, 30p, VFR ~24) | >= 700 | **A** | 1080p25 |
-| < 40/s | < 700 | **C** | 1080p25 |
+| progressive, not within 0.5 of 25 (23.976, 24, 29.97, 30, VFR ~24) | any | **B** (pulldown) | 1080i50 TFF |
+| 25p | >= 700 | **A** | 1080p25 |
+| 25p | < 700 | **C** | 1080p25 |
 
 **Picture paths** (`profiles::plan_video`):
 - A / C: `[bwdif=mode=send_frame]` (only if the source is interlaced) → `fps=25/1` → scale → pad.
 - B, 1080-line interlaced at 25 frames with no vertical resize: `fps=25/1` → `setfield` (+ `fieldorder=tff` for BFF) → `scale=...:interl=1` → pad. Fields are never deinterlaced.
+- B, progressive film / 30p (`VideoPath::FieldCadence`): scale → pad (4:2:2) at the source rate → `fps=50/1` (each frame held for 2 or 3 fields; 1 or 2 for 30p) → `interlace=scan=tff:lowpass=off` → field-aware 4:2:0. Measured on 1080p23.976: one repeated field twice a second instead of one repeated frame once a second, 1.33x the 25p encode time, +3% size.
 - B, everything else: `[bwdif=mode=send_field]` → `fps=50/1` → progressive scale to 4:2:2 → pad → `interlace=scan=tff:lowpass=complex` → field-aware 4:2:0 (`scale=interl=1`). 59.94 material is decimated to 50.
 - Every chain ends with `setparams` tagging BT.709 limited on the frames themselves.
 
@@ -30,7 +32,7 @@ rate* is the field rate of interlaced material and the frame rate
 
 **Colour**: scale `in_color_matrix` from the source tag (`bt709`; `smpte170m`/`bt470bg` → 601; `bt2020*`), untagged SD = 601, untagged HD = 709; `in_range` from the tag (or `yuvj*`), else limited; out BT.709 limited. All three profiles tag `bt709` primaries/transfer/matrix (C used to tag `smpte170m`). HDR (`smpte2084`, `arib-std-b67`) is tone-mapped with `zscale` + `tonemap=hable:desat=0` when the build has them; otherwise it is matrix-converted only.
 
-**Encoder** (defaults, measured in slice 6a): libx264 High@4.2 yuv420p, `preset=medium`, `tune=film`, CRF 22 / 21 / 18, maxrate/bufsize 20M/30M, 20M/30M, 5M/6M, `keyint=min-keyint=50`, `open-gop=0`, `scenecut=0`; B adds `interlaced=1:tff=1:pic-struct=1`, `-flags +ilme+ildct -field_order tt`. Input `-fflags +genpts+discardcorrupt`; `-filter_threads` = the per-encode thread share. `-video_track_timescale` is a multiple of the frame-rate numerator (1000 for 25/1).
+**Encoder** (defaults, measured in slice 6a): libx264 High@4.2 yuv420p, `preset=medium`, `tune=film`, CRF 22 / 21 / 18, maxrate/bufsize 20M/30M, 20M/30M, 8M/12M, `keyint=min-keyint=50`, `open-gop=0`, `scenecut=0`; B adds `interlaced=1:tff=1:pic-struct=1`, `-flags +ilme+ildct -field_order tt`. Input `-fflags +genpts+discardcorrupt`; `-filter_threads` = the per-encode thread share. `-video_track_timescale` is a multiple of the frame-rate numerator (1000 for 25/1).
 
 **Audio**: two or more mono source tracks are joined (tracks 1+2 → L/R) unless `dual_mono`; known multichannel layouts get a BS.775 matrix downmix, unknown/discrete ones take channels 1/2; no channel count fails. Every path starts with `aresample=[resampler=soxr:]osr=48000:async=1:min_hard_comp=0.1:first_pts=0` (soxr only when the build has libsoxr; `-async 1` is gone). Default policy EBU R128 (-23 LUFS / -1 dBTP) two-pass; linear whenever the projected true peak allows. `passthrough_validate` / `analyze_only` measure but never apply loudnorm.
 

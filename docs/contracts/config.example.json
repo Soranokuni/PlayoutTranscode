@@ -22,7 +22,7 @@
   "profiles": {
     "a": { "enabled": true, "crf": 22, "maxrate": "20M", "bufsize": "30M" },
     "b": { "enabled": true, "crf": 21, "maxrate": "20M", "bufsize": "30M" },
-    "c": { "enabled": true, "crf": 18, "maxrate": "5M", "bufsize": "6M" }
+    "c": { "enabled": true, "crf": 18, "maxrate": "8M", "bufsize": "12M" }
   },
   "ingestion": {
     "settle_secs": 5,

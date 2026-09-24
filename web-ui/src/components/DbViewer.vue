@@ -183,6 +183,11 @@
         </div>
       </div>
 
+      <p class="retention-note">
+        Job records are kept for 5 days. For anything older, search the clip in
+        <button class="link-btn" type="button" @click="activeSubTab = 'assets'">Assets</button>.
+      </p>
+
       <div class="table-container panel">
         <table class="db-table">
           <thead>
@@ -1053,6 +1058,21 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.retention-note {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent-cyan);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .db-viewer {
   display: flex;
   flex-direction: column;

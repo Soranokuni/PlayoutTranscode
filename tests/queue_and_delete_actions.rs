@@ -347,3 +347,56 @@ async fn diagnostics_counts_ready_assets_with_no_keyframe_evidence() {
         diag["metrics"]
     );
 }
+
+/// Handoff #1: an operator's cancel is remembered for that exact file, and a
+/// retry -- the answer to the held record -- forgets it again.
+#[tokio::test]
+async fn a_cancel_is_remembered_and_a_retry_forgets_it() {
+    use playout_transcode::jobs::{JobPhase, JobRecord};
+    let s = spawn_test_server().await;
+    let src = s.watch_dir.join("cancel-me.mxf");
+    std::fs::write(&src, b"source bytes").unwrap();
+    let path = src.to_string_lossy().into_owned();
+    let meta = std::fs::metadata(&src).unwrap();
+    let mtime = meta
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let job = JobRecord::new(&path, "pending");
+    let id = job.id.clone();
+    s.jobs.push(job);
+    let r = s
+        .post_json(&format!("/api/jobs/{id}/cancel"), serde_json::json!({}))
+        .await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(
+        db::check_cancel_hold(&s.pool, &path, meta.len(), mtime)
+            .await
+            .unwrap(),
+        db::CancelHold::Ask
+    );
+
+    // The next start's held record, retried from the UI. The service is not
+    // running, so the dispatch itself is refused -- the cancel is forgotten
+    // either way, because the operator has answered.
+    db::record_cancelled_source(&s.pool, &path, meta.len(), mtime)
+        .await
+        .unwrap();
+    let mut held = JobRecord::new(&path, "pending");
+    held.transition_to(JobPhase::Skipped, None).unwrap();
+    held.error_category = Some("held_after_cancel".into());
+    let held_id = held.id.clone();
+    s.jobs.push(held);
+    let _ = s
+        .post_json(&format!("/api/jobs/{held_id}/retry"), serde_json::json!({}))
+        .await;
+    assert_eq!(
+        db::check_cancel_hold(&s.pool, &path, meta.len(), mtime)
+            .await
+            .unwrap(),
+        db::CancelHold::None
+    );
+}
