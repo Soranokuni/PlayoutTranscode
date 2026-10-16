@@ -136,6 +136,19 @@ pub fn claim(target_root: &Path, registry_id: &str) -> Result<RegistryMarker, Cl
     }
 }
 
+/// Whether the marker in `target_root` names `registry_id`, without writing.
+///
+/// For `GET /api/v2/media-root` (C1): a client that can see the folder checks
+/// the same marker, so this answers "does the stamp say us?" and nothing else.
+/// A missing, unreadable or foreign marker is `false`. Blocking -- call it
+/// from `spawn_blocking`, since the target can be an SMB share (PL-07).
+pub fn is_claimed_by(target_root: &Path, registry_id: &str) -> bool {
+    std::fs::read_to_string(target_root.join(MARKER_FILE_NAME))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<RegistryMarker>(&raw).ok())
+        .is_some_and(|m| m.registry_id == registry_id)
+}
+
 fn write_marker(marker_path: &Path, marker: &RegistryMarker) -> Result<(), ClaimError> {
     let json = serde_json::to_string_pretty(marker).map_err(|e| ClaimError::Io {
         path: marker_path.to_path_buf(),
@@ -208,6 +221,30 @@ mod tests {
         std::fs::write(root.join(MARKER_FILE_NAME), "{not json").unwrap();
         let err = claim(&root, "registry-a").expect_err("an unreadable marker must refuse");
         assert!(matches!(err, ClaimError::Io { .. }));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C1 `claimed`: a folder stamped by another registry is not ours, and
+    /// asking must not touch the stamp.
+    #[test]
+    fn a_foreign_marker_is_not_claimed_by_us() {
+        let root = temp_root("foreign");
+        claim(&root, "registry-a").unwrap();
+        let before = std::fs::read_to_string(root.join(MARKER_FILE_NAME)).unwrap();
+        assert!(!is_claimed_by(&root, "registry-b"));
+        assert!(is_claimed_by(&root, "registry-a"));
+        let after = std::fs::read_to_string(root.join(MARKER_FILE_NAME)).unwrap();
+        assert_eq!(before, after, "the check must be read-only");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_missing_or_corrupt_marker_is_not_claimed() {
+        let root = temp_root("unclaimed");
+        assert!(!is_claimed_by(&root, "registry-a"));
+        assert!(!root.join(MARKER_FILE_NAME).exists(), "the check must not claim");
+        std::fs::write(root.join(MARKER_FILE_NAME), "{not json").unwrap();
+        assert!(!is_claimed_by(&root, "registry-a"));
         let _ = std::fs::remove_dir_all(&root);
     }
 }

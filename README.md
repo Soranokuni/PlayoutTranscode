@@ -180,6 +180,7 @@ PlayoutTranscode exposes a RESTful API and SSE stream on port `4353`:
 - `GET /api/config`: Read current runtime configuration.
 - `PUT /api/config`: Update and reload configuration dynamically.
 - `GET /api/diagnostics`: Export diagnostic package for troubleshooting.
+- `GET /api/v2/media-root`: This registry's identity and media root (`registry_id`, `target_folder`, `host`, `layout`, `marker_file`, `claimed`), so PlayOut can check that the folder it and CasparCG see carries this registry's `.playouttranscode-registry.json` marker. Token-protected.
 - `GET /api/db/overview`: Embedded database viewer and table row counts.
 
 ---

@@ -219,6 +219,7 @@ pub fn build_router(port: u16, bind_address: &str, deps: ServerDeps) -> Router {
         .route("/recycle-bin/purge", delete(delete_empty_recycle_bin))
         .route("/recycle-bin/auto-purge", post(post_auto_purge))
         .route("/metrics", get(get_metrics_v2))
+        .route("/media-root", get(get_media_root_v2))
         .route("/diagnostics", get(get_diagnostics))
         .route("/db/overview", get(get_db_overview_handler))
         .route("/db/assets", get(get_db_assets_handler))
@@ -1955,6 +1956,62 @@ async fn get_watchfolder(State(state): State<ServerState>) -> Json<WatchfolderIn
             true,
         ),
     })
+}
+
+/// `GET /api/v2/media-root` (contract C1).
+///
+/// PlayOut compares the folder it and CasparCG see against this registry: it
+/// reads the marker there and checks `registry_id`, including when this
+/// service runs on another machine and `target_folder` is a path only this
+/// host understands. Token-protected: it reveals a path.
+async fn get_media_root_v2(State(state): State<ServerState>) -> impl IntoResponse {
+    let registry_id = match db::registry_id(&state.pool).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!("Could not read this registry's identity: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "internal_error" })),
+            )
+                .into_response();
+        }
+    };
+    let target_folder = state.config.lock().paths.target_folder.clone();
+
+    // Off the runtime (PL-07): an SMB target that stops answering would hold a
+    // runtime worker for the whole network timeout on a single read.
+    let claimed = if target_folder.is_empty() {
+        false
+    } else {
+        let root = std::path::PathBuf::from(&target_folder);
+        let id = registry_id.clone();
+        tokio::task::spawn_blocking(move || crate::media_root::is_claimed_by(&root, &id))
+            .await
+            .unwrap_or(false)
+    };
+
+    Json(serde_json::json!({
+        "registry_id": registry_id,
+        "target_folder": target_folder,
+        "host": host_name(),
+        // Fixed subfolders of the target: `processor` publishes into
+        // `videos/`, `identity::sidecar_path_for` into `sidecars/`.
+        "layout": { "videos": "videos", "sidecars": "sidecars" },
+        "marker_file": crate::media_root::MARKER_FILE_NAME,
+        "claimed": claimed,
+    }))
+    .into_response()
+}
+
+/// This machine's name, from the environment (no extra dependency).
+fn host_name() -> String {
+    ["COMPUTERNAME", "HOSTNAME"]
+        .iter()
+        .filter_map(|k| std::env::var(k).ok())
+        .chain(std::iter::once_with(|| std::fs::read_to_string("/etc/hostname").ok()).flatten())
+        .map(|s| s.trim().to_string())
+        .find(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 async fn get_service_status(State(state): State<ServerState>) -> Json<serde_json::Value> {
