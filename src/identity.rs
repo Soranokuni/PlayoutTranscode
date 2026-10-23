@@ -507,6 +507,10 @@ pub enum SidecarRebuildError {
     ProbeUnavailable(String),
     /// The sidecar itself could not be written.
     WriteFailed(String),
+    /// The asset is a sub-clip. Its `current_path` is its parent's file, so a
+    /// sidecar written there would describe the parent's file under the
+    /// sub-clip's identity and trims (C-11).
+    Subclip { parent_uuid: String },
 }
 
 /// Rebuild a sidecar for an asset whose sidecar was lost.
@@ -527,6 +531,11 @@ pub fn rebuild_sidecar_from_media(
     asset: &crate::db::MediaAsset,
     tools: &crate::bootstrap::ToolPaths,
 ) -> Result<PathBuf, SidecarRebuildError> {
+    if let Some(parent_uuid) = &asset.parent_uuid {
+        return Err(SidecarRebuildError::Subclip {
+            parent_uuid: parent_uuid.clone(),
+        });
+    }
     if asset.current_path.is_empty() {
         return Err(SidecarRebuildError::MezzanineMissing);
     }
@@ -550,6 +559,10 @@ pub fn build_sidecar_from_db_asset_with_probe(
     asset: &crate::db::MediaAsset,
     probe: Option<&ProbeData>,
 ) -> Result<PathBuf, String> {
+    // C-11: the file belongs to the parent, and so does its sidecar.
+    if asset.parent_uuid.is_some() {
+        return Err("A sub-clip has no sidecar of its own".to_string());
+    }
     if asset.current_path.is_empty() {
         return Err("Asset current_path is empty".to_string());
     }

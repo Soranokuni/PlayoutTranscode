@@ -3281,6 +3281,18 @@ async fn post_regenerate_sidecar(
                     )
                         .into_response()
                 }
+                Ok(Err(crate::identity::SidecarRebuildError::Subclip { parent_uuid })) => {
+                    // 409: the request is well-formed but contradicts what the
+                    // asset is. The parent's sidecar is the one to regenerate.
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "subclip_has_no_sidecar",
+                            "parent_uuid": parent_uuid,
+                        })),
+                    )
+                        .into_response()
+                }
                 Ok(Err(crate::identity::SidecarRebuildError::WriteFailed(e))) => {
                     tracing::error!("Failed to rebuild sidecar for '{}': {}", uuid, e);
                     (
