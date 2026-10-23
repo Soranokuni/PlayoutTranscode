@@ -31,7 +31,13 @@ async fn health_is_reachable_without_a_token() {
 async fn protected_routes_require_a_token() {
     let s = authed_server().await;
 
-    for path in ["/api/jobs", "/api/config", "/api/assets", "/api/v2/assets"] {
+    for path in [
+        "/api/jobs",
+        "/api/config",
+        "/api/assets",
+        "/api/v2/assets",
+        "/api/v2/media-root",
+    ] {
         let r = s.get(path).await;
         assert_eq!(r.status(), 401, "{} must require a token", path);
         let body: serde_json::Value = r.json().await.expect("json");

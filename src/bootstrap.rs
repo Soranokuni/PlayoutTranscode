@@ -518,7 +518,10 @@ fn extract_and_install(zip_path: &Path, staging: &Path, bin: &Path) -> Result<()
         if entry.is_dir() {
             continue;
         }
-        let name = entry.name().to_string();
+        let name = entry
+            .name()
+            .map_err(|e| format!("Zip entry {}: {}", i, e))?
+            .to_string();
         let Some(dest) = extraction_target(staging, &name) else {
             continue;
         };

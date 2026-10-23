@@ -32,7 +32,7 @@ tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["fs", "cors", "timeout", "limit", "trace"] }
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
-zip = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 anyhow = "1"
 parking_lot = "0.12"

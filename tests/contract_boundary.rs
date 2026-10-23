@@ -466,3 +466,77 @@ mod integration_tests {
         );
     }
 }
+
+// The shared test server, at the crate root: a `#[path]` inside an inline
+// module resolves under a `media_root_contract/` folder, which only Windows
+// forgives.
+mod common;
+
+/// Contract C1: `GET /api/v2/media-root`, against the real router.
+///
+/// PlayOut deserialises exactly this shape to verify that the folder it and
+/// CasparCG see is this registry's target folder. `deny_unknown_fields` is
+/// deliberate: a new key is a contract change and must be made in both repos.
+mod media_root_contract {
+    use super::common;
+
+    use playout_transcode::{db, media_root};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MediaRootLayout {
+        videos: String,
+        sidecars: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct MediaRootResponse {
+        registry_id: String,
+        target_folder: String,
+        host: String,
+        layout: MediaRootLayout,
+        marker_file: String,
+        claimed: bool,
+    }
+
+    async fn fetch(s: &common::TestServer) -> MediaRootResponse {
+        let r = s.get("/api/v2/media-root").await;
+        assert_eq!(r.status(), 200);
+        r.json().await.expect("C1 shape")
+    }
+
+    #[tokio::test]
+    async fn media_root_reports_a_claimed_folder() {
+        let s = common::spawn_test_server().await;
+        let ours = db::registry_id(&s.pool).await.unwrap();
+        media_root::claim(&s.target_dir, &ours).unwrap();
+
+        let body = fetch(&s).await;
+        assert_eq!(body.registry_id, ours);
+        assert_eq!(body.target_folder, s.target_dir.to_string_lossy());
+        assert!(!body.host.is_empty());
+        assert_eq!(body.layout.videos, "videos");
+        assert_eq!(body.layout.sidecars, "sidecars");
+        assert_eq!(body.marker_file, ".playouttranscode-registry.json");
+        assert_eq!(body.marker_file, media_root::MARKER_FILE_NAME);
+        assert!(body.claimed);
+    }
+
+    #[tokio::test]
+    async fn media_root_is_unclaimed_without_our_marker() {
+        let s = common::spawn_test_server().await;
+        let ours = db::registry_id(&s.pool).await.unwrap();
+
+        // No marker yet: reading must not create one.
+        assert!(!fetch(&s).await.claimed);
+        assert!(!s.target_dir.join(media_root::MARKER_FILE_NAME).exists());
+
+        // Another registry's marker.
+        media_root::claim(&s.target_dir, "some-other-registry").unwrap();
+        let body = fetch(&s).await;
+        assert_eq!(body.registry_id, ours);
+        assert!(!body.claimed);
+    }
+}
