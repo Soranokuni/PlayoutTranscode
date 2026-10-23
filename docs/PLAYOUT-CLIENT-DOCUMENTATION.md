@@ -1201,3 +1201,12 @@ lra_lu, mode }`. A sub-clip carries its parent's. Rows published before this
 are filled from their sidecars on the next start; until then the fields are
 absent, as before. Since T-5 a QC failure is already `status = "error"`, so
 the gate agrees with the status rather than adding a second verdict.
+
+### 14.5 C-19 — the boundary test now tests the boundary
+
+`tests/contract_boundary.rs` used to carry its own copies of `AssetResponse`,
+`hydrate_item` and `compute_frame_trim` and test those, so it passed whatever
+the server did. It now publishes assets through the real `db` functions,
+fetches them through the real router (v1, v2 and batch), and decodes them into
+a mirror of your DTOs with your required fields required. If you change what
+you require from an asset, change the mirror there too.

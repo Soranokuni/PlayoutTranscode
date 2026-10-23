@@ -1,476 +1,271 @@
-mod contract {
-    use serde::{Deserialize, Serialize};
+//! The PlayOut boundary, tested against what this crate really serves (C-19).
+//!
+//! These tests used to define their own `AssetResponse`, `hydrate_item` and
+//! `compute_frame_trim` and test those, so they stayed green through any
+//! rename or status change on the server. Now every asset is produced by the
+//! real `db` functions and fetched through the real router, and decoded into a
+//! mirror of the DTOs PlayOut deserialises (`src-tauri/src/ingestor_api.rs`):
+//! its required fields are required here too, so a renamed or dropped field,
+//! or a status PlayOut does not know, fails this file instead of a take.
+//! PlayOut's own trim maths is tested in PlayOut.
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct AssetResponse {
-        pub uuid: String,
-        pub playoutvue_id: String,
-        pub current_path: String,
-        pub duration_ms: i64,
-        pub trim_in_ms: i64,
-        pub trim_out_ms: i64,
-        pub fps_num: i64,
-        pub fps_den: i64,
-        pub mezzanine_ok: bool,
-        pub fps: f64,
-        pub total_frames: i64,
-        pub gop_frames: i64,
-        pub keyframe_safe_start_ms: i64,
+// The shared test server, at the crate root: a `#[path]` inside an inline
+// module resolves under a folder of the module's name, which only Windows
+// forgives.
+mod common;
+
+mod playout_contract {
+    use super::common;
+    use playout_transcode::db;
+    use serde::Deserialize;
+    use std::collections::HashMap;
+
+    /// PlayOut's `AssetResponse` / `V2AssetDto`. No `deny_unknown_fields`:
+    /// PlayOut ignores fields it does not know, so additive changes are fine.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)] // fields that only have to decode
+    struct PlayoutAsset {
+        uuid: String,
+        #[serde(default)]
+        playoutvue_id: Option<String>,
+        current_path: String,
+        duration_ms: i64,
+        trim_in_ms: i64,
+        trim_out_ms: i64,
+        rating: String,
+        tp: String,
+        status: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        #[serde(default)]
+        virtual_folder: Option<String>,
+        #[serde(default)]
+        mezzanine_ok: Option<bool>,
+        #[serde(default)]
+        fps_num: Option<i64>,
+        #[serde(default)]
+        fps_den: Option<i64>,
+        #[serde(default)]
+        total_frames: Option<i64>,
+        #[serde(default)]
+        gop_frames: Option<i64>,
+        #[serde(default)]
+        keyframe_safe_start_ms: Option<i64>,
+        #[serde(default)]
+        warnings: Option<Vec<String>>,
+        #[serde(default)]
+        parent_uuid: Option<String>,
+        #[serde(default)]
+        qc_report: Option<PlayoutQcReport>,
+        #[serde(default)]
+        loudness: Option<PlayoutLoudness>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct RundownItem {
-        pub id: String,
-        pub path: String,
-        pub playoutvue_id: String,
-        pub duration_ms: i64,
-        pub trim_in_ms: i64,
-        pub trim_out_ms: i64,
-        pub fps_num: i64,
-        pub fps_den: i64,
+    /// PlayOut's `V2QcReportDto` and `V2QcFindingDto`.
+    #[derive(Debug, Deserialize)]
+    struct PlayoutQcReport {
+        passed: bool,
+        #[serde(default)]
+        blocking_errors: usize,
+        #[serde(default)]
+        findings: Vec<PlayoutQcFinding>,
     }
 
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct FrameTrimResult {
-        pub in_frame: u32,
-        pub out_frame: u32,
-        pub duration_frames: u32,
-        pub fps_rational: String,
+    #[derive(Debug, Deserialize)]
+    struct PlayoutQcFinding {
+        severity: String,
+        code: String,
+        #[allow(dead_code)]
+        message: String,
     }
 
-    pub fn hydrate_item(raw: &AssetResponse) -> RundownItem {
-        let id = raw.playoutvue_id.clone();
-        let path = raw.current_path.clone();
-        let playoutvue_id = raw.playoutvue_id.clone();
-        let duration_ms = raw.duration_ms;
-        let trim_in_ms = raw.trim_in_ms;
-        let mut trim_out_ms = raw.trim_out_ms;
-
-        let fps_num = if raw.fps_num > 0 && raw.fps_den > 0 {
-            raw.fps_num
-        } else {
-            25
-        };
-        let fps_den = if raw.fps_num > 0 && raw.fps_den > 0 {
-            raw.fps_den
-        } else {
-            1
-        };
-
-        if duration_ms > 0 {
-            if trim_out_ms == 0 || trim_out_ms > duration_ms {
-                trim_out_ms = duration_ms;
-            }
-            if trim_out_ms <= trim_in_ms {
-                trim_out_ms = duration_ms;
-            }
-        }
-
-        RundownItem {
-            id,
-            path,
-            playoutvue_id,
-            duration_ms,
-            trim_in_ms,
-            trim_out_ms,
-            fps_num,
-            fps_den,
-        }
+    /// PlayOut's `V2LoudnessDto`.
+    #[derive(Debug, Deserialize)]
+    struct PlayoutLoudness {
+        #[serde(default)]
+        integrated_lufs: Option<f64>,
+        #[serde(default)]
+        lra_lu: Option<f64>,
+        #[serde(default)]
+        mode: Option<String>,
     }
 
-    pub fn compute_frame_trim(item: &RundownItem) -> Result<FrameTrimResult, String> {
-        if item.fps_num <= 0 || item.fps_den <= 0 {
-            return Err(format!(
-                "Invalid frame rate for asset: {}/{}",
-                item.fps_num, item.fps_den
-            ));
-        }
+    /// The `IngestorStatus` values PlayOut has a branch for.
+    const PLAYOUT_STATUSES: [&str; 4] = ["processing", "ready", "error", "missing"];
 
-        let fps = item.fps_num as f64 / item.fps_den as f64;
-        let total_dur = if item.duration_ms < 0 {
-            0
-        } else {
-            item.duration_ms
-        };
-        let in_ms = item.trim_in_ms.clamp(0, total_dur);
-        let out_ms = if item.trim_out_ms <= 0 || item.trim_out_ms > total_dur {
-            total_dur
-        } else {
-            item.trim_out_ms
-        };
-
-        if out_ms <= in_ms {
-            return Err(format!(
-                "Asset has zero or invalid duration ({}ms), cannot trim",
-                total_dur
-            ));
-        }
-
-        let in_frame = ((in_ms as f64 / 1000.0) * fps).floor() as u32;
-        let out_frame_raw = ((out_ms as f64 / 1000.0) * fps).ceil() as u32;
-        let total_frames = ((total_dur as f64 / 1000.0) * fps).round() as u32;
-        let out_frame = std::cmp::min(out_frame_raw, total_frames);
-        let duration_frames = out_frame.saturating_sub(in_frame);
-
-        Ok(FrameTrimResult {
-            in_frame,
-            out_frame,
-            duration_frames,
-            fps_rational: format!("{}/{}", item.fps_num, item.fps_den),
-        })
-    }
-
-    pub fn caspar_play_command(
-        channel: u32,
-        layer: u32,
-        path: &str,
-        trim: &FrameTrimResult,
-    ) -> String {
-        format!(
-            "PLAY {}-{} \"{}\" SEEK {} LENGTH {}",
-            channel, layer, path, trim.in_frame, trim.duration_frames
-        )
-    }
-
-    pub fn expected_out_ms(trim: &FrameTrimResult) -> Result<i64, String> {
-        let parts: Vec<&str> = trim.fps_rational.split('/').collect();
-        if parts.len() != 2 {
-            return Err("Invalid fps_rational".into());
-        }
-        let num: f64 = parts[0].parse().map_err(|_| "Invalid numerator")?;
-        let den: f64 = parts[1].parse().map_err(|_| "Invalid denominator")?;
-        if den <= 0.0 || num <= 0.0 {
-            return Err("Invalid fps value".into());
-        }
-        let fps = num / den;
-        let ms = ((trim.duration_frames as f64 / fps) * 1000.0).round() as i64;
-        if ms <= 0 {
-            return Err("Zero or negative duration".into());
-        }
-        Ok(ms)
-    }
-}
-
-#[cfg(test)]
-mod integration_tests {
-    use super::contract::*;
-
-    fn make_ready_asset(
+    async fn publish(
+        s: &common::TestServer,
         uuid: &str,
-        path: &str,
+        file: &str,
         duration_ms: i64,
         fps_num: i64,
         fps_den: i64,
-    ) -> AssetResponse {
-        AssetResponse {
-            uuid: uuid.to_string(),
-            playoutvue_id: uuid.to_string(),
-            current_path: path.to_string(),
+        mezzanine_ok: bool,
+    ) -> String {
+        let path = s.target_dir.join(file).to_string_lossy().to_string();
+        db::insert_processing(&s.pool, uuid, duration_ms, None, &path, file)
+            .await
+            .expect("insert");
+        let fps = fps_num as f64 / fps_den as f64;
+        let total_frames = (duration_ms * fps_num) / (1000 * fps_den);
+        db::mark_ready(
+            &s.pool,
+            uuid,
+            &path,
             duration_ms,
-            trim_in_ms: 0,
-            trim_out_ms: duration_ms,
+            mezzanine_ok,
+            fps,
             fps_num,
             fps_den,
-            mezzanine_ok: true,
-            fps: fps_num as f64 / fps_den as f64,
-            total_frames: ((duration_ms as f64 / 1000.0) * (fps_num as f64 / fps_den as f64))
-                .round() as i64,
-            gop_frames: ((fps_num as f64 / fps_den as f64) * 2.0).round() as i64,
-            keyframe_safe_start_ms: 0,
-        }
+            total_frames,
+            (fps * 2.0).round() as i64,
+            0,
+            &[],
+            "[0,2000,4000,6000,8000]",
+            None,
+        )
+        .await
+        .expect("mark_ready");
+        path
     }
 
-    #[test]
-    fn test_boundary_transcode_ready_to_caspar_registration_pal() {
-        let asset = make_ready_asset(
-            "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
-            "D:/media/videos/clip_a1b2c3d4.mp4",
-            10_000,
-            25,
-            1,
+    /// The asset through both single-asset routes PlayOut calls, which must agree.
+    async fn fetch(s: &common::TestServer, uuid: &str) -> PlayoutAsset {
+        let v2 = s.get(&format!("/api/v2/assets/{uuid}")).await;
+        assert_eq!(v2.status(), 200, "v2 asset {uuid}");
+        let v2_text = v2.text().await.unwrap();
+        let v1 = s.get(&format!("/api/assets/{uuid}")).await;
+        assert_eq!(v1.status(), 200, "v1 asset {uuid}");
+        let v1_text = v1.text().await.unwrap();
+        let asset: PlayoutAsset = serde_json::from_str(&v2_text)
+            .unwrap_or_else(|e| panic!("PlayOut cannot decode {uuid} ({e}): {v2_text}"));
+        let _: PlayoutAsset = serde_json::from_str(&v1_text)
+            .unwrap_or_else(|e| panic!("PlayOut cannot decode v1 {uuid} ({e}): {v1_text}"));
+        assert!(
+            PLAYOUT_STATUSES.contains(&asset.status.as_str()),
+            "status {}",
+            asset.status
         );
+        asset
+    }
 
-        assert!(
-            asset.duration_ms > 0,
-            "duration_ms must be resolved before ready"
-        );
-        assert!(
-            !asset.current_path.is_empty(),
-            "path must be final before ready"
-        );
-        assert!(
-            asset.trim_out_ms > asset.trim_in_ms,
-            "trims must be valid before ready"
-        );
-        assert!(
-            asset.fps_num > 0 && asset.fps_den > 0,
-            "fps rational must be present before ready"
-        );
-        assert!(
-            asset.mezzanine_ok,
-            "mezzanine_ok must be true for a ready asset"
-        );
+    #[tokio::test]
+    async fn a_ready_asset_meets_what_playout_relies_on() {
+        let s = common::spawn_test_server().await;
+        let uuid = "a1b2c3d4-e5f6-4890-abcd-ef1234567890";
+        let path = publish(&s, uuid, "clip.mp4", 10_000, 25, 1, true).await;
 
-        let item = hydrate_item(&asset);
-
-        assert_eq!(item.id, asset.uuid, "id must come from playoutvue_id");
+        let a = fetch(&s, uuid).await;
+        assert_eq!(a.status, "ready");
         assert_eq!(
-            item.path, asset.current_path,
-            "path must be the final playout path"
+            a.mezzanine_ok,
+            Some(true),
+            "a ready asset is always mezzanine_ok"
         );
-        assert_eq!(item.playoutvue_id, asset.uuid);
-        assert_eq!(item.duration_ms, 10_000);
-        assert_eq!(item.trim_in_ms, 0);
+        assert_eq!(a.uuid, uuid);
         assert_eq!(
-            item.trim_out_ms, 10_000,
-            "trim_out_ms must equal duration_ms (no repair needed)"
+            a.playoutvue_id.as_deref(),
+            Some(uuid),
+            "uuid and playoutvue_id are one identity"
         );
-        assert_eq!(item.fps_num, 25);
-        assert_eq!(item.fps_den, 1);
-
-        let trim = compute_frame_trim(&item)
-            .expect("frame trim computation must succeed on a ready asset");
-
-        assert_eq!(trim.in_frame, 0);
-        assert_eq!(trim.duration_frames, 250, "10s at 25fps = 250 frames");
-        assert_eq!(trim.fps_rational, "25/1");
-
-        let cmd = caspar_play_command(1, 10, &item.path, &trim);
+        assert_eq!(a.current_path, path, "the final playable path");
         assert_eq!(
-            cmd,
-            "PLAY 1-10 \"D:/media/videos/clip_a1b2c3d4.mp4\" SEEK 0 LENGTH 250"
+            (a.duration_ms, a.trim_in_ms, a.trim_out_ms),
+            (10_000, 0, 10_000)
         );
+        assert_eq!((a.fps_num, a.fps_den), (Some(25), Some(1)));
+        assert!(a.parent_uuid.is_none(), "a full-length asset has no parent");
+    }
 
-        let out_ms = expected_out_ms(&trim).expect("expected out ms must be computable");
+    #[tokio::test]
+    async fn an_ntsc_rate_is_served_as_the_exact_rational() {
+        let s = common::spawn_test_server().await;
+        let uuid = "b2c3d4e5-f6a7-4901-bcde-f12345678901";
+        publish(&s, uuid, "ntsc.mp4", 10_010, 30_000, 1001, true).await;
+
+        let a = fetch(&s, uuid).await;
         assert_eq!(
-            out_ms, 10_000,
-            "expected out must match the asset's duration"
+            (a.fps_num, a.fps_den),
+            (Some(30_000), Some(1001)),
+            "never 29970/1000"
         );
     }
 
-    #[test]
-    fn test_boundary_transcode_ready_to_caspar_registration_ntsc() {
-        let asset = make_ready_asset(
-            "ntsc-asset-001",
-            "D:/media/videos/ntsc_clip.mp4",
-            10_010,
-            30000,
-            1001,
-        );
+    #[tokio::test]
+    async fn a_qc_failed_mezzanine_is_error_never_ready() {
+        let s = common::spawn_test_server().await;
+        let uuid = "c3d4e5f6-a7b8-4012-8def-123456789012";
+        publish(&s, uuid, "bad.mp4", 10_000, 25, 1, false).await;
 
-        let item = hydrate_item(&asset);
-
-        assert_eq!(item.fps_num, 30000);
-        assert_eq!(item.fps_den, 1001);
-        assert!(
-            !(item.fps_num == 29970 && item.fps_den == 1000),
-            "must use broadcast rational, not float approximation"
-        );
-
-        let trim = compute_frame_trim(&item).expect("trim must succeed");
-        assert_eq!(trim.fps_rational, "30000/1001");
-
-        let _cmd = caspar_play_command(1, 10, &item.path, &trim);
-        let out_ms = expected_out_ms(&trim).expect("out ms must be computable");
-        assert!(out_ms > 0, "duration must be positive");
+        let a = fetch(&s, uuid).await;
+        assert_eq!(a.status, "error");
+        assert_eq!(a.mezzanine_ok, Some(false));
     }
 
-    #[test]
-    fn test_boundary_trimmed_subclip() {
-        let parent = make_ready_asset("parent-001", "D:/media/videos/parent.mp4", 60_000, 25, 1);
+    #[tokio::test]
+    async fn a_subclip_names_its_parent_and_plays_its_file_with_its_own_window() {
+        let s = common::spawn_test_server().await;
+        let parent = "d4e5f6a7-b8c9-4123-9efa-234567890123";
+        let sub = "e5f6a7b8-c9d0-4234-afab-345678901234";
+        let path = publish(&s, parent, "parent.mp4", 60_000, 25, 1, true).await;
+        db::create_subclip(&s.pool, sub, parent, "Sub", 4_000, 14_000, true, "[]")
+            .await
+            .expect("create")
+            .expect("parent exists");
 
-        let subclip = AssetResponse {
-            uuid: "subclip-001".to_string(),
-            playoutvue_id: "subclip-001".to_string(),
-            current_path: parent.current_path.clone(),
-            duration_ms: parent.duration_ms,
-            trim_in_ms: 5_000,
-            trim_out_ms: 15_000,
-            fps_num: 25,
-            fps_den: 1,
-            mezzanine_ok: true,
-            fps: 25.0,
-            total_frames: 1500,
-            gop_frames: 50,
-            keyframe_safe_start_ms: 0,
-        };
-
-        let item = hydrate_item(&subclip);
-        assert_eq!(item.trim_in_ms, 5_000);
-        assert_eq!(item.trim_out_ms, 15_000);
-        assert_eq!(item.duration_ms, 60_000, "subclip shares parent duration");
-
-        let trim = compute_frame_trim(&item).expect("trimmed subclip must compute frame trim");
-        assert_eq!(trim.in_frame, 125, "5000ms at 25fps = 125 frames");
-        assert_eq!(trim.duration_frames, 250, "10000ms content = 250 frames");
-
-        let cmd = caspar_play_command(1, 10, &item.path, &trim);
-        assert!(cmd.contains("SEEK 125"), "SEEK must use in_frame");
-        assert!(
-            cmd.contains("LENGTH 250"),
-            "LENGTH must use content duration_frames"
-        );
-
-        let out_ms = expected_out_ms(&trim).expect("out ms must be computable");
+        let a = fetch(&s, sub).await;
+        assert_eq!(a.parent_uuid.as_deref(), Some(parent));
+        assert_eq!(a.current_path, path, "a sub-clip plays its parent's file");
         assert_eq!(
-            out_ms, 10_000,
-            "expected out must be the content duration (10s), not absolute (15s)"
+            (a.duration_ms, a.trim_in_ms, a.trim_out_ms),
+            (60_000, 4_000, 14_000)
         );
+        assert_eq!(a.status, "ready");
+
+        // The batch route PlayOut resolves a rundown with: a map by uuid.
+        let r = s
+            .post_json("/api/assets/batch", serde_json::json!([parent, sub]))
+            .await;
+        assert_eq!(r.status(), 200);
+        let batch: HashMap<String, PlayoutAsset> =
+            r.json().await.expect("PlayOut decodes the batch");
+        assert_eq!(batch[sub].parent_uuid.as_deref(), Some(parent));
+        assert!(batch[parent].parent_uuid.is_none());
     }
 
-    #[test]
-    fn test_boundary_trimmed_subclip_custom_display_name() {
-        let parent = make_ready_asset("parent-002", "D:/media/videos/parent2.mp4", 120_000, 25, 1);
+    #[tokio::test]
+    async fn the_qc_report_and_loudness_decode_as_playout_reads_them() {
+        let s = common::spawn_test_server().await;
+        let uuid = "f6a7b8c9-d0e1-4345-babc-456789012345";
+        publish(&s, uuid, "loud.mp4", 10_000, 25, 1, true).await;
+        let qc = serde_json::json!({
+            "passed": true, "blocking_errors": 0, "warnings_count": 1,
+            "findings": [{ "severity": "warning", "code": "loudness_dynamic_mode", "message": "dynamic" }]
+        });
+        let loudness = serde_json::to_string(&db::AssetLoudness {
+            integrated_lufs: -23.0,
+            true_peak_dbtp: -1.5,
+            lra_lu: 7.0,
+            mode: "ebu_r128".into(),
+        })
+        .unwrap();
+        db::record_qc_and_loudness(&s.pool, uuid, Some(&qc.to_string()), Some(&loudness))
+            .await
+            .unwrap();
 
-        let subclip = AssetResponse {
-            uuid: "subclip-custom-title-99".to_string(),
-            playoutvue_id: "subclip-custom-title-99".to_string(),
-            current_path: parent.current_path.clone(),
-            duration_ms: parent.duration_ms,
-            trim_in_ms: 10_000,
-            trim_out_ms: 20_000,
-            fps_num: 25,
-            fps_den: 1,
-            mezzanine_ok: true,
-            fps: 25.0,
-            total_frames: 3000,
-            gop_frames: 50,
-            keyframe_safe_start_ms: 0,
-        };
-
-        let item = hydrate_item(&subclip);
-        assert_eq!(item.trim_in_ms, 10_000);
-        assert_eq!(item.trim_out_ms, 20_000);
-
-        let trim = compute_frame_trim(&item).expect("custom title subclip must compute frame trim");
-        assert_eq!(trim.in_frame, 250, "10000ms at 25fps = 250 frames");
-        assert_eq!(trim.duration_frames, 250, "10000ms content = 250 frames");
-
-        let cmd = caspar_play_command(1, 10, &item.path, &trim);
-        assert!(
-            cmd.contains("SEEK 250"),
-            "SEEK must handle non-pattern titles"
-        );
-    }
-
-    #[test]
-    fn test_boundary_hydration_no_repair_needed() {
-        let asset = make_ready_asset(
-            "repair-test-001",
-            "D:/media/videos/no_repair.mp4",
-            30_000,
-            50,
-            1,
-        );
-
-        let item = hydrate_item(&asset);
-
+        let a = fetch(&s, uuid).await;
+        let report = a.qc_report.expect("qc_report served");
+        assert!(report.passed);
+        assert_eq!(report.blocking_errors, 0, "PlayOut's QC gate reads this");
+        assert_eq!(report.findings[0].severity, "warning");
+        assert_eq!(report.findings[0].code, "loudness_dynamic_mode");
+        let l = a.loudness.expect("loudness served");
         assert_eq!(
-            item.trim_out_ms, asset.duration_ms,
-            "hydrateItem must not need to repair trim_out_ms when ingestor set it correctly"
-        );
-        assert_eq!(
-            item.fps_num, 50,
-            "hydrateItem must use the ingestor's rational fps directly, not reconstruct from float"
-        );
-        assert_eq!(item.fps_den, 1);
-    }
-
-    #[test]
-    fn test_boundary_invalid_fps_asset_must_not_be_ready() {
-        // The ingestor must NEVER publish fps_num=0, fps_den=0 on a ready asset.
-        // PlayOutVue's hydrator has a resilience fallback (defaults to 25/1),
-        // which would mask the error and produce wrong frame trim for NTSC content.
-        // This test validates the contract at the ingestor boundary: if fps is
-        // zero, the asset must not be marked ready/mezzanine_ok.
-        let mut asset =
-            make_ready_asset("bad-fps-001", "D:/media/videos/bad_fps.mp4", 10_000, 25, 1);
-        asset.fps_num = 0;
-        asset.fps_den = 0;
-        asset.mezzanine_ok = false;
-
-        // A correct ingestor would never let this asset reach "ready" status.
-        // The contract says: fps_num and fps_den must be present and > 0 before ready.
-        assert!(
-            asset.fps_num == 0 || asset.fps_den == 0,
-            "this test simulates a broken ingestor output"
-        );
-        assert!(
-            !asset.mezzanine_ok,
-            "broken fps must force mezzanine_ok=false"
-        );
-    }
-
-    #[test]
-    fn test_boundary_zero_duration_asset_rejected() {
-        let mut asset = make_ready_asset("zero-dur-001", "D:/media/videos/zero.mp4", 0, 25, 1);
-        asset.trim_out_ms = 0;
-        asset.mezzanine_ok = false;
-
-        let item = hydrate_item(&asset);
-        let result = compute_frame_trim(&item);
-        assert!(
-            result.is_err(),
-            "compute_frame_trim must reject zero-duration assets — they should never be 'ready'"
-        );
-    }
-
-    #[test]
-    fn test_ingestor_db_purge_preserves_subclips() {
-        // This test validates the F9 fix: purging a subclip by uuid must NOT
-        // delete the parent's mezzanine file or other subclip rows.
-        // The actual DB test requires a SQLite pool; here we verify the
-        // purge_row_by_uuid vs purge_rows_by_fingerprint distinction at the
-        // API contract level.
-        let parent_uuid = "parent-purge-001";
-        let subclip_uuid = "subclip-purge-001";
-        assert_ne!(parent_uuid, subclip_uuid, "uuids must be distinct");
-    }
-
-    #[test]
-    fn test_ingestor_db_rating_isolated_by_uuid() {
-        // F9 fix: set_rating keys on uuid, not fingerprint.
-        // Two subclips sharing the same parent fingerprint must be ratable
-        // independently. This is validated at the DB layer (db.rs set_rating
-        // now uses WHERE uuid = ?).
-    }
-
-    #[test]
-    fn test_boundary_v2_end_to_end_qc_and_audio_metadata_hydration() {
-        // Transcode publishes ready asset with V2 QC & Loudness metadata
-        let asset = make_ready_asset(
-            "v2-e2e-001",
-            "D:/media/mezzanine/broadcast_program.mp4",
-            120_000,
-            25,
-            1,
-        );
-
-        let item = hydrate_item(&asset);
-        assert_eq!(item.id, "v2-e2e-001");
-        assert_eq!(item.duration_ms, 120_000);
-        assert_eq!(item.trim_in_ms, 0);
-        assert_eq!(item.trim_out_ms, 120_000);
-        assert_eq!(item.fps_num, 25);
-        assert_eq!(item.fps_den, 1);
-
-        let trim = compute_frame_trim(&item).expect("frame trim computation must succeed");
-        assert_eq!(trim.in_frame, 0);
-        assert_eq!(trim.duration_frames, 3000);
-        assert_eq!(trim.fps_rational, "25/1");
-
-        let cmd = caspar_play_command(1, 10, &item.path, &trim);
-        assert_eq!(
-            cmd,
-            r#"PLAY 1-10 "D:/media/mezzanine/broadcast_program.mp4" SEEK 0 LENGTH 3000"#
+            (l.integrated_lufs, l.lra_lu, l.mode.as_deref()),
+            (Some(-23.0), Some(7.0), Some("ebu_r128"))
         );
     }
 }
-
-// The shared test server, at the crate root: a `#[path]` inside an inline
-// module resolves under a `media_root_contract/` folder, which only Windows
-// forgives.
-mod common;
 
 /// Contract C1: `GET /api/v2/media-root`, against the real router.
 ///
