@@ -89,6 +89,12 @@ pub struct AssetResponse {
     pub deleted_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub original_virtual_folder: Option<String>,
+    /// The full-length asset a sub-clip was cut from; absent on a full-length
+    /// asset (C-18). A sub-clip shares its parent's `current_path`, so without
+    /// this a client could only guess which of the two it was looking at from
+    /// the trim window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_uuid: Option<String>,
 }
 
 impl From<MediaAsset> for AssetResponse {
@@ -120,6 +126,7 @@ impl From<MediaAsset> for AssetResponse {
             retry_suppressed: is_retry_suppressed(a.qc_verdict_key.as_deref()),
             deleted_at: a.deleted_at,
             original_virtual_folder: a.original_virtual_folder,
+            parent_uuid: a.parent_uuid,
         }
     }
 }
@@ -5407,6 +5414,25 @@ mod tests {
         assert!(is_subclip_row(500, 10_000, 10_000));
         assert!(is_subclip_row(0, 4_000, 10_000));
         assert!(is_subclip_row(1_000, 4_000, 10_000));
+    }
+
+    #[tokio::test]
+    async fn the_response_names_a_subclips_parent_and_only_then() {
+        let (pool, dir) = setup_test_pool().await;
+        ready_row(&pool, "parent", 42, "D:/target/p.mp4", 60_000, 0, 60_000).await;
+        create_subclip(&pool, "sub", "parent", "Sub", 10_000, 20_000, true, "[]")
+            .await
+            .unwrap()
+            .expect("sub-clip created");
+
+        let as_json = |a: MediaAsset| serde_json::to_value(AssetResponse::from(a)).unwrap();
+        let sub = as_json(find_by_uuid(&pool, "sub").await.unwrap().unwrap());
+        let parent = as_json(find_by_uuid(&pool, "parent").await.unwrap().unwrap());
+
+        assert_eq!(sub["parent_uuid"], "parent");
+        assert!(parent.get("parent_uuid").is_none(), "{parent}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -117,6 +117,7 @@ Field invariants (PlayOutVue boundary — enforced by `tests/contract_boundary.r
 | `warnings` | `string[]` of documented warning codes (see encoding-profiles doc) |
 | `keyframe_offsets` | `i64[]`, keyframe positions in ms |
 | `retry_suppressed` | `bool`. The service has recorded that this media already failed under the current settings and will skip it rather than encode it again. Additive; see §9. |
+| `parent_uuid` | `string`, only on a sub-clip: the full-length asset it was cut from. Absent on a full-length asset. A sub-clip shares its parent's `current_path`. Additive. |
 | `status` | `processing` → `ready` \| `error` \| `missing` (see §9) |
 
 ## 6. ToolchainStatus (`src/bootstrap.rs:18-26`)
