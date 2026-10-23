@@ -280,3 +280,43 @@ async fn error_bodies_never_contain_filesystem_paths() {
         body
     );
 }
+
+/// C-11: a sub-clip plays its parent's file, so regenerating "its" sidecar
+/// would overwrite the parent's with the sub-clip's identity and trims.
+#[tokio::test]
+async fn regenerating_a_subclips_sidecar_is_refused_and_writes_nothing() {
+    let s = spawn_test_server().await;
+    let parent = "1b2c3d4e-5f60-4718-9a0b-1c2d3e4f5a6b";
+    let sub = "2c3d4e5f-6071-4829-8b1c-2d3e4f5a6b7c";
+    let file = s.watch_dir.join("parent.mp4");
+    std::fs::write(&file, b"not really a video").expect("write parent file");
+    playout_transcode::db::insert_processing(
+        &s.pool,
+        parent,
+        4321,
+        None,
+        &file.to_string_lossy(),
+        "Parent",
+    )
+    .await
+    .expect("insert parent");
+    playout_transcode::db::create_subclip(&s.pool, sub, parent, "Sub", 1_000, 2_000, true, "[]")
+        .await
+        .expect("create sub-clip")
+        .expect("parent exists");
+
+    let r = s
+        .post_json(
+            &format!("/api/assets/{}/regenerate-sidecar", sub),
+            json!({}),
+        )
+        .await;
+    assert_eq!(r.status(), 409);
+    let body: serde_json::Value = r.json().await.expect("json body");
+    assert_eq!(body["error"], "subclip_has_no_sidecar");
+    assert_eq!(body["parent_uuid"], parent);
+    assert!(
+        !playout_transcode::identity::sidecar_path_for(&file).exists(),
+        "no sidecar may be written for the parent's file"
+    );
+}

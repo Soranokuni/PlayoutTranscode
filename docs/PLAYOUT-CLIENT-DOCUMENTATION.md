@@ -1160,3 +1160,53 @@ queued job, and if it turns out to need no work (a re-offered duplicate) it is
 removed with `job_removed`. Finished job records are kept for **5 days**
 (memory and `transcode_jobs`); older ones are removed hourly, announced with
 `job_removed`. Assets are unaffected: an older ingest is still in the registry.
+
+## 14. Trim-contract follow-ups (2026-10-23)
+
+From PlayOut's TRIM-CONTRACT-AUDIT, the findings that were the transcoder's.
+
+### 14.1 C-18 — `parent_uuid` on the asset
+
+A sub-clip's asset payload now carries `parent_uuid`, the full-length asset it
+was cut from. It is absent on a full-length asset. Use it instead of guessing
+from the trim window which of two rows on one `current_path` is the parent.
+
+### 14.2 C-11 — `regenerate-sidecar` refuses a sub-clip
+
+A sub-clip has no sidecar of its own: its file is its parent's. The route
+answers **409** `{"error":"subclip_has_no_sidecar","parent_uuid":"…"}` and
+writes nothing; regenerate the parent's sidecar instead.
+
+### 14.3 C-17 — a re-transcode keeps the trim and moves the sub-clips
+
+A re-transcode publishes under the same uuid. It used to reset the trim to the
+whole file and leave the sub-clips on the old path.
+
+- The asset keeps its trim when the new file still contains it. When it does
+  not, the trim becomes the whole file and the warning
+  `trim_reset_after_reencode` is added.
+- Every live sub-clip moves to the new `current_path` with the new duration,
+  geometry, keyframes and `mezzanine_ok`, and its keyframe alignment is
+  re-judged. A sub-clip whose window is not inside the new file is `error`
+  with the warning `subclip_outside_reencoded_parent` until it is re-cut.
+
+### 14.4 C-13 — `qc_report` and `loudness` are on the asset now
+
+Your `V2AssetDto` has read `qc_report` and `loudness` all along with
+`#[serde(default)]`, and the server never sent them, so your blocking-QC gate
+always saw 0 and the loudness view was always empty. Both are now served, in
+the field names you already use: `qc_report { passed, blocking_errors,
+warnings_count, findings[] }` and `loudness { integrated_lufs, true_peak_dbtp,
+lra_lu, mode }`. A sub-clip carries its parent's. Rows published before this
+are filled from their sidecars on the next start; until then the fields are
+absent, as before. Since T-5 a QC failure is already `status = "error"`, so
+the gate agrees with the status rather than adding a second verdict.
+
+### 14.5 C-19 — the boundary test now tests the boundary
+
+`tests/contract_boundary.rs` used to carry its own copies of `AssetResponse`,
+`hydrate_item` and `compute_frame_trim` and test those, so it passed whatever
+the server did. It now publishes assets through the real `db` functions,
+fetches them through the real router (v1, v2 and batch), and decodes them into
+a mirror of your DTOs with your required fields required. If you change what
+you require from an asset, change the mirror there too.
