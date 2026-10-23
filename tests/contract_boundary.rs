@@ -467,14 +467,18 @@ mod integration_tests {
     }
 }
 
+// The shared test server, at the crate root: a `#[path]` inside an inline
+// module resolves under a `media_root_contract/` folder, which only Windows
+// forgives.
+mod common;
+
 /// Contract C1: `GET /api/v2/media-root`, against the real router.
 ///
 /// PlayOut deserialises exactly this shape to verify that the folder it and
 /// CasparCG see is this registry's target folder. `deny_unknown_fields` is
 /// deliberate: a new key is a contract change and must be made in both repos.
 mod media_root_contract {
-    #[path = "../common/mod.rs"]
-    mod common;
+    use super::common;
 
     use playout_transcode::{db, media_root};
     use serde::Deserialize;
