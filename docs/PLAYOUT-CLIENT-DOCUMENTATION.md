@@ -1160,3 +1160,32 @@ queued job, and if it turns out to need no work (a re-offered duplicate) it is
 removed with `job_removed`. Finished job records are kept for **5 days**
 (memory and `transcode_jobs`); older ones are removed hourly, announced with
 `job_removed`. Assets are unaffected: an older ingest is still in the registry.
+
+## 14. Trim-contract follow-ups (2026-10-23)
+
+From PlayOut's TRIM-CONTRACT-AUDIT, the findings that were the transcoder's.
+
+### 14.1 C-18 — `parent_uuid` on the asset
+
+A sub-clip's asset payload now carries `parent_uuid`, the full-length asset it
+was cut from. It is absent on a full-length asset. Use it instead of guessing
+from the trim window which of two rows on one `current_path` is the parent.
+
+### 14.2 C-11 — `regenerate-sidecar` refuses a sub-clip
+
+A sub-clip has no sidecar of its own: its file is its parent's. The route
+answers **409** `{"error":"subclip_has_no_sidecar","parent_uuid":"…"}` and
+writes nothing; regenerate the parent's sidecar instead.
+
+### 14.3 C-17 — a re-transcode keeps the trim and moves the sub-clips
+
+A re-transcode publishes under the same uuid. It used to reset the trim to the
+whole file and leave the sub-clips on the old path.
+
+- The asset keeps its trim when the new file still contains it. When it does
+  not, the trim becomes the whole file and the warning
+  `trim_reset_after_reencode` is added.
+- Every live sub-clip moves to the new `current_path` with the new duration,
+  geometry, keyframes and `mezzanine_ok`, and its keyframe alignment is
+  re-judged. A sub-clip whose window is not inside the new file is `error`
+  with the warning `subclip_outside_reencoded_parent` until it is re-cut.
