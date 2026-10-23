@@ -57,6 +57,36 @@ pub struct MediaAsset {
     /// the candidate duplicate of its own parent's source and the whole
     /// programme was re-ingested.
     pub parent_uuid: Option<String>,
+    /// The QC report of the published mezzanine, as JSON (C-13). Written with
+    /// the sidecar; `None` before the column existed and until the sidecar
+    /// backfill has read it.
+    #[sqlx(default)]
+    pub qc_report_json: Option<String>,
+    /// The loudness measurement, as [`AssetLoudness`] JSON (C-13). `None` when
+    /// no loudness pass ran.
+    #[sqlx(default)]
+    pub loudness_json: Option<String>,
+}
+
+/// The loudness measurement on the asset payload (C-13), in the field names
+/// PlayOut reads. The sidecar keeps the full [`crate::identity::LoudnessInfo`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AssetLoudness {
+    pub integrated_lufs: f64,
+    pub true_peak_dbtp: f64,
+    pub lra_lu: f64,
+    pub mode: String,
+}
+
+impl From<&crate::identity::LoudnessInfo> for AssetLoudness {
+    fn from(l: &crate::identity::LoudnessInfo) -> Self {
+        Self {
+            integrated_lufs: l.integrated_lufs,
+            true_peak_dbtp: l.true_peak_dbtp,
+            lra_lu: l.lra,
+            mode: l.normalization_mode.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +125,13 @@ pub struct AssetResponse {
     /// the trim window.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_uuid: Option<String>,
+    /// C-13. The QC verdict behind `mezzanine_ok`, with its findings. Absent
+    /// on a row published before it was recorded and not yet backfilled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qc_report: Option<crate::identity::QcReport>,
+    /// C-13. Absent when no loudness pass ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loudness: Option<AssetLoudness>,
 }
 
 impl From<MediaAsset> for AssetResponse {
@@ -127,11 +164,19 @@ impl From<MediaAsset> for AssetResponse {
             deleted_at: a.deleted_at,
             original_virtual_folder: a.original_virtual_folder,
             parent_uuid: a.parent_uuid,
+            qc_report: a
+                .qc_report_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok()),
+            loudness: a
+                .loudness_json
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok()),
         }
     }
 }
 
-const SELECT_COLS: &str = "uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder, parent_uuid, qc_verdict_key";
+const SELECT_COLS: &str = "uuid, fingerprint, source_sha256, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, deleted_at, original_virtual_folder, parent_uuid, qc_verdict_key, qc_report_json, loudness_json";
 
 /// Find all assets with a given status. Used for startup recovery scans.
 pub async fn find_all_with_status(
@@ -858,6 +903,11 @@ async fn init_schema(pool: SqlitePool) -> Result<SqlitePool, sqlx::Error> {
         // published before it existed fall back to the narrower legacy test in
         // `find_reproducible_qc_failure`.
         ("qc_verdict_key", "TEXT", "NULL"),
+        // C-13. The QC report and loudness of the published mezzanine, served
+        // on the asset payload. Nullable: older rows are filled from their
+        // sidecars by `processor::backfill_qc_from_sidecars`.
+        ("qc_report_json", "TEXT", "NULL"),
+        ("loudness_json", "TEXT", "NULL"),
     ] {
         let sql = if default == "NULL" {
             format!(
@@ -1149,6 +1199,40 @@ pub async fn mark_ready(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Record the QC report and loudness of a published mezzanine on its row and
+/// on its live sub-clips, which play the same file (C-13). Both are written
+/// every time, so a re-encode without a loudness pass clears a stale value.
+pub async fn record_qc_and_loudness(
+    pool: &SqlitePool,
+    uuid: &str,
+    qc_report_json: Option<&str>,
+    loudness_json: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE media_assets SET qc_report_json = ?1, loudness_json = ?2
+         WHERE uuid = ?3 OR (parent_uuid = ?3 AND deleted_at IS NULL)",
+    )
+    .bind(qc_report_json)
+    .bind(loudness_json)
+    .bind(uuid)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+/// Published full-length rows with no QC report recorded yet: the sidecar
+/// backfill's work list (C-13).
+pub async fn qc_backfill_targets(pool: &SqlitePool) -> Result<Vec<(String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT uuid, current_path FROM media_assets
+         WHERE qc_report_json IS NULL AND parent_uuid IS NULL AND deleted_at IS NULL
+           AND status IN ('ready', 'error', 'missing') AND current_path != ''
+         ORDER BY uuid",
+    )
+    .fetch_all(pool)
+    .await
 }
 
 pub async fn mark_error(pool: &SqlitePool, uuid: &str) -> Result<(), sqlx::Error> {
@@ -1682,8 +1766,8 @@ pub async fn create_subclip(
     let parent = find_by_uuid(pool, parent_uuid).await?;
     if let Some(p) = parent {
         sqlx::query(
-            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, parent_uuid)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)"
+            "INSERT INTO media_assets (uuid, fingerprint, current_path, duration_ms, trim_in_ms, trim_out_ms, rating, tp, status, display_name, virtual_folder, mezzanine_ok, fps, fps_num, fps_den, total_frames, gop_frames, keyframe_safe_start_ms, warnings, keyframe_offsets_json, parent_uuid, qc_report_json, loudness_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)"
         )
         .bind(new_uuid)
         .bind(p.fingerprint)
@@ -1710,6 +1794,9 @@ pub async fn create_subclip(
         // and a NULL `source_sha256` that reads as "cannot confirm, re-ingest".
         // Making a sub-clip re-encoded the programme it was cut from.
         .bind(parent_uuid)
+        // C-13: the same file, so the same QC report and loudness.
+        .bind(&p.qc_report_json)
+        .bind(&p.loudness_json)
         .execute(pool)
         .await?;
 
@@ -5574,6 +5661,67 @@ mod tests {
         assert_eq!(carried_trim(5_000, 50_000, 60_000, 52_000), (5_000, 50_000, false));
         assert_eq!(carried_trim(0, 30_000, 60_000, 52_000), (0, 30_000, false));
         assert_eq!(carried_trim(5_000, 50_000, 60_000, 40_000), (0, 40_000, true));
+    }
+
+    #[tokio::test]
+    async fn the_response_carries_the_qc_report_and_loudness_for_parent_and_subclips() {
+        let (pool, dir) = setup_test_pool().await;
+        ready_row(&pool, "parent", 9, "D:/target/p.mp4", 60_000, 0, 60_000).await;
+        create_subclip(&pool, "early", "parent", "Early", 0, 10_000, true, "[]")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let qc = crate::identity::QcReport {
+            passed: true,
+            blocking_errors: 0,
+            warnings_count: 1,
+            findings: vec![crate::identity::ValidationFinding::warning(
+                "loudness_dynamic_mode",
+                "dynamic",
+                None,
+                None,
+            )],
+        };
+        let loudness = AssetLoudness {
+            integrated_lufs: -23.1,
+            true_peak_dbtp: -1.2,
+            lra_lu: 6.5,
+            mode: "ebu_r128".into(),
+        };
+        let qc_json = serde_json::to_string(&qc).unwrap();
+        let loudness_json = serde_json::to_string(&loudness).unwrap();
+        let rows = record_qc_and_loudness(&pool, "parent", Some(&qc_json), Some(&loudness_json))
+            .await
+            .unwrap();
+        assert_eq!(rows, 2, "the parent and its sub-clip");
+        create_subclip(&pool, "late", "parent", "Late", 20_000, 30_000, true, "[]")
+            .await
+            .unwrap()
+            .unwrap();
+
+        for uuid in ["parent", "early", "late"] {
+            let v = serde_json::to_value(AssetResponse::from(find_by_uuid(&pool, uuid).await.unwrap().unwrap()))
+                .unwrap();
+            // The names PlayOut's V2QcReportDto / V2LoudnessDto read.
+            assert_eq!(v["qc_report"]["passed"], true, "{uuid}");
+            assert_eq!(v["qc_report"]["blocking_errors"], 0, "{uuid}");
+            assert_eq!(v["qc_report"]["findings"][0]["severity"], "warning", "{uuid}");
+            assert_eq!(v["qc_report"]["findings"][0]["code"], "loudness_dynamic_mode", "{uuid}");
+            assert_eq!(v["loudness"]["integrated_lufs"], -23.1, "{uuid}");
+            assert_eq!(v["loudness"]["lra_lu"], 6.5, "{uuid}");
+            assert_eq!(v["loudness"]["mode"], "ebu_r128", "{uuid}");
+        }
+        assert!(qc_backfill_targets(&pool).await.unwrap().is_empty());
+
+        // A row with nothing recorded serialises neither field.
+        ready_row(&pool, "bare", 10, "D:/target/b.mp4", 1_000, 0, 1_000).await;
+        let v = serde_json::to_value(AssetResponse::from(find_by_uuid(&pool, "bare").await.unwrap().unwrap()))
+            .unwrap();
+        assert!(v.get("qc_report").is_none() && v.get("loudness").is_none(), "{v}");
+        assert_eq!(qc_backfill_targets(&pool).await.unwrap(), vec![("bare".into(), "D:/target/b.mp4".into())]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

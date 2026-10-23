@@ -2247,6 +2247,12 @@ fn process_file_inner(
                     ),
             });
 
+            // C-13: what the asset payload serves, recorded with the row below.
+            let qc_report_json = serde_json::to_string(&qc_report).ok();
+            let loudness_json = sidecar_loudness
+                .as_ref()
+                .and_then(|l| serde_json::to_string(&db::AssetLoudness::from(l)).ok());
+
             let validation_report = identity::ValidationReport {
                 mezzanine_ok,
                 duration_ms,
@@ -2373,6 +2379,21 @@ fn process_file_inner(
                     "The mezzanine encoded but the registry could not record it",
                 );
                 return;
+            }
+
+            // Not worth failing a published asset over: the sidecar holds the
+            // same report, and the startup backfill reads it from there.
+            if let Err(e) = handle.block_on(db::record_qc_and_loudness(
+                pool,
+                &metadata_uuid,
+                qc_report_json.as_deref(),
+                loudness_json.as_deref(),
+            )) {
+                tracing::warn!(
+                    uuid = %metadata_uuid,
+                    "Could not record the QC report on the row ({}); the next start backfills it from the sidecar",
+                    e
+                );
             }
 
             let _ = queue.transition(
@@ -3264,6 +3285,54 @@ fn set_keyframe_backfill_report(report: KeyframeBackfillReport) {
 /// Blocking, and idempotent: a second run finds the corrected rows already
 /// correct and writes nothing. Runs on its own OS thread at startup, off the
 /// async runtime, because each file is an ffprobe.
+/// Fill `qc_report_json` / `loudness_json` from the sidecars of rows published
+/// before the asset payload carried them (C-13).
+///
+/// Blocking: one small file read per row, off the async runtime because the
+/// target folder is usually an SMB share. A row whose sidecar has no QC report
+/// stays `NULL` and is looked at again next start, which costs a file read.
+pub fn backfill_qc_from_sidecars(pool: &SqlitePool, handle: &tokio::runtime::Handle) -> u64 {
+    let targets = match handle.block_on(db::qc_backfill_targets(pool)) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("QC backfill could not read the registry: {}", e);
+            return 0;
+        }
+    };
+    let mut filled = 0;
+    for (uuid, current_path) in targets {
+        let sidecar = identity::sidecar_path_for(Path::new(&current_path));
+        let Ok(text) = std::fs::read_to_string(&sidecar) else {
+            continue;
+        };
+        let Ok(payload) = serde_json::from_str::<identity::SidecarPayload>(&text) else {
+            tracing::warn!(uuid = %uuid, "QC backfill: sidecar did not parse");
+            continue;
+        };
+        let Some(qc) = payload.qc_report.as_ref() else {
+            continue;
+        };
+        let qc_json = serde_json::to_string(qc).ok();
+        let loudness_json = payload
+            .loudness
+            .as_ref()
+            .and_then(|l| serde_json::to_string(&db::AssetLoudness::from(l)).ok());
+        match handle.block_on(db::record_qc_and_loudness(
+            pool,
+            &uuid,
+            qc_json.as_deref(),
+            loudness_json.as_deref(),
+        )) {
+            Ok(_) => filled += 1,
+            Err(e) => tracing::warn!(uuid = %uuid, "QC backfill could not write the row: {}", e),
+        }
+    }
+    if filled > 0 {
+        tracing::info!("QC backfill: recorded the QC report of {} asset(s) from their sidecars", filled);
+    }
+    filled
+}
+
 pub fn backfill_keyframe_offsets(
     pool: &SqlitePool,
     handle: &tokio::runtime::Handle,
@@ -4139,6 +4208,50 @@ mod tests {
         cfg.paths.target_folder = target.to_string_lossy().to_string();
 
         (queue, pool, cfg, root)
+    }
+
+    /// C-13: a row published before the payload carried the QC report gets it
+    /// from its sidecar, once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn qc_backfill_reads_the_report_and_loudness_from_the_sidecar() {
+        let root = std::env::temp_dir().join(format!("pt-qcfill-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let pool = crate::db::init_pool(&root.join("jobs.db")).await.expect("init pool");
+        let media = root.join("clip.mp4");
+        std::fs::write(&media, b"fake").unwrap();
+        let path = media.to_string_lossy().to_string();
+        crate::db::insert_processing(&pool, "old", 5, None, &path, "Old").await.unwrap();
+        sqlx::query("UPDATE media_assets SET status = 'ready', mezzanine_ok = 1, duration_ms = 1000, trim_out_ms = 1000 WHERE uuid = 'old'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A sidecar as the encoder writes it, with a QC report and loudness.
+        let asset = crate::db::find_by_uuid(&pool, "old").await.unwrap().unwrap();
+        let sidecar = identity::build_sidecar_from_db_asset_with_probe(&asset, None).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        v["qc_report"] = serde_json::json!({ "passed": true, "blocking_errors": 0, "warnings_count": 0, "findings": [] });
+        v["loudness"] = serde_json::json!({
+            "integrated_lufs": -23.0, "true_peak_dbtp": -1.0, "lra": 5.0, "threshold": -33.0,
+            "target_lufs": -23.0, "target_true_peak_dbtp": -1.0, "normalization_mode": "ebu_r128",
+            "linear_applied": true
+        });
+        std::fs::write(&sidecar, serde_json::to_string(&v).unwrap()).unwrap();
+
+        let run = |pool: SqlitePool| {
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || backfill_qc_from_sidecars(&pool, &handle))
+        };
+        assert_eq!(run(pool.clone()).await.unwrap(), 1);
+        assert_eq!(run(pool.clone()).await.unwrap(), 0, "nothing left to fill");
+
+        let response = crate::db::AssetResponse::from(crate::db::find_by_uuid(&pool, "old").await.unwrap().unwrap());
+        assert!(response.qc_report.expect("qc report").passed);
+        let loudness = response.loudness.expect("loudness");
+        assert_eq!((loudness.integrated_lufs, loudness.lra_lu, loudness.mode.as_str()), (-23.0, 5.0, "ebu_r128"));
+
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A job in the state a manual retry leaves behind: re-queued and pending.

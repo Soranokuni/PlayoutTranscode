@@ -1077,6 +1077,8 @@ mod tests {
             original_virtual_folder: None,
             parent_uuid: None,
             qc_verdict_key: None,
+            qc_report_json: None,
+            loudness_json: None,
         };
 
         // A 720p50 MPEG-2 asset with 5.1 audio: nothing like the 1080p25 H.264
@@ -1168,6 +1170,8 @@ mod tests {
             original_virtual_folder: None,
             parent_uuid: None,
             qc_verdict_key: None,
+            qc_report_json: None,
+            loudness_json: None,
         };
 
         let path = build_sidecar_from_db_asset_with_probe(&asset, None).unwrap();
@@ -1210,6 +1214,8 @@ mod tests {
             original_virtual_folder: None,
             parent_uuid: None,
             qc_verdict_key: None,
+            qc_report_json: None,
+            loudness_json: None,
         };
 
         let tools = crate::bootstrap::ToolPaths {
@@ -1262,6 +1268,8 @@ mod tests {
             original_virtual_folder: None,
             parent_uuid: None,
             qc_verdict_key: None,
+            qc_report_json: None,
+            loudness_json: None,
         };
 
         let tools = crate::bootstrap::ToolPaths {

@@ -1189,3 +1189,15 @@ whole file and leave the sub-clips on the old path.
   geometry, keyframes and `mezzanine_ok`, and its keyframe alignment is
   re-judged. A sub-clip whose window is not inside the new file is `error`
   with the warning `subclip_outside_reencoded_parent` until it is re-cut.
+
+### 14.4 C-13 — `qc_report` and `loudness` are on the asset now
+
+Your `V2AssetDto` has read `qc_report` and `loudness` all along with
+`#[serde(default)]`, and the server never sent them, so your blocking-QC gate
+always saw 0 and the loudness view was always empty. Both are now served, in
+the field names you already use: `qc_report { passed, blocking_errors,
+warnings_count, findings[] }` and `loudness { integrated_lufs, true_peak_dbtp,
+lra_lu, mode }`. A sub-clip carries its parent's. Rows published before this
+are filled from their sidecars on the next start; until then the fields are
+absent, as before. Since T-5 a QC failure is already `status = "error"`, so
+the gate agrees with the status rather than adding a second verdict.

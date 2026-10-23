@@ -295,6 +295,16 @@ pub async fn run_service(
         });
     }
 
+    // C-13. Rows published before the asset payload carried the QC report and
+    // loudness get them from their sidecars. File reads, so off the runtime.
+    {
+        let qc_pool = pool.clone();
+        let qc_handle = tokio::runtime::Handle::current();
+        std::thread::spawn(move || {
+            processor::backfill_qc_from_sidecars(&qc_pool, &qc_handle);
+        });
+    }
+
     // T-4. Keep `status` honest about whether the mezzanine is still on disk.
     // The registry could say `ready` about a file that was not there, and the
     // first thing that noticed was PlayOut's pre-flight check at TAKE.
