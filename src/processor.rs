@@ -2247,7 +2247,8 @@ fn process_file_inner(
                     ),
             });
 
-            // C-13: what the asset payload serves, recorded with the row below.
+            // C-13: what the asset payload serves, written in `mark_ready`'s
+            // transaction so a `ready` row never goes out without its report.
             let qc_report_json = serde_json::to_string(&qc_report).ok();
             let loudness_json = sidecar_loudness
                 .as_ref()
@@ -2344,7 +2345,7 @@ fn process_file_inner(
                 std::time::Duration::from_millis(500),
                 "mark_ready",
                 |_| {
-                    handle.block_on(db::mark_ready(
+                    handle.block_on(db::mark_ready_with_qc(
                         pool,
                         &metadata_uuid,
                         &final_output_path.to_string_lossy(),
@@ -2359,6 +2360,10 @@ fn process_file_inner(
                         &warnings_list,
                         &keyframe_offsets_json,
                         publish_verdict_key.as_deref(),
+                        Some(db::PublishedQc {
+                            report_json: qc_report_json.as_deref(),
+                            loudness_json: loudness_json.as_deref(),
+                        }),
                     ))
                 },
             );
@@ -2379,21 +2384,6 @@ fn process_file_inner(
                     "The mezzanine encoded but the registry could not record it",
                 );
                 return;
-            }
-
-            // Not worth failing a published asset over: the sidecar holds the
-            // same report, and the startup backfill reads it from there.
-            if let Err(e) = handle.block_on(db::record_qc_and_loudness(
-                pool,
-                &metadata_uuid,
-                qc_report_json.as_deref(),
-                loudness_json.as_deref(),
-            )) {
-                tracing::warn!(
-                    uuid = %metadata_uuid,
-                    "Could not record the QC report on the row ({}); the next start backfills it from the sidecar",
-                    e
-                );
             }
 
             let _ = queue.transition(

@@ -1210,3 +1210,14 @@ the server did. It now publishes assets through the real `db` functions,
 fetches them through the real router (v1, v2 and batch), and decodes them into
 a mirror of your DTOs with your required fields required. If you change what
 you require from an asset, change the mirror there too.
+
+## 15. Aether alignment (2026-10-26)
+
+Nothing renamed, removed or added to the payload; no new status.
+
+### 15.1 `qc_report` arrives with `ready`
+
+The QC report and loudness are written in the same transaction that makes an
+asset `ready`. Before, they followed in a second write, so a poll in between
+(or a failed second write, until the next start) showed a `ready` asset with
+no `qc_report`, which your blocking-QC gate reads as nothing blocking.

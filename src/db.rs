@@ -1088,6 +1088,58 @@ pub async fn mark_ready(
     keyframe_offsets_json: &str,
     qc_verdict_key: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    mark_ready_with_qc(
+        pool,
+        uuid,
+        output_path,
+        duration_ms,
+        mezzanine_ok,
+        fps,
+        fps_num,
+        fps_den,
+        total_frames,
+        gop_frames,
+        keyframe_safe_start_ms,
+        warnings,
+        keyframe_offsets_json,
+        qc_verdict_key,
+        None,
+    )
+    .await
+}
+
+/// The QC report and loudness of a published mezzanine, as stored JSON (C-13).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublishedQc<'a> {
+    pub report_json: Option<&'a str>,
+    pub loudness_json: Option<&'a str>,
+}
+
+/// [`mark_ready`], plus the QC report and loudness in the same transaction.
+///
+/// They used to be written by a separate, best-effort `record_qc_and_loudness`
+/// right after the publish. Between the two -- or for good, if the second write
+/// failed -- PlayOut saw a `ready` row with no `qc_report`, which its
+/// blocking-QC gate reads as "nothing blocking", until the next service start
+/// backfilled it from the sidecar. `None` leaves both columns as they are.
+#[allow(clippy::too_many_arguments)]
+pub async fn mark_ready_with_qc(
+    pool: &SqlitePool,
+    uuid: &str,
+    output_path: &str,
+    duration_ms: i64,
+    mezzanine_ok: bool,
+    fps: f64,
+    fps_num: i64,
+    fps_den: i64,
+    total_frames: i64,
+    gop_frames: i64,
+    keyframe_safe_start_ms: i64,
+    warnings: &[String],
+    keyframe_offsets_json: &str,
+    qc_verdict_key: Option<&str>,
+    qc: Option<PublishedQc<'_>>,
+) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let previous: Option<(i64, i64, i64)> =
         sqlx::query_as("SELECT trim_in_ms, trim_out_ms, duration_ms FROM media_assets WHERE uuid = ?1")
@@ -1197,6 +1249,9 @@ pub async fn mark_ready(
         .execute(&mut *tx)
         .await?;
     }
+    if let Some(qc) = qc {
+        write_qc_and_loudness(&mut *tx, uuid, qc.report_json, qc.loudness_json).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1210,6 +1265,18 @@ pub async fn record_qc_and_loudness(
     qc_report_json: Option<&str>,
     loudness_json: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
+    write_qc_and_loudness(pool, uuid, qc_report_json, loudness_json).await
+}
+
+async fn write_qc_and_loudness<'e, E>(
+    executor: E,
+    uuid: &str,
+    qc_report_json: Option<&str>,
+    loudness_json: Option<&str>,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let result = sqlx::query(
         "UPDATE media_assets SET qc_report_json = ?1, loudness_json = ?2
          WHERE uuid = ?3 OR (parent_uuid = ?3 AND deleted_at IS NULL)",
@@ -1217,7 +1284,7 @@ pub async fn record_qc_and_loudness(
     .bind(qc_report_json)
     .bind(loudness_json)
     .bind(uuid)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }
@@ -5661,6 +5728,41 @@ mod tests {
         assert_eq!(carried_trim(5_000, 50_000, 60_000, 52_000), (5_000, 50_000, false));
         assert_eq!(carried_trim(0, 30_000, 60_000, 52_000), (0, 30_000, false));
         assert_eq!(carried_trim(5_000, 50_000, 60_000, 40_000), (0, 40_000, true));
+    }
+
+    /// The QC report lands with the publish, on the parent and its live
+    /// sub-clips; a plain `mark_ready` leaves what is recorded alone.
+    #[tokio::test]
+    async fn mark_ready_with_qc_records_the_report_in_the_publish() {
+        let (pool, dir) = setup_test_pool().await;
+        ready_row(&pool, "parent", 11, "D:/target/p.mp4", 60_000, 0, 60_000).await;
+        create_subclip(&pool, "early", "parent", "Early", 0, 10_000, true, "[]")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let qc = PublishedQc {
+            report_json: Some(r#"{"passed":true,"blocking_errors":0,"warnings_count":0,"findings":[]}"#),
+            loudness_json: Some(r#"{"integrated_lufs":-23.0,"true_peak_dbtp":-1.0,"lra_lu":5.0,"mode":"ebu_r128"}"#),
+        };
+        mark_ready_with_qc(
+            &pool, "parent", "D:/target/p2.mp4", 60_000, true, 25.0, 25, 1, 1500, 50, 0, &[], "[]", None,
+            Some(qc),
+        )
+        .await
+        .unwrap();
+        for uuid in ["parent", "early"] {
+            let a = find_by_uuid(&pool, uuid).await.unwrap().unwrap();
+            assert_eq!(a.qc_report_json.as_deref(), qc.report_json, "{uuid}");
+            assert_eq!(a.loudness_json.as_deref(), qc.loudness_json, "{uuid}");
+        }
+
+        mark_ready(&pool, "parent", "D:/target/p3.mp4", 60_000, true, 25.0, 25, 1, 1500, 50, 0, &[], "[]", None)
+            .await
+            .unwrap();
+        let a = find_by_uuid(&pool, "parent").await.unwrap().unwrap();
+        assert_eq!(a.qc_report_json.as_deref(), qc.report_json);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
