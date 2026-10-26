@@ -2,6 +2,10 @@
 name = "playout-transcode"
 version = "1.0.0"
 edition = "2021"
+# Matches PlayOutVue (Aether). Checked with `cargo +1.95.0 check --all-targets`;
+# the dependency tree itself needs 1.89 (uuid). The build channel is pinned in
+# rust-toolchain.toml.
+rust-version = "1.95"
 authors = ["Alex Fountas (Soranokuni) <fountasalexandros@gmail.com>"]
 repository = "https://github.com/Soranokuni/PlayoutTranscode"
 license = "MIT"
@@ -22,7 +26,7 @@ tokio-stream = { version = "0.1", features = ["sync"] }
 axum = { version = "0.8", features = ["ws"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = "1"
 uuid = { version = "1", features = ["v4"] }
 notify = { version = "8", features = ["macos_kqueue"] }
 walkdir = "2"
@@ -31,7 +35,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["fs", "cors", "timeout", "limit", "trace"] }
 chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "blocking"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 sha2 = "0.10"
 anyhow = "1"
@@ -43,11 +47,11 @@ tracing-appender = "0.2"
 [dev-dependencies]
 # Async client for the integration harness in tests/common. The main crate only
 # uses reqwest's blocking client (bootstrap's FFmpeg download).
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "json"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
-windows-sys = { version = "0.59", features = [
+windows-service = "0.8"
+windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_JobObjects",
     "Win32_System_IO",
