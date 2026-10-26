@@ -1210,3 +1210,34 @@ the server did. It now publishes assets through the real `db` functions,
 fetches them through the real router (v1, v2 and batch), and decodes them into
 a mirror of your DTOs with your required fields required. If you change what
 you require from an asset, change the mirror there too.
+
+## 15. Aether alignment (2026-10-26)
+
+Nothing renamed, removed or added to the payload; no new status.
+
+### 15.1 `qc_report` arrives with `ready`
+
+The QC report and loudness are written in the same transaction that makes an
+asset `ready`. Before, they followed in a second write, so a poll in between
+(or a failed second write, until the next start) showed a `ready` asset with
+no `qc_report`, which your blocking-QC gate reads as nothing blocking.
+
+### 15.2 C-14 — no published asset has `trim_out_ms = 0`
+
+Older rows stored `trim_out_ms = 0` for "unset", which your v2 library path
+reads as invalid bounds (`processing`) and your v1/batch path as the whole
+file. The next service start sets it to `duration_ms` on every `ready`,
+`error` and `missing` row, sub-clips included (their IN stays as it was, so
+`0` there meant "to the end of the file" and still does). Both of your readings
+now agree. Your `> 0` fallbacks are harmless and can stay.
+
+### 15.3 C-12 — a saved trim reaches the sidecar
+
+`PUT /trim` on a full-length asset now also writes `trim_in_ms` /
+`trim_out_ms` into its existing sidecar (`sidecars/<stem>.uuid.json`, stage
+and rename; no other key changes). Your scanner and offline fallback see the
+trimmed window with the transcoder down. A sub-clip still has no sidecar
+(§14.2), and a sidecar whose `playoutvue_id` is not the trimmed asset is left
+alone. The registry stays the authority: a failed sidecar write is logged and
+the trim is still saved. The per-uuid sidecar layout of your audit's §5 is not
+implemented; this is the minimal fix for the layout you read today.

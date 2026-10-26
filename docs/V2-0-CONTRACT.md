@@ -111,14 +111,14 @@ Field invariants (PlayOutVue boundary — enforced by `tests/contract_boundary.r
 | `uuid` / `playoutvue_id` | identical strings; stable identity of the asset |
 | `current_path` | final Caspar-playable file path on `ready` |
 | `duration_ms` | exact, > 0 on `ready` |
-| `trim_in_ms` / `trim_out_ms` | absolute ms from file start; on first publish `0` / `duration_ms` (`src/db.rs:312-313`); `trim_out > trim_in`, `trim_out ≤ duration_ms` |
+| `trim_in_ms` / `trim_out_ms` | absolute ms from file start; on first publish `0` / `duration_ms` (`src/db.rs:312-313`); `trim_out > trim_in`, `trim_out ≤ duration_ms`. A published asset (`ready`/`error`/`missing`) is never served with `trim_out_ms = 0`: older rows with it are set to `duration_ms` at startup (C-14). A `PUT /trim` on a full-length asset is also written to its sidecar (C-12). |
 | `fps_num` / `fps_den` | exact rational, both > 0 on `ready`; never float approximations (e.g. `30000/1001`, **never** `29970/1000`) |
 | `mezzanine_ok` | false unless frame-accurate-safe. **A `ready` asset always has `mezzanine_ok=true`** — see §9. Earlier versions could publish `ready` with `mezzanine_ok=false`, which three consumers each resolved differently; that state is now refused by the schema. |
 | `warnings` | `string[]` of documented warning codes (see encoding-profiles doc) |
 | `keyframe_offsets` | `i64[]`, keyframe positions in ms |
 | `retry_suppressed` | `bool`. The service has recorded that this media already failed under the current settings and will skip it rather than encode it again. Additive; see §9. |
 | `parent_uuid` | `string`, only on a sub-clip: the full-length asset it was cut from. Absent on a full-length asset. A sub-clip shares its parent's `current_path`. Additive. |
-| `qc_report` | `{ passed, blocking_errors, warnings_count, findings: [{ severity, code, message, measured?, expected? }] }`, the QC verdict behind `mezzanine_ok`. A sub-clip carries its parent's. Absent until recorded (older rows are filled from their sidecars at startup). Additive. |
+| `qc_report` | `{ passed, blocking_errors, warnings_count, findings: [{ severity, code, message, measured?, expected? }] }`, the QC verdict behind `mezzanine_ok`. A sub-clip carries its parent's. Written in the same transaction as the publish, so a newly `ready` asset always has it; absent on older rows until they are filled from their sidecars at startup. Additive. |
 | `loudness` | `{ integrated_lufs, true_peak_dbtp, lra_lu, mode }`. Absent when no loudness pass ran. Additive. |
 | `status` | `processing` → `ready` \| `error` \| `missing` (see §9) |
 

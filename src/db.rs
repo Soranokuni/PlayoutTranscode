@@ -529,7 +529,10 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
              + (SELECT COUNT(*) FROM media_assets
                  WHERE status = 'error' AND mezzanine_ok = 0
                    AND qc_verdict_key IS NOT NULL AND qc_verdict_key <> ?1
-                   AND warnings IN ('', '[]'))",
+                   AND warnings IN ('', '[]'))
+             + (SELECT COUNT(*) FROM media_assets
+                 WHERE trim_out_ms = 0 AND duration_ms > 0
+                   AND status IN ('ready', 'error', 'missing'))",
         )
         .bind(QC_VERDICT_CLEARED)
         .fetch_one(pool)
@@ -667,6 +670,34 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
                 "Recorded the finding on {} permanently failed asset(s) that had a verdict but no \
                  warnings (W-3); they will not be re-encoded",
                 rows.len()
+            );
+        }
+    }
+
+    // C-14. `trim_out_ms = 0` meant "unset" on rows published before
+    // `mark_ready` wrote the OUT point, and PlayOut reads it two ways: its v2
+    // library path rejects it as invalid bounds (amber, `processing`), its v1 and
+    // batch paths treat it as the whole file (green, `ready`). The same asset
+    // differed between the library and the rundown. Every reader agrees on what
+    // "unset" was meant to be -- the end of the file -- so write that. A
+    // sub-clip's `duration_ms` is its parent file's, and its IN stays absolute,
+    // so `0` on a sub-clip also becomes "to the end of the file" (C-20).
+    //
+    // After the T-2b adoption above, which still reads `0` as full length.
+    // `processing` rows are left alone: their duration is the source's, not the
+    // mezzanine's, and `mark_ready` sets the OUT point when they publish.
+    {
+        let filled = sqlx::query(
+            "UPDATE media_assets SET trim_out_ms = duration_ms
+             WHERE trim_out_ms = 0 AND duration_ms > 0
+               AND status IN ('ready', 'error', 'missing')",
+        )
+        .execute(pool)
+        .await?;
+        if filled.rows_affected() > 0 {
+            tracing::info!(
+                "Set the unset OUT point of {} published asset(s) to their duration (C-14)",
+                filled.rows_affected()
             );
         }
     }
@@ -1088,6 +1119,58 @@ pub async fn mark_ready(
     keyframe_offsets_json: &str,
     qc_verdict_key: Option<&str>,
 ) -> Result<(), sqlx::Error> {
+    mark_ready_with_qc(
+        pool,
+        uuid,
+        output_path,
+        duration_ms,
+        mezzanine_ok,
+        fps,
+        fps_num,
+        fps_den,
+        total_frames,
+        gop_frames,
+        keyframe_safe_start_ms,
+        warnings,
+        keyframe_offsets_json,
+        qc_verdict_key,
+        None,
+    )
+    .await
+}
+
+/// The QC report and loudness of a published mezzanine, as stored JSON (C-13).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublishedQc<'a> {
+    pub report_json: Option<&'a str>,
+    pub loudness_json: Option<&'a str>,
+}
+
+/// [`mark_ready`], plus the QC report and loudness in the same transaction.
+///
+/// They used to be written by a separate, best-effort `record_qc_and_loudness`
+/// right after the publish. Between the two -- or for good, if the second write
+/// failed -- PlayOut saw a `ready` row with no `qc_report`, which its
+/// blocking-QC gate reads as "nothing blocking", until the next service start
+/// backfilled it from the sidecar. `None` leaves both columns as they are.
+#[allow(clippy::too_many_arguments)]
+pub async fn mark_ready_with_qc(
+    pool: &SqlitePool,
+    uuid: &str,
+    output_path: &str,
+    duration_ms: i64,
+    mezzanine_ok: bool,
+    fps: f64,
+    fps_num: i64,
+    fps_den: i64,
+    total_frames: i64,
+    gop_frames: i64,
+    keyframe_safe_start_ms: i64,
+    warnings: &[String],
+    keyframe_offsets_json: &str,
+    qc_verdict_key: Option<&str>,
+    qc: Option<PublishedQc<'_>>,
+) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
     let previous: Option<(i64, i64, i64)> =
         sqlx::query_as("SELECT trim_in_ms, trim_out_ms, duration_ms FROM media_assets WHERE uuid = ?1")
@@ -1197,6 +1280,9 @@ pub async fn mark_ready(
         .execute(&mut *tx)
         .await?;
     }
+    if let Some(qc) = qc {
+        write_qc_and_loudness(&mut *tx, uuid, qc.report_json, qc.loudness_json).await?;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1210,6 +1296,18 @@ pub async fn record_qc_and_loudness(
     qc_report_json: Option<&str>,
     loudness_json: Option<&str>,
 ) -> Result<u64, sqlx::Error> {
+    write_qc_and_loudness(pool, uuid, qc_report_json, loudness_json).await
+}
+
+async fn write_qc_and_loudness<'e, E>(
+    executor: E,
+    uuid: &str,
+    qc_report_json: Option<&str>,
+    loudness_json: Option<&str>,
+) -> Result<u64, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
     let result = sqlx::query(
         "UPDATE media_assets SET qc_report_json = ?1, loudness_json = ?2
          WHERE uuid = ?3 OR (parent_uuid = ?3 AND deleted_at IS NULL)",
@@ -1217,7 +1315,7 @@ pub async fn record_qc_and_loudness(
     .bind(qc_report_json)
     .bind(loudness_json)
     .bind(uuid)
-    .execute(pool)
+    .execute(executor)
     .await?;
     Ok(result.rows_affected())
 }
@@ -5663,6 +5761,41 @@ mod tests {
         assert_eq!(carried_trim(5_000, 50_000, 60_000, 40_000), (0, 40_000, true));
     }
 
+    /// The QC report lands with the publish, on the parent and its live
+    /// sub-clips; a plain `mark_ready` leaves what is recorded alone.
+    #[tokio::test]
+    async fn mark_ready_with_qc_records_the_report_in_the_publish() {
+        let (pool, dir) = setup_test_pool().await;
+        ready_row(&pool, "parent", 11, "D:/target/p.mp4", 60_000, 0, 60_000).await;
+        create_subclip(&pool, "early", "parent", "Early", 0, 10_000, true, "[]")
+            .await
+            .unwrap()
+            .unwrap();
+
+        let qc = PublishedQc {
+            report_json: Some(r#"{"passed":true,"blocking_errors":0,"warnings_count":0,"findings":[]}"#),
+            loudness_json: Some(r#"{"integrated_lufs":-23.0,"true_peak_dbtp":-1.0,"lra_lu":5.0,"mode":"ebu_r128"}"#),
+        };
+        mark_ready_with_qc(
+            &pool, "parent", "D:/target/p2.mp4", 60_000, true, 25.0, 25, 1, 1500, 50, 0, &[], "[]", None,
+            Some(qc),
+        )
+        .await
+        .unwrap();
+        for uuid in ["parent", "early"] {
+            let a = find_by_uuid(&pool, uuid).await.unwrap().unwrap();
+            assert_eq!(a.qc_report_json.as_deref(), qc.report_json, "{uuid}");
+            assert_eq!(a.loudness_json.as_deref(), qc.loudness_json, "{uuid}");
+        }
+
+        mark_ready(&pool, "parent", "D:/target/p3.mp4", 60_000, true, 25.0, 25, 1, 1500, 50, 0, &[], "[]", None)
+            .await
+            .unwrap();
+        let a = find_by_uuid(&pool, "parent").await.unwrap().unwrap();
+        assert_eq!(a.qc_report_json.as_deref(), qc.report_json);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn the_response_carries_the_qc_report_and_loudness_for_parent_and_subclips() {
         let (pool, dir) = setup_test_pool().await;
@@ -6104,6 +6237,40 @@ mod tests {
         // Idempotent: the next start is a no-op, not a second failure.
         run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C-14. An unset OUT point on a published row becomes the end of the file;
+    /// rows still processing, and rows with no duration, are left alone.
+    #[tokio::test]
+    async fn an_unset_trim_out_on_a_published_row_becomes_its_duration() {
+        let (pool, dir) = setup_test_pool().await;
+        sqlx::query(
+            "INSERT INTO media_assets
+               (uuid, fingerprint, source_sha256, current_path, duration_ms,
+                trim_in_ms, trim_out_ms, status, mezzanine_ok, parent_uuid)
+             VALUES
+               ('legacy',  1, 'aa', 'D:/media/a.mp4', 60000, 0,     0, 'ready',      1, NULL),
+               ('sub',     1, NULL, 'D:/media/a.mp4', 60000, 10000, 0, 'ready',      1, 'legacy'),
+               ('gone',    2, 'bb', 'D:/media/b.mp4', 30000, 0,     0, 'missing',    1, NULL),
+               ('busy',    3, 'cc', 'D:/watch/c.mxf', 90000, 0,     0, 'processing', 0, NULL),
+               ('nodur',   4, 'dd', 'D:/media/d.mp4', 0,     0,     0, 'error',      0, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
+
+        let trim = |a: MediaAsset| (a.trim_in_ms, a.trim_out_ms);
+        assert_eq!(trim(find_by_uuid(&pool, "legacy").await.unwrap().unwrap()), (0, 60_000));
+        assert_eq!(trim(find_by_uuid(&pool, "sub").await.unwrap().unwrap()), (10_000, 60_000));
+        assert_eq!(trim(find_by_uuid(&pool, "gone").await.unwrap().unwrap()), (0, 30_000));
+        assert_eq!(trim(find_by_uuid(&pool, "busy").await.unwrap().unwrap()), (0, 0));
+        assert_eq!(trim(find_by_uuid(&pool, "nodur").await.unwrap().unwrap()), (0, 0));
+
+        // Idempotent.
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
