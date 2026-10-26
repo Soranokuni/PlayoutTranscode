@@ -111,7 +111,7 @@ Field invariants (PlayOutVue boundary — enforced by `tests/contract_boundary.r
 | `uuid` / `playoutvue_id` | identical strings; stable identity of the asset |
 | `current_path` | final Caspar-playable file path on `ready` |
 | `duration_ms` | exact, > 0 on `ready` |
-| `trim_in_ms` / `trim_out_ms` | absolute ms from file start; on first publish `0` / `duration_ms` (`src/db.rs:312-313`); `trim_out > trim_in`, `trim_out ≤ duration_ms`. A published asset (`ready`/`error`/`missing`) is never served with `trim_out_ms = 0`: older rows with it are set to `duration_ms` at startup (C-14). |
+| `trim_in_ms` / `trim_out_ms` | absolute ms from file start; on first publish `0` / `duration_ms` (`src/db.rs:312-313`); `trim_out > trim_in`, `trim_out ≤ duration_ms`. A published asset (`ready`/`error`/`missing`) is never served with `trim_out_ms = 0`: older rows with it are set to `duration_ms` at startup (C-14). A `PUT /trim` on a full-length asset is also written to its sidecar (C-12). |
 | `fps_num` / `fps_den` | exact rational, both > 0 on `ready`; never float approximations (e.g. `30000/1001`, **never** `29970/1000`) |
 | `mezzanine_ok` | false unless frame-accurate-safe. **A `ready` asset always has `mezzanine_ok=true`** — see §9. Earlier versions could publish `ready` with `mezzanine_ok=false`, which three consumers each resolved differently; that state is now refused by the schema. |
 | `warnings` | `string[]` of documented warning codes (see encoding-profiles doc) |

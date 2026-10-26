@@ -422,21 +422,75 @@ pub fn patch_sidecar_keyframe_safe_start(
         serde_json::json!(keyframe_safe_start_ms),
     );
 
-    let json = serde_json::to_string_pretty(&doc)
-        .map_err(|e| format!("cannot serialize the patched sidecar: {}", e))?;
+    publish_patched_sidecar(&sidecar_path, &doc)?;
+    Ok(true)
+}
 
-    // Same staging-then-rename as `write_sidecar_payload`: a half-written
-    // sidecar is what PlayOut hydrates from.
+/// Same staging-then-rename as `write_sidecar_payload`: a half-written
+/// sidecar is what PlayOut hydrates from.
+fn publish_patched_sidecar(sidecar_path: &Path, doc: &serde_json::Value) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(doc)
+        .map_err(|e| format!("cannot serialize the patched sidecar: {}", e))?;
     let tmp = sidecar_path.with_extension("tmp_json");
     fs::write(&tmp, &json).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("cannot write '{}': {}", tmp.display(), e)
     })?;
-    fs::rename(&tmp, &sidecar_path).map_err(|e| {
+    fs::rename(&tmp, sidecar_path).map_err(|e| {
         let _ = fs::remove_file(&tmp);
         format!("cannot publish '{}': {}", sidecar_path.display(), e)
     })?;
+    Ok(())
+}
 
+/// Carry a `PUT /trim` into the asset's sidecar (C-12).
+///
+/// The trim used to live only in the registry; the sidecar kept the
+/// `0..duration` it was written with at ingest. PlayOut's scanner and its
+/// offline fallback read the sidecar, so with the transcoder down they played
+/// the whole file of a clip the operator had trimmed.
+///
+/// Only the two trim keys change, as in [`patch_sidecar_keyframe_safe_start`].
+/// The sidecar must belong to `uuid`: a legacy sub-clip that T-2b could not
+/// adopt has no `parent_uuid` but shares its parent's file, and its trim must
+/// not land in the parent's sidecar. `Ok(false)` when there is no sidecar, it
+/// is someone else's, or it already holds this trim.
+pub fn patch_sidecar_trim(
+    media_path: &Path,
+    uuid: &str,
+    trim_in_ms: i64,
+    trim_out_ms: i64,
+) -> Result<bool, String> {
+    let sidecar_path = sidecar_path_for(media_path);
+    if !sidecar_path.exists() {
+        return Ok(false);
+    }
+
+    let raw = fs::read_to_string(&sidecar_path)
+        .map_err(|e| format!("cannot read sidecar '{}': {}", sidecar_path.display(), e))?;
+    let mut doc: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("sidecar '{}' is not valid JSON: {}", sidecar_path.display(), e))?;
+    let Some(obj) = doc.as_object_mut() else {
+        return Err(format!("sidecar '{}' is not a JSON object", sidecar_path.display()));
+    };
+
+    let owner = obj
+        .get("playoutvue_id")
+        .or_else(|| obj.get("id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !owner.eq_ignore_ascii_case(uuid) {
+        return Ok(false);
+    }
+    if obj.get("trim_in_ms").and_then(|v| v.as_i64()) == Some(trim_in_ms)
+        && obj.get("trim_out_ms").and_then(|v| v.as_i64()) == Some(trim_out_ms)
+    {
+        return Ok(false);
+    }
+    obj.insert("trim_in_ms".to_string(), serde_json::json!(trim_in_ms));
+    obj.insert("trim_out_ms".to_string(), serde_json::json!(trim_out_ms));
+
+    publish_patched_sidecar(&sidecar_path, &doc)?;
     Ok(true)
 }
 
@@ -1300,5 +1354,37 @@ mod tests {
         assert_eq!(sanitize_filename("ΨΥΧΗ"), "psychi");
         assert_eq!(sanitize_filename("ΘΕΑΤΡΟ"), "theatro");
         assert_eq!(sanitize_filename("   ___ΕΛΛΑΔΑ___  "), "ellada");
+    }
+
+    /// C-12. A saved trim reaches the sidecar of the asset it belongs to, and
+    /// only that one; every other key is left as written.
+    #[test]
+    fn a_trim_is_patched_into_its_own_sidecar_only() {
+        let dir = std::env::temp_dir().join(format!("pt-sidecar-trim-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(dir.join("videos")).unwrap();
+        fs::create_dir_all(dir.join("sidecars")).unwrap();
+        let media = dir.join("videos").join("clip_abc.mp4");
+        fs::write(&media, b"x").unwrap();
+        let sidecar = sidecar_path_for(&media);
+        fs::write(
+            &sidecar,
+            r#"{"playoutvue_id":"abc","id":"abc","duration_ms":60000,"trim_in_ms":0,"trim_out_ms":60000,"fps_num":25}"#,
+        )
+        .unwrap();
+
+        assert!(patch_sidecar_trim(&media, "ABC", 5_000, 50_000).unwrap());
+        let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!((doc["trim_in_ms"].as_i64(), doc["trim_out_ms"].as_i64()), (Some(5_000), Some(50_000)));
+        assert_eq!(doc["fps_num"], 25, "other keys survive");
+
+        // Already there, someone else's (a legacy sub-clip on the parent's
+        // file), or no sidecar at all: nothing written.
+        assert!(!patch_sidecar_trim(&media, "abc", 5_000, 50_000).unwrap());
+        assert!(!patch_sidecar_trim(&media, "sub-clip", 10_000, 20_000).unwrap());
+        let doc: serde_json::Value = serde_json::from_str(&fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(doc["trim_in_ms"], 5_000);
+        assert!(!patch_sidecar_trim(&dir.join("videos").join("none.mp4"), "abc", 0, 1).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

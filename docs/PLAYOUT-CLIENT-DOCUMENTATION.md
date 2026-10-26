@@ -1230,3 +1230,14 @@ file. The next service start sets it to `duration_ms` on every `ready`,
 `error` and `missing` row, sub-clips included (their IN stays as it was, so
 `0` there meant "to the end of the file" and still does). Both of your readings
 now agree. Your `> 0` fallbacks are harmless and can stay.
+
+### 15.3 C-12 — a saved trim reaches the sidecar
+
+`PUT /trim` on a full-length asset now also writes `trim_in_ms` /
+`trim_out_ms` into its existing sidecar (`sidecars/<stem>.uuid.json`, stage
+and rename; no other key changes). Your scanner and offline fallback see the
+trimmed window with the transcoder down. A sub-clip still has no sidecar
+(§14.2), and a sidecar whose `playoutvue_id` is not the trimmed asset is left
+alone. The registry stays the authority: a failed sidecar write is logged and
+the trim is still saved. The per-uuid sidecar layout of your audit's §5 is not
+implemented; this is the minimal fix for the layout you read today.

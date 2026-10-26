@@ -292,6 +292,39 @@ mod playout_contract {
         let batch: HashMap<String, PlayoutAsset> = r.json().await.expect("PlayOut decodes the batch");
         assert_eq!(batch[uuid].trim_out_ms, 20_000);
     }
+
+    /// C-12. PlayOut's scanner and offline fallback read the trim from the
+    /// sidecar, so a trim saved through the API must reach it.
+    #[tokio::test]
+    async fn a_saved_trim_reaches_the_sidecar_playout_reads_offline() {
+        let s = common::spawn_test_server().await;
+        let uuid = "b8c9d0e1-f2a3-4567-9cde-678901234567";
+        let path = publish(&s, uuid, "videos/trimmed.mp4", 60_000, 25, 1, true).await;
+        let sidecar = playout_transcode::identity::sidecar_path_for(std::path::Path::new(&path));
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        std::fs::write(
+            &sidecar,
+            serde_json::json!({
+                "playoutvue_id": uuid, "id": uuid, "duration_ms": 60_000,
+                "trim_in_ms": 0, "trim_out_ms": 60_000, "fps_num": 25, "fps_den": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let r = s
+            .put_json(
+                &format!("/api/assets/{uuid}/trim"),
+                serde_json::json!({ "trim_in_ms": 4_000, "trim_out_ms": 50_000 }),
+            )
+            .await;
+        assert_eq!(r.status(), 200);
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!((doc["trim_in_ms"].as_i64(), doc["trim_out_ms"].as_i64()), (Some(4_000), Some(50_000)));
+        assert_eq!(doc["fps_num"], 25, "the rest of the sidecar is untouched");
+    }
 }
 
 /// Contract C1: `GET /api/v2/media-root`, against the real router.

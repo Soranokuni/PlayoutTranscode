@@ -2694,7 +2694,26 @@ async fn put_trim(
         ).into_response();
     }
 
-    match db::set_trim(&state.pool, &uuid, body.trim_in_ms, effective_out).await {
+    let set = db::set_trim(&state.pool, &uuid, body.trim_in_ms, effective_out).await;
+
+    // C-12. The sidecar is PlayOut's copy for when this service is down. A
+    // sub-clip has none of its own (C-11). Best effort: the registry is the
+    // authority, and a failed patch only leaves the offline copy stale.
+    if matches!(set, Ok(true)) && asset.parent_uuid.is_none() && !asset.current_path.is_empty() {
+        let media_path = std::path::PathBuf::from(&asset.current_path);
+        let (sidecar_uuid, trim_in_ms) = (uuid.clone(), body.trim_in_ms);
+        let patched = tokio::task::spawn_blocking(move || {
+            crate::identity::patch_sidecar_trim(&media_path, &sidecar_uuid, trim_in_ms, effective_out)
+        })
+        .await;
+        match patched {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => tracing::warn!(uuid = %uuid, "Trim saved; the sidecar could not follow: {}", e),
+            Err(e) => tracing::warn!(uuid = %uuid, "Trim saved; the sidecar patch did not run: {}", e),
+        }
+    }
+
+    match set {
         Ok(true) => match db::find_by_uuid(&state.pool, &uuid).await {
             Ok(Some(asset)) => (StatusCode::OK, Json(AssetResponse::from(asset))).into_response(),
             Ok(None) => (
