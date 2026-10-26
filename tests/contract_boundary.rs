@@ -265,6 +265,33 @@ mod playout_contract {
             (Some(-23.0), Some(7.0), Some("ebu_r128"))
         );
     }
+
+    /// C-14. PlayOut's v2 path reads `trim_out_ms = 0` as invalid bounds and
+    /// its v1/batch path as the whole file. After the startup migration no
+    /// published asset is served with it, on any route.
+    #[tokio::test]
+    async fn a_legacy_unset_out_point_is_served_as_the_whole_file() {
+        let s = common::spawn_test_server().await;
+        let uuid = "a7b8c9d0-e1f2-4456-8bcd-567890123456";
+        let path = publish(&s, uuid, "legacy.mp4", 20_000, 25, 1, true).await;
+        // As a pre-`mark_ready`-OUT version left it.
+        sqlx::query("UPDATE media_assets SET trim_out_ms = 0 WHERE uuid = ?1")
+            .bind(uuid)
+            .execute(&*s.pool)
+            .await
+            .unwrap();
+
+        db::run_data_migrations(&s.pool, &s.root.join("media_assets.db"))
+            .await
+            .unwrap();
+
+        let a = fetch(&s, uuid).await;
+        assert_eq!((a.status.as_str(), a.trim_in_ms, a.trim_out_ms), ("ready", 0, 20_000));
+        assert_eq!(a.current_path, path);
+        let r = s.post_json("/api/assets/batch", serde_json::json!([uuid])).await;
+        let batch: HashMap<String, PlayoutAsset> = r.json().await.expect("PlayOut decodes the batch");
+        assert_eq!(batch[uuid].trim_out_ms, 20_000);
+    }
 }
 
 /// Contract C1: `GET /api/v2/media-root`, against the real router.

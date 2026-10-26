@@ -1221,3 +1221,12 @@ The QC report and loudness are written in the same transaction that makes an
 asset `ready`. Before, they followed in a second write, so a poll in between
 (or a failed second write, until the next start) showed a `ready` asset with
 no `qc_report`, which your blocking-QC gate reads as nothing blocking.
+
+### 15.2 C-14 — no published asset has `trim_out_ms = 0`
+
+Older rows stored `trim_out_ms = 0` for "unset", which your v2 library path
+reads as invalid bounds (`processing`) and your v1/batch path as the whole
+file. The next service start sets it to `duration_ms` on every `ready`,
+`error` and `missing` row, sub-clips included (their IN stays as it was, so
+`0` there meant "to the end of the file" and still does). Both of your readings
+now agree. Your `> 0` fallbacks are harmless and can stay.

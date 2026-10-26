@@ -529,7 +529,10 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
              + (SELECT COUNT(*) FROM media_assets
                  WHERE status = 'error' AND mezzanine_ok = 0
                    AND qc_verdict_key IS NOT NULL AND qc_verdict_key <> ?1
-                   AND warnings IN ('', '[]'))",
+                   AND warnings IN ('', '[]'))
+             + (SELECT COUNT(*) FROM media_assets
+                 WHERE trim_out_ms = 0 AND duration_ms > 0
+                   AND status IN ('ready', 'error', 'missing'))",
         )
         .bind(QC_VERDICT_CLEARED)
         .fetch_one(pool)
@@ -667,6 +670,34 @@ pub async fn run_data_migrations(pool: &SqlitePool, db_path: &Path) -> Result<()
                 "Recorded the finding on {} permanently failed asset(s) that had a verdict but no \
                  warnings (W-3); they will not be re-encoded",
                 rows.len()
+            );
+        }
+    }
+
+    // C-14. `trim_out_ms = 0` meant "unset" on rows published before
+    // `mark_ready` wrote the OUT point, and PlayOut reads it two ways: its v2
+    // library path rejects it as invalid bounds (amber, `processing`), its v1 and
+    // batch paths treat it as the whole file (green, `ready`). The same asset
+    // differed between the library and the rundown. Every reader agrees on what
+    // "unset" was meant to be -- the end of the file -- so write that. A
+    // sub-clip's `duration_ms` is its parent file's, and its IN stays absolute,
+    // so `0` on a sub-clip also becomes "to the end of the file" (C-20).
+    //
+    // After the T-2b adoption above, which still reads `0` as full length.
+    // `processing` rows are left alone: their duration is the source's, not the
+    // mezzanine's, and `mark_ready` sets the OUT point when they publish.
+    {
+        let filled = sqlx::query(
+            "UPDATE media_assets SET trim_out_ms = duration_ms
+             WHERE trim_out_ms = 0 AND duration_ms > 0
+               AND status IN ('ready', 'error', 'missing')",
+        )
+        .execute(pool)
+        .await?;
+        if filled.rows_affected() > 0 {
+            tracing::info!(
+                "Set the unset OUT point of {} published asset(s) to their duration (C-14)",
+                filled.rows_affected()
             );
         }
     }
@@ -6206,6 +6237,40 @@ mod tests {
         // Idempotent: the next start is a no-op, not a second failure.
         run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// C-14. An unset OUT point on a published row becomes the end of the file;
+    /// rows still processing, and rows with no duration, are left alone.
+    #[tokio::test]
+    async fn an_unset_trim_out_on_a_published_row_becomes_its_duration() {
+        let (pool, dir) = setup_test_pool().await;
+        sqlx::query(
+            "INSERT INTO media_assets
+               (uuid, fingerprint, source_sha256, current_path, duration_ms,
+                trim_in_ms, trim_out_ms, status, mezzanine_ok, parent_uuid)
+             VALUES
+               ('legacy',  1, 'aa', 'D:/media/a.mp4', 60000, 0,     0, 'ready',      1, NULL),
+               ('sub',     1, NULL, 'D:/media/a.mp4', 60000, 10000, 0, 'ready',      1, 'legacy'),
+               ('gone',    2, 'bb', 'D:/media/b.mp4', 30000, 0,     0, 'missing',    1, NULL),
+               ('busy',    3, 'cc', 'D:/watch/c.mxf', 90000, 0,     0, 'processing', 0, NULL),
+               ('nodur',   4, 'dd', 'D:/media/d.mp4', 0,     0,     0, 'error',      0, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
+
+        let trim = |a: MediaAsset| (a.trim_in_ms, a.trim_out_ms);
+        assert_eq!(trim(find_by_uuid(&pool, "legacy").await.unwrap().unwrap()), (0, 60_000));
+        assert_eq!(trim(find_by_uuid(&pool, "sub").await.unwrap().unwrap()), (10_000, 60_000));
+        assert_eq!(trim(find_by_uuid(&pool, "gone").await.unwrap().unwrap()), (0, 30_000));
+        assert_eq!(trim(find_by_uuid(&pool, "busy").await.unwrap().unwrap()), (0, 0));
+        assert_eq!(trim(find_by_uuid(&pool, "nodur").await.unwrap().unwrap()), (0, 0));
+
+        // Idempotent.
+        run_data_migrations(&pool, &dir.join("test.db")).await.unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
