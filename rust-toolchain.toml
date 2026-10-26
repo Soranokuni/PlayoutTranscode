@@ -1,0 +1,8 @@
+# Pin the toolchain so local builds, CI and release artefacts agree, and match
+# PlayOutVue (Aether), which builds with the same channel. `rust-version` in
+# Cargo.toml is the minimum the crate is checked against; this is the version
+# we build with. Bump both CI's `dtolnay/rust-toolchain@<ver>` and this file
+# together.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
